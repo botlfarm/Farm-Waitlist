@@ -9,7 +9,7 @@
 ## Install as a Home Assistant Add-on
 
 1. In Home Assistant, navigate to **Settings -> Add-ons -> Add-on Store**.
-2. Open the top-right **⋮** menu, select **Repositories**, and paste your public GitHub repository URL (replace `OWNER` in `repository.yaml` and `farm-waitlist/config.yaml` with your GitHub username/org before publishing).
+2. Open the top-right **⋮** menu, select **Repositories**, and paste `https://github.com/botlfarm/Farm-Waitlist`.
 3. Find **Farm Waitlist** in the store and click **Install**.
 4. Open the **Configuration** tab *(optional—leave blank to run without Odoo sync)*:
    - Enter your **Odoo Base URL** (`odoo_url`), **Odoo Database** (`odoo_db`), and **Odoo API Key** (`odoo_api_key`, masked as a password field).

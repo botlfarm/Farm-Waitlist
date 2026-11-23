@@ -2,7 +2,7 @@ name: Farm Waitlist
 version: "1.0.0"
 slug: farm-waitlist
 description: Local-first seasonal farm pre-orders, waitlists, standing recurring orders, daily supply forecasting, and Odoo 19.3 sync.
-url: https://github.com/OWNER/farm-waitlist
+url: https://github.com/botlfarm/Farm-Waitlist
 arch:
   - aarch64
   - amd64
@@ -21,4 +21,4 @@ schema:
   odoo_url: url?
   odoo_db: str?
   odoo_api_key: password?
-image: ghcr.io/OWNER/farm-waitlist-{arch}
+image: ghcr.io/botlfarm/farm-waitlist-{arch}
