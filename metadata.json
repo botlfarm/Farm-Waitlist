@@ -1,0 +1,6 @@
+{
+  "name": "Farm Waitlist",
+  "description": "Local-first Home Assistant add-on for managing farm seasonal pre-orders, waitlists, standing recurring orders, daily supply forecasting, and Odoo 19.3 synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
