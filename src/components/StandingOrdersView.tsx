@@ -50,8 +50,8 @@ export function StandingOrdersView({
   const [weekday, setWeekday] = useState<number>(6); // Default Saturday
   const [startDate, setStartDate] = useState(today);
   const [notes, setNotes] = useState('');
-  const [lines, setLines] = useState<OrderItemLine[]>(
-    activeItems[0] ? [{ trackedItemId: activeItems[0].id, quantity: 1 }] : []
+  const [lines, setLines] = useState<Array<{ trackedItemId: number; qtyText: string }>>(
+    activeItems[0] ? [{ trackedItemId: activeItems[0].id, qtyText: '1' }] : []
   );
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -60,7 +60,7 @@ export function StandingOrdersView({
     const nextItem =
       activeItems.find((i) => !lines.some((l) => l.trackedItemId === i.id)) ?? activeItems[0];
     if (!nextItem) return;
-    setLines([...lines, { trackedItemId: nextItem.id, quantity: 1 }]);
+    setLines([...lines, { trackedItemId: nextItem.id, qtyText: '1' }]);
   };
 
   const handleSubmit = async () => {
@@ -69,7 +69,9 @@ export function StandingOrdersView({
       setError('Customer name is required.');
       return;
     }
-    const validLines = lines.filter((l) => l.quantity > 0);
+    const validLines: OrderItemLine[] = lines
+      .map((l) => ({ trackedItemId: l.trackedItemId, quantity: Number(l.qtyText) }))
+      .filter((l) => Number.isFinite(l.quantity) && l.quantity > 0);
     if (validLines.length === 0) {
       setError('Add at least one Tracked Item.');
       return;
@@ -263,16 +265,18 @@ export function StandingOrdersView({
                       </select>
                       <input
                         data-testid={`standing-item-qty-${idx}`}
-                        type="number"
-                        step="0.5"
-                        min="0.5"
-                        value={line.quantity}
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="Qty"
+                        value={line.qtyText}
                         onChange={(e) => {
+                          const raw = e.target.value;
+                          if (raw !== '' && !/^\d*\.?\d*$/.test(raw)) return;
                           const next = [...lines];
-                          next[idx] = { ...line, quantity: Number(e.target.value) || 0 };
+                          next[idx] = { ...line, qtyText: raw };
                           setLines(next);
                         }}
-                        className="min-h-[38px] w-20 rounded-md border border-[#283340] bg-[#0F1419] px-2 py-1.5 font-mono text-sm tabular-nums text-[#F0F6FC]"
+                        className="min-h-[38px] w-20 rounded-md border border-[#283340] bg-[#0F1419] px-2 py-1.5 font-mono text-sm tabular-nums text-[#F0F6FC] placeholder:text-[#6E7681]"
                       />
                     </div>
                   ))}

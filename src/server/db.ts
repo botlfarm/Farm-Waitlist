@@ -1,8 +1,9 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import { DEFAULT_PUBLIC_SNIPPET_FOOTER } from '../shared/generators';
 import { DEFAULT_TIMEZONE } from '../shared/timezone';
-import type { AppSettings, BackupInfo, BackupTrigger } from '../shared/types';
+import type { AppSettings, BackupInfo, BackupTrigger, PreApprovalTemplate } from '../shared/types';
 
 export interface Migration {
   version: number;
@@ -10,17 +11,108 @@ export interface Migration {
   sql: string;
 }
 
+const DEFAULT_EMAIL_TEMPLATE_BODY =
+  "Hey {{name}}, you're pre-approved for {{items_summary}} on {{date}} ({{channel}}). Place the order through EFF using the pre-approved option.";
+
+const DEFAULT_SMS_TEMPLATE_BODY =
+  "Hi {{name}}! You're pre-approved for {{items_summary}} on {{date}} ({{channel}}). Place your order using the pre-approved option.";
+
+export function buildDefaultPreApprovalTemplates(
+  legacyBody: string = DEFAULT_EMAIL_TEMPLATE_BODY
+): PreApprovalTemplate[] {
+  return [
+    {
+      id: 'default-email',
+      name: 'Default Email',
+      format: 'html',
+      body: legacyBody || DEFAULT_EMAIL_TEMPLATE_BODY,
+      isDefault: true,
+      channelIds: [],
+      itemIds: [],
+    },
+    {
+      id: 'default-sms',
+      name: 'Text / SMS',
+      format: 'plain',
+      body: DEFAULT_SMS_TEMPLATE_BODY,
+      isDefault: false,
+      channelIds: [],
+      itemIds: [],
+    },
+  ];
+}
+
+function normalizePreApprovalTemplates(
+  raw: unknown,
+  legacyBody: string
+): PreApprovalTemplate[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return buildDefaultPreApprovalTemplates(legacyBody);
+  }
+  const cleaned: PreApprovalTemplate[] = [];
+  const seenIds = new Set<string>();
+  for (let i = 0; i < raw.length; i += 1) {
+    const entry = raw[i];
+    if (!entry || typeof entry !== 'object') continue;
+    const obj = entry as Record<string, unknown>;
+    const rawId = typeof obj.id === 'string' && obj.id.trim() ? obj.id.trim() : `tmpl-${i + 1}`;
+    const id = seenIds.has(rawId) ? `${rawId}-${i + 1}` : rawId;
+    seenIds.add(id);
+    const name = typeof obj.name === 'string' && obj.name.trim() ? obj.name.trim() : `Template ${i + 1}`;
+    const format = obj.format === 'plain' ? 'plain' : 'html';
+    const body = typeof obj.body === 'string' ? obj.body : '';
+    const channelIds = Array.isArray(obj.channelIds)
+      ? Array.from(
+          new Set(
+            obj.channelIds
+              .map((v) => Number(v))
+              .filter((n) => Number.isInteger(n) && n > 0)
+          )
+        )
+      : [];
+    const itemIds = Array.isArray(obj.itemIds)
+      ? Array.from(
+          new Set(
+            obj.itemIds
+              .map((v) => Number(v))
+              .filter((n) => Number.isInteger(n) && n > 0)
+          )
+        )
+      : [];
+    cleaned.push({
+      id,
+      name,
+      format,
+      body,
+      isDefault: Boolean(obj.isDefault),
+      channelIds,
+      itemIds,
+    });
+  }
+  if (cleaned.length === 0) {
+    return buildDefaultPreApprovalTemplates(legacyBody);
+  }
+  // Guarantee exactly one default template
+  const firstDefaultIdx = cleaned.findIndex((t) => t.isDefault);
+  const chosenDefaultIdx = firstDefaultIdx >= 0 ? firstDefaultIdx : 0;
+  return cleaned.map((t, idx) => ({ ...t, isDefault: idx === chosenDefaultIdx }));
+}
+
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   timezone: DEFAULT_TIMEZONE,
   odooSyncInterval: 'manual',
   odooSyncCutoffDate: null,
   odooIgnoredDateRanges: [],
-  preApprovalTemplate:
-    "Hey {{name}}, you're pre-approved for {{items_summary}} on {{date}} ({{channel}}). Place the order through EFF using the pre-approved option.",
+  preApprovalTemplate: DEFAULT_EMAIL_TEMPLATE_BODY,
+  preApprovalTemplates: buildDefaultPreApprovalTemplates(DEFAULT_EMAIL_TEMPLATE_BODY),
   holdThresholdHours: 48,
   backupScheduleEnabled: true,
   backupRetentionDays: 14,
   publicSnippetWeeks: 3,
+  publicSnippetHeaderTitle: '',
+  publicSnippetHeaderText: '',
+  publicSnippetFooterText: DEFAULT_PUBLIC_SNIPPET_FOOTER,
+  publicSnippetAutoAdvanceToday: true,
 };
 
 export const MIGRATIONS: Migration[] = [
@@ -328,19 +420,56 @@ export class DatabaseManager {
       .prepare('SELECT key, value_json FROM app_settings')
       .all() as Array<{ key: string; value_json: string }>;
     const merged: Record<string, unknown> = { ...DEFAULT_APP_SETTINGS };
+    let hasExplicitTemplates = false;
     for (const row of rows) {
       try {
         merged[row.key] = JSON.parse(row.value_json);
+        if (row.key === 'preApprovalTemplates') {
+          hasExplicitTemplates = true;
+        }
       } catch {
         // Ignore malformed setting
       }
     }
+    const legacyBody =
+      typeof merged.preApprovalTemplate === 'string' && merged.preApprovalTemplate
+        ? merged.preApprovalTemplate
+        : DEFAULT_EMAIL_TEMPLATE_BODY;
+    const templates = normalizePreApprovalTemplates(
+      hasExplicitTemplates ? merged.preApprovalTemplates : null,
+      legacyBody
+    );
+    const defaultTemplate = templates.find((t) => t.isDefault) ?? templates[0];
+    merged.preApprovalTemplates = templates;
+    merged.preApprovalTemplate = defaultTemplate?.body ?? legacyBody;
     return merged as unknown as AppSettings;
   }
 
   public updateSettings(patch: Partial<AppSettings>): AppSettings {
     const current = this.getSettings();
     const next: AppSettings = { ...current, ...patch };
+
+    if (Array.isArray(patch.preApprovalTemplates)) {
+      const normalized = normalizePreApprovalTemplates(
+        patch.preApprovalTemplates,
+        next.preApprovalTemplate
+      );
+      next.preApprovalTemplates = normalized;
+      const defaultTmpl = normalized.find((t) => t.isDefault) ?? normalized[0];
+      if (defaultTmpl) {
+        next.preApprovalTemplate = defaultTmpl.body;
+      }
+    } else if (typeof patch.preApprovalTemplate === 'string') {
+      // Legacy callers updating only preApprovalTemplate sync the default template body too
+      const existingList = normalizePreApprovalTemplates(
+        current.preApprovalTemplates,
+        patch.preApprovalTemplate
+      );
+      next.preApprovalTemplates = existingList.map((t) =>
+        t.isDefault ? { ...t, body: patch.preApprovalTemplate! } : t
+      );
+    }
+
     const now = new Date().toISOString();
     const stmt = this._db.prepare(
       `INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?)

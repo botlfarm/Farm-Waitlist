@@ -14,6 +14,7 @@ import type {
   CalendarDayProjection,
   OrderRecord,
   PickupChannel,
+  PreApprovalTemplate,
   PublicAvailabilityCalendarDay,
   PublicAvailabilityDay,
   PublicAvailabilityResult,
@@ -76,6 +77,192 @@ export function renderPreApprovalMessage(params: {
 }
 
 /**
+ * Selects the best matching Pre-Approval template for an order:
+ * 1. Templates with both matching pickupChannelId AND matching trackedItemId (highest priority)
+ * 2. Templates matching trackedItemId (when no channel restriction) or pickupChannelId (when no item restriction)
+ * 3. Template marked isDefault (or first template as fallback)
+ */
+export function selectBestPreApprovalTemplate(
+  templates: PreApprovalTemplate[],
+  order: Pick<OrderRecord, 'pickupChannelId' | 'items'>
+): PreApprovalTemplate | null {
+  if (!templates.length) return null;
+
+  const orderItemIds = new Set(order.items.map((i) => i.trackedItemId));
+  let bestRuleMatch: { template: PreApprovalTemplate; score: number } | null = null;
+
+  for (const tmpl of templates) {
+    const hasChannelRule = tmpl.channelIds.length > 0;
+    const hasItemRule = tmpl.itemIds.length > 0;
+    if (!hasChannelRule && !hasItemRule) continue;
+
+    const channelMatches =
+      !hasChannelRule ||
+      (order.pickupChannelId !== null && tmpl.channelIds.includes(order.pickupChannelId));
+    const itemMatches =
+      !hasItemRule || tmpl.itemIds.some((id) => orderItemIds.has(id));
+
+    if (!channelMatches || !itemMatches) continue;
+
+    const score = (hasChannelRule && hasItemRule ? 30 : 0) + (hasItemRule ? 12 : 0) + (hasChannelRule ? 10 : 0);
+    if (!bestRuleMatch || score > bestRuleMatch.score) {
+      bestRuleMatch = { template: tmpl, score };
+    }
+  }
+
+  if (bestRuleMatch) return bestRuleMatch.template;
+  return templates.find((t) => t.isDefault) ?? templates[0];
+}
+
+export type SafeRichMessageSegment =
+  | { type: 'text'; text: string }
+  | { type: 'link'; label: string; href: string }
+  | { type: 'newline' };
+
+export function isSafeHttpUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl.trim());
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parses a message containing optional HTML `<a href="https://...">Label</a>`,
+ * Markdown `[Label](https://...)`, or bare `https://...` URLs into safe, typed
+ * segments (blocking `javascript:`, `data:`, and all other HTML tags/scripts).
+ */
+export function parseSafeRichMessageSegments(rawText: string): SafeRichMessageSegment[] {
+  const normalized = rawText.replace(/\r\n/g, '\n').replace(/<br\s*\/?>/gi, '\n');
+  const lines = normalized.split('\n');
+  const segments: SafeRichMessageSegment[] = [];
+
+  // Matches:
+  // 1) <a ... href="url" ...>label</a>
+  // 2) [label](url)
+  // 3) bare https?://... URL
+  const tokenRe =
+    /<a\b[^>]*\bhref\s*=\s*(?:"([^"]+)"|'([^']+)')[^>]*>([\s\S]*?)<\/a>|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"')]+)/gi;
+
+  lines.forEach((line, lineIdx) => {
+    if (lineIdx > 0) {
+      segments.push({ type: 'newline' });
+    }
+    let lastIndex = 0;
+    tokenRe.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = tokenRe.exec(line)) !== null) {
+      if (match.index > lastIndex) {
+        segments.push({ type: 'text', text: line.slice(lastIndex, match.index) });
+      }
+
+      const htmlHref = match[1] ?? match[2];
+      const htmlLabelRaw = match[3];
+      const mdLabel = match[4];
+      const mdHref = match[5];
+      const bareUrl = match[6];
+
+      if (htmlHref !== undefined) {
+        const cleanLabel = (htmlLabelRaw ?? '').replace(/<[^>]+>/g, '').trim() || htmlHref.trim();
+        if (isSafeHttpUrl(htmlHref)) {
+          segments.push({ type: 'link', label: cleanLabel, href: htmlHref.trim() });
+        } else {
+          segments.push({ type: 'text', text: cleanLabel });
+        }
+      } else if (mdHref !== undefined && mdLabel !== undefined) {
+        if (isSafeHttpUrl(mdHref)) {
+          segments.push({ type: 'link', label: mdLabel.trim() || mdHref.trim(), href: mdHref.trim() });
+        } else {
+          segments.push({ type: 'text', text: match[0] });
+        }
+      } else if (bareUrl !== undefined) {
+        // Trim trailing sentence punctuation from bare URLs (e.g. "https://farm.com/shop.")
+        let urlPart = bareUrl;
+        let trailing = '';
+        while (urlPart.length > 8 && /[.,!?;:]$/.test(urlPart)) {
+          trailing = urlPart.slice(-1) + trailing;
+          urlPart = urlPart.slice(0, -1);
+        }
+        if (isSafeHttpUrl(urlPart)) {
+          segments.push({ type: 'link', label: urlPart, href: urlPart });
+          if (trailing) {
+            segments.push({ type: 'text', text: trailing });
+          }
+        } else {
+          segments.push({ type: 'text', text: match[0] });
+        }
+      }
+
+      lastIndex = tokenRe.lastIndex;
+    }
+
+    if (lastIndex < line.length) {
+      segments.push({ type: 'text', text: line.slice(lastIndex) });
+    }
+  });
+
+  return segments;
+}
+
+export function messageHasLinks(rawText: string): boolean {
+  return parseSafeRichMessageSegments(rawText).some((s) => s.type === 'link');
+}
+
+/**
+ * Renders a message into strictly sanitized HTML safe for rich-text email clipboard pasting.
+ */
+export function renderMessageToSafeHtml(rawText: string): string {
+  const segments = parseSafeRichMessageSegments(rawText);
+  const body = segments
+    .map((seg) => {
+      if (seg.type === 'newline') return '<br>';
+      if (seg.type === 'link') {
+        return `<a href="${escapeHtml(seg.href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(seg.label)}</a>`;
+      }
+      return escapeHtml(seg.text);
+    })
+    .join('');
+  return `<div>${body}</div>`;
+}
+
+/**
+ * Renders a message into clean plain text suitable for SMS / text messages.
+ * HTML/Markdown links become "Label (https://...)" (or just the URL if label matches URL).
+ */
+export function renderMessageToPlainText(rawText: string): string {
+  const segments = parseSafeRichMessageSegments(rawText);
+  return segments
+    .map((seg) => {
+      if (seg.type === 'newline') return '\n';
+      if (seg.type === 'link') {
+        if (seg.label.toLowerCase() === seg.href.toLowerCase()) {
+          return seg.href;
+        }
+        return `${seg.label} (${seg.href})`;
+      }
+      return seg.text;
+    })
+    .join('');
+}
+
+export const DEFAULT_PUBLIC_SNIPPET_FOOTER =
+  'Quantities are approximate post-buffer estimates subject to daily farm harvest.';
+
+function renderInlineRichTextToSafeHtml(rawText: string): string {
+  const segments = parseSafeRichMessageSegments(rawText);
+  return segments
+    .map((seg) => {
+      if (seg.type === 'newline') return '<br>';
+      if (seg.type === 'link') {
+        return `<a href="${escapeHtml(seg.href)}" target="_blank" rel="noopener noreferrer" style="color:#0284c7;text-decoration:underline;">${escapeHtml(seg.label)}</a>`;
+      }
+      return escapeHtml(seg.text);
+    })
+    .join('');
+}
+
+/**
  * Generates anonymized public availability with approximate post-buffer ATP quantities
  * in a clean Monday–Sunday calendar layout for items flagged `includeInPublicSnippet`,
  * with zero customer names exposed.
@@ -88,6 +275,10 @@ export function generatePublicAvailability(params: {
   weeks?: number;
   timezone?: string;
   now?: Date;
+  headerTitle?: string;
+  headerText?: string;
+  footerText?: string;
+  autoAdvanceToday?: boolean;
 }): PublicAvailabilityResult {
   const {
     items,
@@ -97,6 +288,10 @@ export function generatePublicAvailability(params: {
     weeks = 3,
     timezone = DEFAULT_TIMEZONE,
     now = new Date(),
+    headerTitle,
+    headerText,
+    footerText,
+    autoAdvanceToday = true,
   } = params;
 
   const publicItems = items.filter((i) => i.isActive && i.includeInPublicSnippet);
@@ -181,6 +376,17 @@ export function generatePublicAvailability(params: {
 
   const singleItem = publicItems.length === 1 ? publicItems[0] : null;
 
+  const defaultHeadingTitle = singleItem
+    ? `Upcoming Pickup Availability — ${singleItem.name}`
+    : `Upcoming Pickup Availability (Next ${weeks} Weeks)`;
+  const resolvedHeaderTitle =
+    typeof headerTitle === 'string' && headerTitle.trim()
+      ? headerTitle.trim()
+      : defaultHeadingTitle;
+  const resolvedHeaderText = typeof headerText === 'string' ? headerText.trim() : '';
+  const resolvedFooterText =
+    footerText === undefined ? DEFAULT_PUBLIC_SNIPPET_FOOTER : footerText.trim();
+
   const badgeStyle = (status: 'Available' | 'Limited' | 'Waitlist Full') => {
     if (status === 'Available') {
       return 'background:#ecfdf5;color:#065f46;border:1px solid #a7f3d0;';
@@ -198,7 +404,7 @@ export function generatePublicAvailability(params: {
   const calendarCellsHtml = calendarDays
     .map((day) => {
       if (day.isPast) {
-        return `<div class="fw-cal-cell fw-cal-past" aria-hidden="true"><div class="fw-cal-date">${escapeHtml(day.displayDate)}</div></div>`;
+        return `<div class="fw-cal-cell fw-cal-past" data-fw-date="${escapeHtml(day.date)}" aria-hidden="true"><div class="fw-cal-date">${escapeHtml(day.displayDate)}</div></div>`;
       }
 
       const channelHtml = day.channelNames.length
@@ -221,13 +427,21 @@ export function generatePublicAvailability(params: {
       const todayClass = day.isToday ? ' fw-cal-today' : '';
       const todayBadge = day.isToday ? '<span class="fw-cal-today-tag">Today</span>' : '';
 
-      return `<div class="fw-cal-cell${todayClass}"><div class="fw-cal-date-row"><span class="fw-cal-date"><span class="fw-cal-mob-dow">${escapeHtml(day.weekdayLabel)}, </span>${escapeHtml(day.displayDate)}</span>${todayBadge}</div>${channelHtml}<div class="fw-cal-items">${itemsHtml}</div></div>`;
+      return `<div class="fw-cal-cell${todayClass}" data-fw-date="${escapeHtml(day.date)}"><div class="fw-cal-date-row"><span class="fw-cal-date"><span class="fw-cal-mob-dow">${escapeHtml(day.weekdayLabel)}, </span>${escapeHtml(day.displayDate)}</span>${todayBadge}</div>${channelHtml}<div class="fw-cal-items">${itemsHtml}</div></div>`;
     })
     .join('\n      ');
 
+  const headerIntroHtml = resolvedHeaderText
+    ? `\n  <p class="fw-cal-intro">${renderInlineRichTextToSafeHtml(resolvedHeaderText)}</p>`
+    : '';
+
+  const footerHtml = resolvedFooterText
+    ? `\n    <p class="fw-cal-foot">${renderInlineRichTextToSafeHtml(resolvedFooterText)}</p>`
+    : '';
+
   const bodyHtml =
     publicItems.length === 0
-      ? `<p style="margin:12px 0;color:#475569;font-size:14px;">No items are currently flagged for public availability display.</p>`
+      ? `<p style="margin:12px 0;color:#475569;font-size:14px;">No items are currently flagged for public availability display.</p>${footerHtml}`
       : `<div class="fw-cal-legend">
       <span><i style="background:#10b981;"></i>Available</span>
       <span><i style="background:#f59e0b;"></i>Limited</span>
@@ -236,20 +450,22 @@ export function generatePublicAvailability(params: {
     <div class="fw-cal-dow">${weekdayHeadersHtml}</div>
     <div class="fw-cal-grid">
       ${calendarCellsHtml}
-    </div>
-    <p class="fw-cal-foot">Quantities are approximate post-buffer estimates subject to daily farm harvest.</p>`;
+    </div>${footerHtml}`;
 
-  const headingTitle = singleItem
-    ? `Upcoming Pickup Availability — ${escapeHtml(singleItem.name)}`
-    : `Upcoming Pickup Availability (Next ${weeks} Weeks)`;
+  // Optional progressive-enhancement script: automatically advances the "Today" highlight
+  // and dims/hides elapsed days in the visitor's browser using the farm's timezone.
+  const autoAdvanceScriptHtml = autoAdvanceToday
+    ? `\n  <script>(function(){try{var s=document.currentScript,r=s&&s.closest?s.closest('.fw-cal'):null;if(!r)return;var tz=r.getAttribute('data-fw-tz')||'America/New_York',n=new Date(),t='';try{var p=new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(n),g=function(k){for(var i=0;i<p.length;i++)if(p[i].type===k)return p[i].value;return''};t=g('year')+'-'+g('month')+'-'+g('day')}catch(e){var m=String(n.getMonth()+1),d=String(n.getDate());t=n.getFullYear()+'-'+(m.length<2?'0'+m:m)+'-'+(d.length<2?'0'+d:d)}if(!/^\\d{4}-\\d{2}-\\d{2}$/.test(t))return;var c=r.querySelectorAll('[data-fw-date]');for(var i=0;i<c.length;i++){var el=c[i],dt=el.getAttribute('data-fw-date'),tag=el.querySelector('.fw-cal-today-tag');if(dt<t){el.classList.add('fw-cal-past');el.classList.remove('fw-cal-today');el.setAttribute('aria-hidden','true');if(tag)tag.remove()}else if(dt===t){el.classList.remove('fw-cal-past');el.classList.add('fw-cal-today');el.removeAttribute('aria-hidden');if(!tag){var row=el.querySelector('.fw-cal-date-row');if(row){var sp=document.createElement('span');sp.className='fw-cal-today-tag';sp.textContent='Today';row.appendChild(sp)}}}else{el.classList.remove('fw-cal-past','fw-cal-today');el.removeAttribute('aria-hidden');if(tag)tag.remove()}}}catch(e){}})();</script>`
+    : '';
 
-  const html = `<section class="fw-cal">
+  const html = `<section class="fw-cal" data-fw-tz="${escapeHtml(timezone)}">
   <style>
     .fw-cal{max-width:880px;margin:0 auto;padding:18px;border:1px solid #e2e8f0;border-radius:10px;background:#ffffff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#0f172a;box-sizing:border-box}
     .fw-cal *{box-sizing:border-box}
-    .fw-cal-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:10px}
+    .fw-cal-head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:8px}
     .fw-cal-title{margin:0;font-size:18px;font-weight:700;color:#0f172a}
     .fw-cal-ts{font-size:12px;color:#64748b}
+    .fw-cal-intro{margin:0 0 12px;font-size:13px;line-height:1.45;color:#334155}
     .fw-cal-legend{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:12px;font-size:12px;color:#475569}
     .fw-cal-legend span{display:inline-flex;align-items:center;gap:6px}
     .fw-cal-legend i{display:inline-block;width:8px;height:8px;border-radius:999px}
@@ -259,6 +475,7 @@ export function generatePublicAvailability(params: {
     .fw-cal-cell{min-height:84px;padding:8px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;display:flex;flex-direction:column;gap:5px}
     .fw-cal-today{border-color:#0284c7;background:#f0f9ff}
     .fw-cal-past{opacity:.38;background:#f8fafc}
+    .fw-cal-past .fw-cal-items,.fw-cal-past .fw-cal-ch,.fw-cal-past .fw-cal-today-tag{display:none}
     .fw-cal-date-row{display:flex;align-items:center;justify-content:space-between;gap:4px}
     .fw-cal-date{font-size:12px;font-weight:700;color:#0f172a}
     .fw-cal-mob-dow{display:none}
@@ -269,7 +486,7 @@ export function generatePublicAvailability(params: {
     .fw-cal-item{display:flex;justify-content:space-between;align-items:center;gap:4px;padding:3px 6px;border-radius:5px;font-size:11px;font-weight:600;line-height:1.2}
     .fw-cal-item-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
     .fw-cal-item-qty{white-space:nowrap}
-    .fw-cal-foot{margin:12px 0 0;font-size:11px;color:#64748b}
+    .fw-cal-foot{margin:12px 0 0;font-size:11px;line-height:1.45;color:#64748b}
     @media (max-width:640px){
       .fw-cal{padding:12px}
       .fw-cal-dow{display:none}
@@ -281,16 +498,20 @@ export function generatePublicAvailability(params: {
     }
   </style>
   <div class="fw-cal-head">
-    <h3 class="fw-cal-title">${headingTitle}</h3>
+    <h3 class="fw-cal-title">${escapeHtml(resolvedHeaderTitle)}</h3>
     <span class="fw-cal-ts">Availability accurate as of ${escapeHtml(generatedAtDisplay)}</span>
-  </div>
-  ${bodyHtml}
+  </div>${headerIntroHtml}
+  ${bodyHtml}${autoAdvanceScriptHtml}
 </section>`;
 
   return {
     generatedAtDisplay,
     timezone,
     weeks,
+    headerTitle: resolvedHeaderTitle,
+    headerText: resolvedHeaderText,
+    footerText: resolvedFooterText,
+    autoAdvanceToday,
     days: availabilityDays,
     calendarDays,
     html,

@@ -3,7 +3,11 @@ import fs from 'fs';
 import multer from 'multer';
 import os from 'os';
 import path from 'path';
-import { generatePublicAvailability, renderPreApprovalMessage } from '../shared/generators';
+import {
+  generatePublicAvailability,
+  renderPreApprovalMessage,
+  selectBestPreApprovalTemplate,
+} from '../shared/generators';
 import {
   findEarliestValidSlotDate,
   isWeekdayAllowedForChannel,
@@ -862,14 +866,20 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
 
     const updated = getOrderById(db, id)!;
     const settings = dbManager.getSettings();
+    const templates = settings.preApprovalTemplates ?? [];
+    const matchedTemplate = selectBestPreApprovalTemplate(templates, updated);
     const message = renderPreApprovalMessage({
-      template: settings.preApprovalTemplate,
+      template: matchedTemplate?.body ?? settings.preApprovalTemplate,
       order: updated,
       items: listTrackedItems(db),
       channels: listPickupChannels(db),
     });
 
-    res.json({ order: updated, message });
+    res.json({
+      order: updated,
+      message,
+      selectedTemplateId: matchedTemplate?.id ?? null,
+    });
   });
 
   // Release Hold -> returns order to Waitlist & clears slotted_date/pre_approved_at
@@ -1522,6 +1532,10 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       weeks,
       timezone: ws.settings.timezone,
       now: getNow(),
+      headerTitle: ws.settings.publicSnippetHeaderTitle,
+      headerText: ws.settings.publicSnippetHeaderText,
+      footerText: ws.settings.publicSnippetFooterText,
+      autoAdvanceToday: ws.settings.publicSnippetAutoAdvanceToday ?? true,
     });
     res.json(snippet);
   });

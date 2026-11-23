@@ -15,9 +15,18 @@ import type {
   SyncLog,
   TrackedItem,
 } from '../shared/types';
-import type { OdooCredentials } from './config';
+import { normalizeOdooBaseUrl, type OdooCredentials } from './config';
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const MAX_ODOO_REDIRECTS = 3;
+
+function isSafeOdooRedirectHost(fromHostname: string, toHostname: string): boolean {
+  const normFrom = fromHostname.toLowerCase().replace(/^www\./, '');
+  const normTo = toHostname.toLowerCase().replace(/^www\./, '');
+  return normFrom === normTo;
+}
 
 interface OdooSaleOrder {
   id: number;
@@ -104,11 +113,13 @@ export async function callOdooJson2<T>(params: {
   fetchFn?: FetchLike;
 }): Promise<T> {
   const { odoo, model, method, payload, fetchFn = fetch } = params;
-  if (!odoo.url || !odoo.apiKey) {
+  const normalizedBaseUrl = normalizeOdooBaseUrl(odoo.url);
+  if (!normalizedBaseUrl || !odoo.apiKey) {
     throw new Error('Odoo credentials are not configured');
   }
 
-  const endpoint = `${odoo.url}/json/2/${encodeURIComponent(model)}/${encodeURIComponent(method)}`;
+  const expectedApiPath = `/json/2/${encodeURIComponent(model)}/${encodeURIComponent(method)}`;
+  const bodyJson = JSON.stringify(payload);
   const headers: Record<string, string> = {
     Authorization: `bearer ${odoo.apiKey}`,
     'Content-Type': 'application/json; charset=utf-8',
@@ -118,11 +129,73 @@ export async function callOdooJson2<T>(params: {
     headers['X-Odoo-Database'] = odoo.db;
   }
 
-  const response = await fetchFn(endpoint, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  });
+  let currentUrl = new URL(`${normalizedBaseUrl}${expectedApiPath}`);
+  let response: Response | null = null;
+
+  for (let hop = 0; hop <= MAX_ODOO_REDIRECTS; hop += 1) {
+    response = await fetchFn(currentUrl.toString(), {
+      method: 'POST',
+      headers,
+      body: bodyJson,
+      redirect: 'manual',
+    });
+
+    if (!REDIRECT_STATUSES.has(response.status)) {
+      break;
+    }
+
+    const location = response.headers.get('location');
+    if (!location) {
+      throw new Error(
+        `Odoo API error (${model}.${method}): ${response.status} redirect without Location header at ${currentUrl.origin}${currentUrl.pathname}`
+      );
+    }
+
+    if (hop === MAX_ODOO_REDIRECTS) {
+      throw new Error(
+        `Odoo API error (${model}.${method}): Too many redirects while connecting to ${currentUrl.origin}`
+      );
+    }
+
+    let nextUrl: URL;
+    try {
+      nextUrl = new URL(location, currentUrl);
+    } catch {
+      throw new Error(
+        `Odoo API error (${model}.${method}): Invalid redirect target returned by ${currentUrl.origin}`
+      );
+    }
+
+    if (nextUrl.protocol !== 'https:' && nextUrl.protocol !== 'http:') {
+      throw new Error(
+        `Odoo API error (${model}.${method}): Refused redirect to unsupported protocol (${nextUrl.protocol})`
+      );
+    }
+
+    if (currentUrl.protocol === 'https:' && nextUrl.protocol === 'http:') {
+      throw new Error(
+        `Odoo API error (${model}.${method}): Refused insecure redirect from HTTPS to HTTP (${nextUrl.origin}). Update your Odoo URL to https://.`
+      );
+    }
+
+    if (!isSafeOdooRedirectHost(currentUrl.hostname, nextUrl.hostname)) {
+      throw new Error(
+        `Odoo API error (${model}.${method}): ${currentUrl.host} redirected to a different host (${nextUrl.host}). Update your Odoo URL directly to ${nextUrl.origin}.`
+      );
+    }
+
+    if (!nextUrl.pathname.endsWith(expectedApiPath)) {
+      throw new Error(
+        `Odoo API error (${model}.${method}): Redirected to ${nextUrl.origin}${nextUrl.pathname} instead of ${expectedApiPath}. Check your Odoo URL (use https://<host> without /odoo or /web) and Odoo Database name.`
+      );
+    }
+
+    currentUrl = nextUrl;
+  }
+
+  if (!response) {
+    throw new Error(`Odoo API error (${model}.${method}): No response received from Odoo`);
+  }
 
   const rawText = await response.text();
   let parsedBody: unknown = null;
@@ -147,6 +220,9 @@ export async function callOdooJson2<T>(params: {
       if (msg) {
         detail = `${response.status}: ${msg}`;
       }
+    }
+    if (response.status === 404) {
+      detail = `${detail} (POST ${currentUrl.origin}${currentUrl.pathname} — verify Odoo URL is the base https://<host> without /odoo or /web)`;
     }
     throw new Error(`Odoo API error (${model}.${method}): ${detail}`);
   }

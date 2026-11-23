@@ -202,7 +202,9 @@ export function OrderDetailDrawer({
   const [status, setStatus] = useState<OrderStatus>('waitlist');
   const [isLocked, setIsLocked] = useState(false);
   const [notes, setNotes] = useState('');
-  const [orderItems, setOrderItems] = useState<OrderItemLine[]>([]);
+  const [orderItems, setOrderItems] = useState<
+    Array<{ rowKey: string; trackedItemId: number; qtyText: string }>
+  >([]);
   const [saving, setSaving] = useState(false);
   const [slottingTarget, setSlottingTarget] = useState<string | null>(null);
   const [onlyOpenDates, setOnlyOpenDates] = useState(false);
@@ -215,6 +217,7 @@ export function OrderDetailDrawer({
   const [mergeKeepDate, setMergeKeepDate] = useState<string>('');
   const [merging, setMerging] = useState(false);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const rowKeyCounter = useRef(0);
 
   useEffect(() => {
     if (!order) return;
@@ -226,7 +229,13 @@ export function OrderDetailDrawer({
     setStatus(order.status);
     setIsLocked(order.isLocked);
     setNotes(order.notes ?? '');
-    setOrderItems(order.items.map((l) => ({ trackedItemId: l.trackedItemId, quantity: l.quantity })));
+    setOrderItems(
+      order.items.map((l, idx) => ({
+        rowKey: `init-${order.id}-${idx}-${l.trackedItemId}`,
+        trackedItemId: l.trackedItemId,
+        qtyText: formatQty(l.quantity),
+      }))
+    );
     setOnlyOpenDates(false);
     setShowOffChannel(false);
     setSlottingTarget(null);
@@ -284,18 +293,26 @@ export function OrderDetailDrawer({
     selectedChannel && channelHasScheduleRestriction(selectedChannel)
   );
 
+  const parsedOrderItems = useMemo<OrderItemLine[]>(
+    () =>
+      orderItems
+        .map((l) => ({ trackedItemId: l.trackedItemId, quantity: Number(l.qtyText) }))
+        .filter((l) => Number.isFinite(l.quantity) && l.quantity > 0),
+    [orderItems]
+  );
+
   const candidateDates = useMemo<CandidateSlotDate[]>(() => {
     if (!order) return [];
     return evaluateCandidateSlotDates({
       order,
-      draftItems: orderItems,
+      draftItems: parsedOrderItems,
       draftPickupChannelId: parsedChannelId,
       days,
       items,
       channels,
       today,
     });
-  }, [order, orderItems, parsedChannelId, days, items, channels, today]);
+  }, [order, parsedOrderItems, parsedChannelId, days, items, channels, today]);
 
   const firstAvailable = useMemo(
     () => candidateDates.find((c) => c.isFirstAvailable) ?? null,
@@ -316,7 +333,7 @@ export function OrderDetailDrawer({
     order.status === 'pre_approved' ? getAgingHoldHours(order.preApprovedAt) : null;
   const isHoldOverThreshold = agingHours !== null && agingHours >= holdThresholdHours;
 
-  const validDraftItems = orderItems.filter((l) => l.quantity > 0);
+  const validDraftItems = parsedOrderItems;
   const itemsSummary =
     validDraftItems.length === 0
       ? 'No items assigned yet'
@@ -330,7 +347,11 @@ export function OrderDetailDrawer({
   const addItemLine = () => {
     const unused = items.find((i) => !orderItems.some((l) => l.trackedItemId === i.id)) ?? items[0];
     if (!unused) return;
-    setOrderItems([...orderItems, { trackedItemId: unused.id, quantity: 1 }]);
+    rowKeyCounter.current += 1;
+    setOrderItems([
+      ...orderItems,
+      { rowKey: `new-${rowKeyCounter.current}`, trackedItemId: unused.id, qtyText: '1' },
+    ]);
   };
 
   const buildDraftPatch = (): OrderSavePatch => ({
@@ -1200,7 +1221,7 @@ export function OrderDetailDrawer({
             ) : (
               <div className="space-y-2">
                 {orderItems.map((line, idx) => (
-                  <div key={`${line.trackedItemId}-${idx}`} className="flex items-center gap-2">
+                  <div key={line.rowKey} className="flex items-center gap-2">
                     <select
                       data-testid={`order-item-select-${idx}`}
                       value={line.trackedItemId}
@@ -1219,16 +1240,18 @@ export function OrderDetailDrawer({
                     </select>
                     <input
                       data-testid={`order-item-qty-${idx}`}
-                      type="number"
-                      step="0.5"
-                      min="0.5"
-                      value={line.quantity}
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="Qty"
+                      value={line.qtyText}
                       onChange={(e) => {
+                        const raw = e.target.value;
+                        if (raw !== '' && !/^\d*\.?\d*$/.test(raw)) return;
                         const next = [...orderItems];
-                        next[idx] = { ...line, quantity: Number(e.target.value) || 0 };
+                        next[idx] = { ...line, qtyText: raw };
                         setOrderItems(next);
                       }}
-                      className="min-h-[38px] w-24 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 font-mono text-sm tabular-nums text-[#F0F6FC]"
+                      className="min-h-[38px] w-24 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 font-mono text-sm tabular-nums text-[#F0F6FC] placeholder:text-[#6E7681]"
                     />
                     <button
                       type="button"

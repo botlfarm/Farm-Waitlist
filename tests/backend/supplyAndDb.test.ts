@@ -14,14 +14,26 @@ import {
   computeStandingOccurrenceDates,
   materializeStandingOrders,
 } from '../../src/server/standingEngine';
-import { generatePublicAvailability } from '../../src/shared/generators';
+import {
+  generatePublicAvailability,
+  messageHasLinks,
+  parseSafeRichMessageSegments,
+  renderMessageToPlainText,
+  renderMessageToSafeHtml,
+  selectBestPreApprovalTemplate,
+} from '../../src/shared/generators';
 import {
   evaluateCandidateSlotDates,
   findEarliestValidSlotDate,
   isWeekdayAllowedForChannel,
   projectDailySupply,
 } from '../../src/shared/supplyEngine';
-import type { OrderRecord, PickupChannel, TrackedItem } from '../../src/shared/types';
+import type {
+  OrderRecord,
+  PickupChannel,
+  PreApprovalTemplate,
+  TrackedItem,
+} from '../../src/shared/types';
 
 const tmpDirs: string[] = [];
 
@@ -825,5 +837,244 @@ describe('Standing Orders Materialization, Per-Week Exceptions & Undo Checkpoint
     ]);
     expect(listDailySupplyEntries(mgr.db)).toHaveLength(0);
     mgr.close();
+  });
+});
+
+describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', () => {
+  const baseOrder: OrderRecord = {
+    id: 1,
+    source: 'manual',
+    status: 'slotted',
+    timingType: 'specific_date',
+    requestedDate: '2026-11-28',
+    slottedDate: '2026-11-28',
+    isLocked: false,
+    customerName: 'Clara',
+    customerNameOverridden: false,
+    customerEmail: 'clara@example.com',
+    customerPhone: '555-0100',
+    pickupChannelId: 2,
+    freeTextPickup: null,
+    notes: null,
+    preApprovedAt: null,
+    standingOrderId: null,
+    standingOccurrenceDate: null,
+    odooQuotationId: null,
+    odooQuotationName: null,
+    odooPartnerId: null,
+    odooCreatedAtLocal: null,
+    odooRawNotes: null,
+    odooRawLines: [],
+    odooUpdatedAfterSlot: false,
+    odooMissingFlagged: false,
+    odooSuggestedConfirmed: null,
+    items: [{ trackedItemId: 5, quantity: 3 }],
+    chatter: [],
+    createdAt: '',
+    updatedAt: '',
+  };
+
+  it('auto-selects templates by specificity: channel+item > item > channel > default', () => {
+    const templates: PreApprovalTemplate[] = [
+      {
+        id: 'default-email',
+        name: 'Default Email',
+        format: 'html',
+        body: 'Default body',
+        isDefault: true,
+        channelIds: [],
+        itemIds: [],
+      },
+      {
+        id: 'channel-only',
+        name: 'Market Email',
+        format: 'html',
+        body: 'Channel body',
+        isDefault: false,
+        channelIds: [2],
+        itemIds: [],
+      },
+      {
+        id: 'item-only',
+        name: 'Turkey Email',
+        format: 'html',
+        body: 'Item body',
+        isDefault: false,
+        channelIds: [],
+        itemIds: [5],
+      },
+      {
+        id: 'channel-and-item',
+        name: 'Market Turkey Email',
+        format: 'html',
+        body: 'Channel + Item body',
+        isDefault: false,
+        channelIds: [2],
+        itemIds: [5],
+      },
+    ];
+
+    expect(selectBestPreApprovalTemplate(templates, baseOrder)?.id).toBe('channel-and-item');
+    expect(selectBestPreApprovalTemplate(templates.slice(0, 3), baseOrder)?.id).toBe('item-only');
+    expect(selectBestPreApprovalTemplate(templates.slice(0, 2), baseOrder)?.id).toBe('channel-only');
+    expect(
+      selectBestPreApprovalTemplate(templates, {
+        ...baseOrder,
+        pickupChannelId: 99,
+        items: [{ trackedItemId: 88, quantity: 1 }],
+      })?.id
+    ).toBe('default-email');
+  });
+
+  it('parses safe http/https HTML, markdown, and bare links while neutralizing javascript: URLs and raw HTML tags', () => {
+    const safeMsg =
+      'Hi Clara! Order at <a href="https://botlfarm.com/shop">our farm store</a> or [Pickup Info](https://botlfarm.com/pickup) or https://botlfarm.com/faq.';
+    expect(messageHasLinks(safeMsg)).toBe(true);
+    const segments = parseSafeRichMessageSegments(safeMsg);
+    const links = segments.filter((s) => s.type === 'link');
+    expect(links).toEqual([
+      { type: 'link', label: 'our farm store', href: 'https://botlfarm.com/shop' },
+      { type: 'link', label: 'Pickup Info', href: 'https://botlfarm.com/pickup' },
+      { type: 'link', label: 'https://botlfarm.com/faq', href: 'https://botlfarm.com/faq' },
+    ]);
+
+    const html = renderMessageToSafeHtml(safeMsg);
+    expect(html).toContain(
+      '<a href="https://botlfarm.com/shop" target="_blank" rel="noopener noreferrer">our farm store</a>'
+    );
+    expect(html).toContain(
+      '<a href="https://botlfarm.com/pickup" target="_blank" rel="noopener noreferrer">Pickup Info</a>'
+    );
+
+    const plain = renderMessageToPlainText(safeMsg);
+    expect(plain).toContain('our farm store (https://botlfarm.com/shop)');
+    expect(plain).toContain('Pickup Info (https://botlfarm.com/pickup)');
+    expect(plain).toContain('https://botlfarm.com/faq');
+
+    // XSS / unsafe protocol attempts must NOT produce link segments or executable HTML
+    const malicious =
+      'Click <a href="javascript:alert(1)">Bad Link</a> and <script>alert(2)</script> <img src=x onerror=alert(3)>';
+    const unsafeSegs = parseSafeRichMessageSegments(malicious);
+    expect(unsafeSegs.filter((s) => s.type === 'link')).toHaveLength(0);
+    const escapedHtml = renderMessageToSafeHtml(malicious);
+    expect(escapedHtml).not.toContain('<script>');
+    expect(escapedHtml).not.toContain('<a ');
+    expect(escapedHtml).not.toContain('<img');
+    expect(escapedHtml).toContain('&lt;script&gt;');
+  });
+
+  it('migrates legacy preApprovalTemplate into preApprovalTemplates and persists multiple templates cleanly', async () => {
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    // Simulate a legacy DB row that only has preApprovalTemplate and no preApprovalTemplates key
+    mgr.db.prepare(`DELETE FROM app_settings WHERE key = 'preApprovalTemplates'`).run();
+    mgr.db
+      .prepare(
+        `INSERT INTO app_settings (key, value_json, updated_at) VALUES ('preApprovalTemplate', ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json`
+      )
+      .run(JSON.stringify('Legacy custom hello {{name}}!'), new Date().toISOString());
+
+    const migrated = mgr.getSettings();
+    expect(migrated.preApprovalTemplates?.length).toBeGreaterThanOrEqual(2);
+    const defaultTmpl = migrated.preApprovalTemplates!.find((t) => t.isDefault);
+    expect(defaultTmpl?.body).toBe('Legacy custom hello {{name}}!');
+
+    // Save custom multi-template list and verify reload + legacy sync
+    const updated = mgr.updateSettings({
+      preApprovalTemplates: [
+        {
+          id: 'email-store',
+          name: 'Store Link Email',
+          format: 'html',
+          body: 'Hi {{name}}, place your order at <a href="https://botlfarm.com/shop">BOTL Farm Store</a>!',
+          isDefault: true,
+          channelIds: [],
+          itemIds: [],
+        },
+        {
+          id: 'sms-short',
+          name: 'Text / SMS',
+          format: 'plain',
+          body: 'Hi {{name}}, your eggs are ready for {{date}}: https://botlfarm.com/shop',
+          isDefault: false,
+          channelIds: [1],
+          itemIds: [],
+        },
+      ],
+    });
+
+    expect(updated.preApprovalTemplates).toHaveLength(2);
+    expect(updated.preApprovalTemplate).toContain('BOTL Farm Store');
+    expect(mgr.getSettings().preApprovalTemplates?.[1].channelIds).toEqual([1]);
+    mgr.close();
+  });
+
+  it('supports customizable snippet header/footer text (with safe links) and optional daily Today auto-advance script', () => {
+    const eggsItem: TrackedItem = {
+      id: 1,
+      name: 'Standard Eggs',
+      unitLabel: 'dozens',
+      isActive: true,
+      supplyMode: 'continuous',
+      defaultDailyProduction: 10,
+      globalSafetyBuffer: 4,
+      includeInPublicSnippet: true,
+      keywordRules: ['standard'],
+      sortOrder: 0,
+      createdAt: '',
+      updatedAt: '',
+    };
+
+    const days = projectDailySupply({
+      items: [eggsItem],
+      entries: [],
+      orders: [],
+      startDate: '2026-11-23',
+      endDate: '2026-12-06',
+      today: '2026-11-23',
+    });
+
+    const withCustom = generatePublicAvailability({
+      items: [eggsItem],
+      days,
+      channels: [],
+      today: '2026-11-23',
+      weeks: 2,
+      timezone: 'America/New_York',
+      now: new Date('2026-11-23T15:00:00Z'),
+      headerTitle: 'BOTL Farm Fresh Egg Availability',
+      headerText:
+        'Order at <a href="https://botlfarm.com/shop">BOTL Farm Store</a> <script>alert(1)</script>',
+      footerText: 'Questions? Email us or visit https://botlfarm.com/contact',
+      autoAdvanceToday: true,
+    });
+
+    expect(withCustom.headerTitle).toBe('BOTL Farm Fresh Egg Availability');
+    expect(withCustom.html).toContain('BOTL Farm Fresh Egg Availability');
+    expect(withCustom.html).toContain('<p class="fw-cal-intro">Order at <a href="https://botlfarm.com/shop"');
+    expect(withCustom.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(withCustom.html).toContain('https://botlfarm.com/contact');
+    expect(withCustom.html).toContain('data-fw-tz="America/New_York"');
+    expect(withCustom.html).toContain('data-fw-date="2026-11-23"');
+    expect(withCustom.html).toContain('<script>(function(){');
+
+    // Empty footer hides footer element; autoAdvanceToday: false emits zero <script> tags
+    const staticNoFooter = generatePublicAvailability({
+      items: [eggsItem],
+      days,
+      channels: [],
+      today: '2026-11-23',
+      weeks: 2,
+      timezone: 'America/New_York',
+      now: new Date('2026-11-23T15:00:00Z'),
+      footerText: '',
+      autoAdvanceToday: false,
+    });
+
+    expect(staticNoFooter.html).not.toContain('<p class="fw-cal-foot">');
+    expect(staticNoFooter.html).not.toContain('<script');
   });
 });

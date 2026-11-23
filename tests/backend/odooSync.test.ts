@@ -3,9 +3,10 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createExpressApp } from '../../src/server/app';
-import { loadRuntimeConfig } from '../../src/server/config';
+import { loadRuntimeConfig, normalizeOdooBaseUrl } from '../../src/server/config';
 import { DatabaseManager } from '../../src/server/db';
 import {
+  callOdooJson2,
   stripHtmlToPlainText,
   syncOdooQuotations,
   type FetchLike,
@@ -957,5 +958,148 @@ describe('Odoo 19.3 /json/2/ Synchronization, Chatter Filtering & Reconciliation
       await new Promise<void>((resolve) => server.close(() => resolve()));
       mgr.close();
     }
+  });
+
+  it('normalizes Odoo URLs by stripping /odoo, /web, and /json/2 suffixes while preserving reverse-proxy paths', () => {
+    expect(normalizeOdooBaseUrl('https://botlfarm.odoo.com/')).toBe('https://botlfarm.odoo.com');
+    expect(normalizeOdooBaseUrl('https://botlfarm.odoo.com/odoo')).toBe('https://botlfarm.odoo.com');
+    expect(normalizeOdooBaseUrl('https://botlfarm.odoo.com/odoo/sales/42?debug=1')).toBe(
+      'https://botlfarm.odoo.com'
+    );
+    expect(normalizeOdooBaseUrl('https://botlfarm.odoo.com/web#action=123')).toBe(
+      'https://botlfarm.odoo.com'
+    );
+    expect(normalizeOdooBaseUrl('https://botlfarm.odoo.com/json/2/')).toBe(
+      'https://botlfarm.odoo.com'
+    );
+    expect(normalizeOdooBaseUrl('https://botlfarm.odoo.com/json/2/sale.order/search_read')).toBe(
+      'https://botlfarm.odoo.com'
+    );
+    expect(normalizeOdooBaseUrl('https://farm.example.com/erp/odoo/sales')).toBe(
+      'https://farm.example.com/erp'
+    );
+    expect(normalizeOdooBaseUrl('ftp://botlfarm.odoo.com')).toBe('');
+  });
+
+  it('follows HTTP 301/302 redirects while preserving POST, headers, and JSON body and blocks unsafe redirects', async () => {
+    const calls: Array<{ url: string; method?: string; redirect?: RequestRedirect; auth?: string; body?: string }> = [];
+
+    // 1. HTTP -> HTTPS (301) followed by apex -> www (302) must preserve POST + Bearer + body
+    const redirectFetch: FetchLike = async (url, init) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({
+        url,
+        method: init?.method,
+        redirect: init?.redirect,
+        auth: headers.Authorization,
+        body: typeof init?.body === 'string' ? init.body : undefined,
+      });
+
+      if (url === 'http://farm.example.com/json/2/sale.order/search_read') {
+        return new Response(null, {
+          status: 301,
+          headers: { location: 'https://farm.example.com/json/2/sale.order/search_read' },
+        });
+      }
+      if (url === 'https://farm.example.com/json/2/sale.order/search_read') {
+        return new Response(null, {
+          status: 302,
+          headers: { location: 'https://www.farm.example.com/json/2/sale.order/search_read' },
+        });
+      }
+      return new Response(JSON.stringify([{ id: 42 }]), { status: 200 });
+    };
+
+    const rows = await callOdooJson2<Array<{ id: number }>>({
+      odoo: {
+        url: 'http://farm.example.com/odoo/sales',
+        db: 'botl_prod',
+        apiKey: 'super-secret-api-key',
+        source: 'ha_options',
+      },
+      model: 'sale.order',
+      method: 'search_read',
+      payload: { domain: [], fields: ['id'], limit: 1 },
+      fetchFn: redirectFetch,
+    });
+
+    expect(rows).toEqual([{ id: 42 }]);
+    expect(calls).toHaveLength(3);
+    expect(calls.map((c) => c.url)).toEqual([
+      'http://farm.example.com/json/2/sale.order/search_read',
+      'https://farm.example.com/json/2/sale.order/search_read',
+      'https://www.farm.example.com/json/2/sale.order/search_read',
+    ]);
+    for (const c of calls) {
+      expect(c.method).toBe('POST');
+      expect(c.redirect).toBe('manual');
+      expect(c.auth).toBe('bearer super-secret-api-key');
+      expect(c.body).toContain('"fields":["id"]');
+    }
+
+    // 2. HTTPS -> HTTP downgrade must be rejected without leaking API key
+    await expect(
+      callOdooJson2({
+        odoo: {
+          url: 'https://farm.example.com',
+          db: 'botl_prod',
+          apiKey: 'super-secret-api-key',
+          source: 'ha_options',
+        },
+        model: 'sale.order',
+        method: 'search_read',
+        payload: { domain: [] },
+        fetchFn: async () =>
+          new Response(null, {
+            status: 301,
+            headers: { location: 'http://farm.example.com/json/2/sale.order/search_read' },
+          }),
+      })
+    ).rejects.toThrow(/Refused insecure redirect from HTTPS to HTTP/);
+
+    // 3. Cross-host redirect must be rejected with helpful origin message and never expose the API key
+    let crossHostErr = '';
+    try {
+      await callOdooJson2({
+        odoo: {
+          url: 'https://custom.farm.example',
+          db: 'botl_prod',
+          apiKey: 'super-secret-api-key',
+          source: 'ha_options',
+        },
+        model: 'sale.order',
+        method: 'search_read',
+        payload: { domain: [] },
+        fetchFn: async () =>
+          new Response(null, {
+            status: 301,
+            headers: { location: 'https://botlfarm.odoo.com/json/2/sale.order/search_read' },
+          }),
+      });
+    } catch (err) {
+      crossHostErr = err instanceof Error ? err.message : String(err);
+    }
+    expect(crossHostErr).toContain('https://botlfarm.odoo.com');
+    expect(crossHostErr).not.toContain('super-secret-api-key');
+
+    // 4. Redirect off /json/2/ (e.g. /web/login or database selector) must give a clear error
+    await expect(
+      callOdooJson2({
+        odoo: {
+          url: 'https://botlfarm.odoo.com',
+          db: 'wrong_db',
+          apiKey: 'super-secret-api-key',
+          source: 'ha_options',
+        },
+        model: 'sale.order',
+        method: 'search_read',
+        payload: { domain: [] },
+        fetchFn: async () =>
+          new Response(null, {
+            status: 303,
+            headers: { location: '/web/database/selector' },
+          }),
+      })
+    ).rejects.toThrow(/Redirected to https:\/\/botlfarm\.odoo\.com\/web\/database\/selector/);
   });
 });

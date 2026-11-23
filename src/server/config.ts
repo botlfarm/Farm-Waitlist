@@ -42,7 +42,7 @@ function readHaOptions(optionsPath: string): HaOptionsFile | null {
 }
 
 export function normalizeOdooBaseUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim().replace(/\/+$/, '');
+  const trimmed = rawUrl.trim();
   if (!trimmed) return '';
   let parsed: URL;
   try {
@@ -53,7 +53,10 @@ export function normalizeOdooBaseUrl(rawUrl: string): string {
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
     return '';
   }
-  return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '');
+  const cleanedPath = parsed.pathname
+    .replace(/\/(odoo|web|json\/2|jsonrpc|xmlrpc)(\/.*)?$/i, '')
+    .replace(/\/+$/, '');
+  return `${parsed.origin}${cleanedPath}`;
 }
 
 export function loadRuntimeConfig(overrides?: Partial<RuntimeConfig>): RuntimeConfig {

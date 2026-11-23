@@ -1,3 +1,8 @@
+import {
+  parseSafeRichMessageSegments,
+  renderMessageToPlainText,
+  renderMessageToSafeHtml,
+} from '../shared/generators';
 import type {
   AppSettings,
   BackupInfo,
@@ -105,6 +110,74 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
   } finally {
     document.body.removeChild(textarea);
   }
+}
+
+/**
+ * Copies a message with clickable HTML links (text/html + text/plain) for email composers,
+ * with a safe DOM-node execCommand fallback for non-HTTPS local Home Assistant Ingress iframes.
+ */
+export async function copyRichMessageToClipboard(rawMessage: string): Promise<boolean> {
+  const html = renderMessageToSafeHtml(rawMessage);
+  const plainText = renderMessageToPlainText(rawMessage);
+  const segments = parseSafeRichMessageSegments(rawMessage);
+  const hasLinks = segments.some((s) => s.type === 'link');
+
+  if (
+    typeof navigator !== 'undefined' &&
+    typeof ClipboardItem !== 'undefined' &&
+    typeof navigator.clipboard?.write === 'function'
+  ) {
+    try {
+      const item = new ClipboardItem({
+        'text/html': new Blob([html], { type: 'text/html' }),
+        'text/plain': new Blob([plainText], { type: 'text/plain' }),
+      });
+      await navigator.clipboard.write([item]);
+      return true;
+    } catch {
+      // Fall through to safe DOM copy
+    }
+  }
+
+  if (hasLinks && typeof document !== 'undefined' && typeof window !== 'undefined') {
+    const container = document.createElement('div');
+    container.setAttribute('contenteditable', 'true');
+    container.style.position = 'fixed';
+    container.style.top = '-9999px';
+    container.style.left = '-9999px';
+    container.style.whiteSpace = 'pre-wrap';
+
+    for (const seg of segments) {
+      if (seg.type === 'newline') {
+        container.appendChild(document.createElement('br'));
+      } else if (seg.type === 'link') {
+        const anchor = document.createElement('a');
+        anchor.href = seg.href;
+        anchor.textContent = seg.label;
+        container.appendChild(anchor);
+      } else {
+        container.appendChild(document.createTextNode(seg.text));
+      }
+    }
+
+    document.body.appendChild(container);
+    const selection = window.getSelection();
+    const range = document.createRange();
+    try {
+      range.selectNodeContents(container);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      const ok = document.execCommand('copy');
+      selection?.removeAllRanges();
+      if (ok) return true;
+    } catch {
+      // Fall through to plain text copy
+    } finally {
+      document.body.removeChild(container);
+    }
+  }
+
+  return copyTextToClipboard(plainText);
 }
 
 export const api = {
@@ -227,9 +300,12 @@ export const api = {
     }),
 
   preApproveOrder: (id: number) =>
-    requestJson<{ order: OrderRecord; message: string }>(`./api/orders/${id}/pre-approve`, {
-      method: 'POST',
-    }),
+    requestJson<{ order: OrderRecord; message: string; selectedTemplateId?: string | null }>(
+      `./api/orders/${id}/pre-approve`,
+      {
+        method: 'POST',
+      }
+    ),
 
   releaseHold: (id: number) =>
     requestJson<OrderRecord>(`./api/orders/${id}/release-hold`, { method: 'POST' }),

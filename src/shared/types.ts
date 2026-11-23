@@ -7,6 +7,17 @@ export type AvailabilityTier = 'green' | 'amber' | 'red';
 export type SyncInterval = '15m' | '30m' | '1h' | '6h' | 'manual';
 export type BackupTrigger = 'manual' | 'scheduled' | 'pre-migrate' | 'pre-restore';
 export type OrderMergeItemStrategy = 'keep_target' | 'use_source' | 'combine';
+export type TemplateFormat = 'html' | 'plain';
+
+export interface PreApprovalTemplate {
+  id: string;
+  name: string;
+  format: TemplateFormat;
+  body: string;
+  isDefault: boolean;
+  channelIds: number[];
+  itemIds: number[];
+}
 
 export interface IgnoredDateRange {
   id: string;
@@ -21,10 +32,15 @@ export interface AppSettings {
   odooSyncCutoffDate: string | null; // YYYY-MM-DD in local timezone
   odooIgnoredDateRanges: IgnoredDateRange[];
   preApprovalTemplate: string;
+  preApprovalTemplates?: PreApprovalTemplate[];
   holdThresholdHours: number;
   backupScheduleEnabled: boolean;
   backupRetentionDays: number;
   publicSnippetWeeks: number;
+  publicSnippetHeaderTitle?: string;
+  publicSnippetHeaderText?: string;
+  publicSnippetFooterText?: string;
+  publicSnippetAutoAdvanceToday?: boolean;
 }
 
 export interface TrackedItem {
@@ -262,6 +278,10 @@ export interface PublicAvailabilityResult {
   generatedAtDisplay: string;
   timezone: string;
   weeks: number;
+  headerTitle?: string;
+  headerText?: string;
+  footerText?: string;
+  autoAdvanceToday?: boolean;
   days: PublicAvailabilityDay[];
   calendarDays: PublicAvailabilityCalendarDay[];
   html: string;

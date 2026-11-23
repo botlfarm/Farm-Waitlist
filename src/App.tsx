@@ -3,6 +3,7 @@ import { AvailabilitySnippetView } from './components/AvailabilitySnippetView';
 import { CalendarWorkspace } from './components/CalendarWorkspace';
 import { DayDetailDrawer } from './components/DayDetailDrawer';
 import { OrderDetailDrawer } from './components/OrderDetailDrawer';
+import { OrderListView } from './components/OrderListView';
 import { PreApprovalModal } from './components/PreApprovalModal';
 import { QuickAddOrderModal } from './components/QuickAddOrderModal';
 import { SettingsView } from './components/SettingsView';
@@ -38,9 +39,11 @@ export default function App() {
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   const [preApprovalState, setPreApprovalState] = useState<{
     open: boolean;
+    order: OrderRecord | null;
     customerName: string;
     message: string;
-  }>({ open: false, customerName: '', message: '' });
+    templateId: string | null;
+  }>({ open: false, order: null, customerName: '', message: '', templateId: null });
 
   const [weekdayPrompt, setWeekdayPrompt] = useState<WeekdayConfirmPrompt | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -167,12 +170,14 @@ export default function App() {
 
   const handlePreApprove = async (orderId: number) => {
     try {
-      const { order, message } = await api.preApproveOrder(orderId);
+      const { order, message, selectedTemplateId } = await api.preApproveOrder(orderId);
       await refreshWorkspace();
       setPreApprovalState({
         open: true,
+        order,
         customerName: order.customerName,
         message,
+        templateId: selectedTemplateId ?? null,
       });
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to pre-approve', 'error');
@@ -269,6 +274,17 @@ export default function App() {
             />
           )}
 
+          {activeTab === 'orders' && (
+            <OrderListView
+              today={workspace.today}
+              orders={workspace.orders}
+              items={workspace.items}
+              channels={workspace.channels}
+              onSelectOrder={(order) => setSelectedOrderId(order.id)}
+              onToast={showToast}
+            />
+          )}
+
           {activeTab === 'standing' && (
             <StandingOrdersView
               today={workspace.today}
@@ -294,7 +310,12 @@ export default function App() {
           )}
 
           {activeTab === 'snippet' && (
-            <AvailabilitySnippetView defaultWeeks={workspace.settings.publicSnippetWeeks} />
+            <AvailabilitySnippetView
+              defaultWeeks={workspace.settings.publicSnippetWeeks}
+              settings={workspace.settings}
+              onSettingsSaved={() => refreshWorkspace()}
+              onToast={showToast}
+            />
           )}
 
           {activeTab === 'settings' && (
@@ -468,9 +489,22 @@ export default function App() {
           {/* Pre-Approval Ready-to-Copy Modal */}
           <PreApprovalModal
             open={preApprovalState.open}
+            order={preApprovalState.order}
             customerName={preApprovalState.customerName}
             initialMessage={preApprovalState.message}
-            onClose={() => setPreApprovalState({ open: false, customerName: '', message: '' })}
+            initialTemplateId={preApprovalState.templateId}
+            templates={workspace.settings.preApprovalTemplates ?? []}
+            items={workspace.items}
+            channels={workspace.channels}
+            onClose={() =>
+              setPreApprovalState({
+                open: false,
+                order: null,
+                customerName: '',
+                message: '',
+                templateId: null,
+              })
+            }
           />
 
           {/* Weekday Channel Mismatch Confirmation Dialog */}

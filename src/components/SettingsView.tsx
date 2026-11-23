@@ -2,15 +2,20 @@ import {
   Check,
   Database,
   Download,
+  Link2,
+  Mail,
+  MessageSquare,
   Plus,
   RefreshCw,
   RotateCcw,
+  Star,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
 import { useEffect, useState, type ChangeEvent } from 'react';
 import { api } from '../lib/api';
+import { isSafeHttpUrl } from '../shared/generators';
 import {
   ISO_WEEKDAY_LABELS,
   formatLocalDateTime,
@@ -22,10 +27,13 @@ import type {
   IgnoredDateRange,
   OdooConnectionStatus,
   PickupChannel,
+  PreApprovalTemplate,
   SupplyMode,
   SyncInterval,
+  TemplateFormat,
   TrackedItem,
 } from '../shared/types';
+import { RichMessagePreview } from './RichMessagePreview';
 
 type SettingsSection = 'items' | 'channels' | 'odoo' | 'templates' | 'backups';
 
@@ -75,6 +83,14 @@ export function SettingsView({
 
   // --- Settings form state ---
   const [draftSettings, setDraftSettings] = useState<AppSettings>(settings);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
+    () =>
+      settings.preApprovalTemplates?.find((t) => t.isDefault)?.id ??
+      settings.preApprovalTemplates?.[0]?.id ??
+      'default-email'
+  );
+  const [linkLabelDraft, setLinkLabelDraft] = useState('');
+  const [linkUrlDraft, setLinkUrlDraft] = useState('');
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
   const [rangeLabel, setRangeLabel] = useState('');
@@ -88,7 +104,98 @@ export function SettingsView({
 
   useEffect(() => {
     setDraftSettings(settings);
+    const list = settings.preApprovalTemplates ?? [];
+    if (list.length > 0 && !list.some((t) => t.id === selectedTemplateId)) {
+      setSelectedTemplateId(list.find((t) => t.isDefault)?.id ?? list[0].id);
+    }
   }, [settings]);
+
+  const draftTemplates: PreApprovalTemplate[] =
+    draftSettings.preApprovalTemplates && draftSettings.preApprovalTemplates.length > 0
+      ? draftSettings.preApprovalTemplates
+      : [
+          {
+            id: 'default-email',
+            name: 'Default Email',
+            format: 'html',
+            body: draftSettings.preApprovalTemplate,
+            isDefault: true,
+            channelIds: [],
+            itemIds: [],
+          },
+        ];
+
+  const activeTemplate: PreApprovalTemplate =
+    draftTemplates.find((t) => t.id === selectedTemplateId) ?? draftTemplates[0];
+
+  const updateTemplatesList = (nextList: PreApprovalTemplate[]) => {
+    const defaultTmpl = nextList.find((t) => t.isDefault) ?? nextList[0];
+    setDraftSettings({
+      ...draftSettings,
+      preApprovalTemplates: nextList,
+      preApprovalTemplate: defaultTmpl?.body ?? draftSettings.preApprovalTemplate,
+    });
+  };
+
+  const updateActiveTemplate = (patch: Partial<PreApprovalTemplate>) => {
+    const nextList = draftTemplates.map((t) => {
+      if (t.id !== activeTemplate.id) {
+        return patch.isDefault ? { ...t, isDefault: false } : t;
+      }
+      return { ...t, ...patch };
+    });
+    updateTemplatesList(nextList);
+  };
+
+  const handleAddTemplate = () => {
+    const newId = `tmpl-${Date.now()}`;
+    const newTemplate: PreApprovalTemplate = {
+      id: newId,
+      name: `New Template ${draftTemplates.length + 1}`,
+      format: 'html',
+      body: "Hey {{name}}, you're pre-approved for {{items_summary}} on {{date}} ({{channel}}).",
+      isDefault: false,
+      channelIds: [],
+      itemIds: [],
+    };
+    updateTemplatesList([...draftTemplates, newTemplate]);
+    setSelectedTemplateId(newId);
+  };
+
+  const handleDeleteTemplate = (id: string) => {
+    if (draftTemplates.length <= 1) return;
+    const remaining = draftTemplates.filter((t) => t.id !== id);
+    const hasDefault = remaining.some((t) => t.isDefault);
+    const normalized = hasDefault
+      ? remaining
+      : remaining.map((t, idx) => ({ ...t, isDefault: idx === 0 }));
+    updateTemplatesList(normalized);
+    if (selectedTemplateId === id) {
+      setSelectedTemplateId(normalized[0].id);
+    }
+  };
+
+  const handleInsertStoreLink = () => {
+    const rawUrl = linkUrlDraft.trim();
+    if (!rawUrl) {
+      onToast('Enter a store URL (starting with https://)', 'error');
+      return;
+    }
+    const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+    if (!isSafeHttpUrl(normalizedUrl)) {
+      onToast('Please enter a valid http:// or https:// URL', 'error');
+      return;
+    }
+    const label = linkLabelDraft.trim() || 'Order Here';
+    const snippet =
+      activeTemplate.format === 'html'
+        ? `<a href="${normalizedUrl}">${label}</a>`
+        : `${label}: ${normalizedUrl}`;
+    const separator = activeTemplate.body.trim().length > 0 && !activeTemplate.body.endsWith(' ') ? ' ' : '';
+    updateActiveTemplate({ body: `${activeTemplate.body}${separator}${snippet}` });
+    setLinkLabelDraft('');
+    setLinkUrlDraft('');
+  };
 
   const loadBackups = async () => {
     setLoadingBackups(true);
@@ -1059,31 +1166,347 @@ export function SettingsView({
 
       {/* 4. TEMPLATES & HOLDS */}
       {section === 'templates' && (
-        <section className="max-w-3xl rounded-lg border border-[#283340] bg-[#161D24] p-5">
-          <h2 className="font-['Plus_Jakarta_Sans'] text-base font-bold text-[#F0F6FC]">
-            Pre-Approval Message Template &amp; Hold Timer
-          </h2>
-          <div className="mt-4 space-y-4">
-            <div>
-              <label htmlFor="tmpl-text" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
-                Pre-Approval Copy Template
-              </label>
-              <textarea
-                id="tmpl-text"
-                data-testid="settings-template-textarea"
-                rows={4}
-                value={draftSettings.preApprovalTemplate}
-                onChange={(e) =>
-                  setDraftSettings({ ...draftSettings, preApprovalTemplate: e.target.value })
-                }
-                className="w-full rounded-md border border-[#283340] bg-[#0F1419] p-3 text-sm text-[#F0F6FC]"
-              />
-              <p className="mt-1 font-mono text-[11px] text-[#8B949E]">
-                Variables: {'{{name}}'}, {'{{items_summary}}'}, {'{{date}}'}, {'{{channel}}'}
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+            {/* Template List Sidebar */}
+            <section className="rounded-lg border border-[#283340] bg-[#161D24] p-5 lg:col-span-4">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="font-['Plus_Jakarta_Sans'] text-base font-bold text-[#F0F6FC]">
+                  Message Templates ({draftTemplates.length})
+                </h2>
+                <button
+                  type="button"
+                  data-testid="add-template-btn"
+                  onClick={handleAddTemplate}
+                  className="inline-flex min-h-[34px] items-center gap-1 rounded-md border border-[#38BDF8]/60 bg-[#0EA5E9]/15 px-2.5 py-1 text-xs font-semibold text-[#38BDF8] hover:bg-[#0EA5E9]/25"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  New
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-[#8B949E]">
+                Create separate Email (HTML link) and Text/SMS templates, or assign a template to
+                specific pickup locations or items.
               </p>
-            </div>
 
-            <div className="grid grid-cols-2 gap-4">
+              <div className="mt-4 space-y-2" data-testid="template-list">
+                {draftTemplates.map((tmpl) => {
+                  const selected = tmpl.id === activeTemplate.id;
+                  const ruleLabels: string[] = [];
+                  if (tmpl.channelIds.length > 0) {
+                    const names = tmpl.channelIds
+                      .map((id) => channels.find((c) => c.id === id)?.name)
+                      .filter(Boolean);
+                    if (names.length > 0) ruleLabels.push(names.join(', '));
+                  }
+                  if (tmpl.itemIds.length > 0) {
+                    const names = tmpl.itemIds
+                      .map((id) => items.find((i) => i.id === id)?.name)
+                      .filter(Boolean);
+                    if (names.length > 0) ruleLabels.push(names.join(', '));
+                  }
+                  return (
+                    <button
+                      key={tmpl.id}
+                      type="button"
+                      data-testid={`template-item-${tmpl.id}`}
+                      onClick={() => setSelectedTemplateId(tmpl.id)}
+                      className={`w-full rounded-md border p-3 text-left transition-colors ${
+                        selected
+                          ? 'border-[#38BDF8] bg-[#0EA5E9]/15'
+                          : 'border-[#283340] bg-[#0F1419] hover:border-[#3B4958]'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="inline-flex min-w-0 items-center gap-1.5 text-sm font-semibold text-[#F0F6FC]">
+                          {tmpl.format === 'html' ? (
+                            <Mail className="h-3.5 w-3.5 shrink-0 text-[#38BDF8]" />
+                          ) : (
+                            <MessageSquare className="h-3.5 w-3.5 shrink-0 text-[#8B949E]" />
+                          )}
+                          <span className="truncate">{tmpl.name}</span>
+                        </span>
+                        {tmpl.isDefault && (
+                          <span className="shrink-0 rounded bg-[#0EA5E9]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#38BDF8]">
+                            Default
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-1 text-[11px] text-[#8B949E]">
+                        {tmpl.format === 'html' ? 'Email · HTML Links' : 'Text / SMS · Plain'}
+                        {ruleLabels.length > 0 ? ` · Auto: ${ruleLabels.join(' + ')}` : ''}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            {/* Active Template Editor */}
+            <section className="rounded-lg border border-[#283340] bg-[#161D24] p-5 lg:col-span-8">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h3 className="font-['Plus_Jakarta_Sans'] text-base font-bold text-[#F0F6FC]">
+                  Edit Template
+                </h3>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="settings-template-default-btn"
+                    disabled={activeTemplate.isDefault}
+                    onClick={() => updateActiveTemplate({ isDefault: true })}
+                    className={`inline-flex min-h-[34px] items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium ${
+                      activeTemplate.isDefault
+                        ? 'border-[#38BDF8]/50 bg-[#0EA5E9]/15 text-[#38BDF8]'
+                        : 'border-[#283340] bg-[#0F1419] text-[#C9D1D9] hover:border-[#38BDF8]'
+                    }`}
+                  >
+                    <Star className="h-3.5 w-3.5" />
+                    {activeTemplate.isDefault ? 'Default Template' : 'Set as Default'}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="settings-template-delete-btn"
+                    disabled={draftTemplates.length <= 1}
+                    onClick={() => handleDeleteTemplate(activeTemplate.id)}
+                    className="inline-flex min-h-[34px] items-center gap-1 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1 text-xs font-medium text-[#8B949E] hover:border-[#F87171] hover:text-[#F87171] disabled:opacity-40"
+                    aria-label={`Delete ${activeTemplate.name}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Delete
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4 space-y-4">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <div>
+                    <label
+                      htmlFor="tmpl-name"
+                      className="mb-1 block text-xs font-medium text-[#C9D1D9]"
+                    >
+                      Template Name
+                    </label>
+                    <input
+                      id="tmpl-name"
+                      data-testid="settings-template-name-input"
+                      type="text"
+                      value={activeTemplate.name}
+                      onChange={(e) => updateActiveTemplate({ name: e.target.value })}
+                      placeholder="e.g., Default Email, SMS / Text, Wooster Square"
+                      className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC]"
+                    />
+                  </div>
+
+                  <div>
+                    <span className="mb-1 block text-xs font-medium text-[#C9D1D9]">
+                      Delivery Format
+                    </span>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {(
+                        [
+                          { id: 'html', label: 'Email (HTML Links)' },
+                          { id: 'plain', label: 'Text / SMS (Plain)' },
+                        ] as Array<{ id: TemplateFormat; label: string }>
+                      ).map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          data-testid={`settings-template-format-${opt.id}`}
+                          onClick={() => updateActiveTemplate({ format: opt.id })}
+                          className={`min-h-[40px] rounded-md border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                            activeTemplate.format === opt.id
+                              ? 'border-[#38BDF8] bg-[#0EA5E9] text-[#0B1117]'
+                              : 'border-[#283340] bg-[#0F1419] text-[#C9D1D9] hover:border-[#38BDF8]'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Auto-Select Rules: Locations & Items */}
+                <div className="rounded-md border border-[#283340] bg-[#0F1419]/70 p-3.5 space-y-3">
+                  <div>
+                    <span className="text-xs font-semibold text-[#F0F6FC]">
+                      Auto-Select Rules (Optional)
+                    </span>
+                    <p className="mt-0.5 text-[11px] text-[#8B949E]">
+                      Leave blank to select manually or use as default. Choose specific pickup
+                      locations or items to auto-pick this template when pre-approving matching
+                      orders.
+                    </p>
+                  </div>
+
+                  {channels.length > 0 && (
+                    <div>
+                      <span className="mb-1.5 block text-[11px] font-medium text-[#C9D1D9]">
+                        Pickup Locations / Channels
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {channels.map((ch) => {
+                          const active = activeTemplate.channelIds.includes(ch.id);
+                          return (
+                            <button
+                              key={ch.id}
+                              type="button"
+                              data-testid={`settings-template-channel-${ch.id}`}
+                              onClick={() => {
+                                const next = active
+                                  ? activeTemplate.channelIds.filter((id) => id !== ch.id)
+                                  : [...activeTemplate.channelIds, ch.id];
+                                updateActiveTemplate({ channelIds: next });
+                              }}
+                              className={`min-h-[30px] rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
+                                active
+                                  ? 'border-[#38BDF8] bg-[#0EA5E9]/20 text-[#38BDF8]'
+                                  : 'border-[#283340] bg-[#161D24] text-[#8B949E] hover:text-[#E6EDF3]'
+                              }`}
+                            >
+                              {ch.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {items.length > 0 && (
+                    <div>
+                      <span className="mb-1.5 block text-[11px] font-medium text-[#C9D1D9]">
+                        Tracked Items
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {items.map((item) => {
+                          const active = activeTemplate.itemIds.includes(item.id);
+                          return (
+                            <button
+                              key={item.id}
+                              type="button"
+                              data-testid={`settings-template-item-${item.id}`}
+                              onClick={() => {
+                                const next = active
+                                  ? activeTemplate.itemIds.filter((id) => id !== item.id)
+                                  : [...activeTemplate.itemIds, item.id];
+                                updateActiveTemplate({ itemIds: next });
+                              }}
+                              className={`min-h-[30px] rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
+                                active
+                                  ? 'border-[#38BDF8] bg-[#0EA5E9]/20 text-[#38BDF8]'
+                                  : 'border-[#283340] bg-[#161D24] text-[#8B949E] hover:text-[#E6EDF3]'
+                              }`}
+                            >
+                              {item.name}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Insert Store Link Helper */}
+                <div className="rounded-md border border-[#283340] bg-[#0F1419]/70 p-3">
+                  <div className="mb-2 flex items-center gap-1.5 text-xs font-medium text-[#C9D1D9]">
+                    <Link2 className="h-3.5 w-3.5 text-[#38BDF8]" />
+                    Insert Store Page Link
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+                    <input
+                      type="text"
+                      data-testid="template-link-label-input"
+                      value={linkLabelDraft}
+                      onChange={(e) => setLinkLabelDraft(e.target.value)}
+                      placeholder="Link text (e.g., Order Eggs Here)"
+                      className="min-h-[36px] rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 text-xs text-[#F0F6FC] placeholder:text-[#6E7681] sm:col-span-4"
+                    />
+                    <input
+                      type="url"
+                      data-testid="template-link-url-input"
+                      value={linkUrlDraft}
+                      onChange={(e) => setLinkUrlDraft(e.target.value)}
+                      placeholder="https://yourstore.com/product-page"
+                      className="min-h-[36px] rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 font-mono text-xs text-[#F0F6FC] placeholder:text-[#6E7681] sm:col-span-5"
+                    />
+                    <button
+                      type="button"
+                      data-testid="template-insert-link-btn"
+                      onClick={handleInsertStoreLink}
+                      className="min-h-[36px] rounded-md border border-[#38BDF8]/60 bg-[#1E2730] px-3 py-1.5 text-xs font-semibold text-[#38BDF8] hover:bg-[#25313D] sm:col-span-3"
+                    >
+                      + Insert Link
+                    </button>
+                  </div>
+                </div>
+
+                {/* Template Body + Variable Chips */}
+                <div>
+                  <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+                    <label
+                      htmlFor="tmpl-text"
+                      className="text-xs font-medium text-[#C9D1D9]"
+                    >
+                      Message Body
+                    </label>
+                    <div className="flex flex-wrap items-center gap-1">
+                      {['{{name}}', '{{items_summary}}', '{{date}}', '{{channel}}'].map((v) => (
+                        <button
+                          key={v}
+                          type="button"
+                          onClick={() =>
+                            updateActiveTemplate({
+                              body: `${activeTemplate.body}${activeTemplate.body && !activeTemplate.body.endsWith(' ') ? ' ' : ''}${v}`,
+                            })
+                          }
+                          className="rounded border border-[#283340] bg-[#0F1419] px-1.5 py-0.5 font-mono text-[10px] text-[#38BDF8] hover:border-[#38BDF8]"
+                        >
+                          +{v}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <textarea
+                    id="tmpl-text"
+                    data-testid="settings-template-textarea"
+                    rows={5}
+                    value={activeTemplate.body}
+                    onChange={(e) => updateActiveTemplate({ body: e.target.value })}
+                    className="w-full rounded-md border border-[#283340] bg-[#0F1419] p-3 text-sm leading-relaxed text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+                  />
+                  <p className="mt-1 text-[11px] text-[#8B949E]">
+                    Supports clickable links using{' '}
+                    <code className="font-mono text-[#C9D1D9]">
+                      &lt;a href=&quot;https://...&quot;&gt;Store Page&lt;/a&gt;
+                    </code>{' '}
+                    or <code className="font-mono text-[#C9D1D9]">[Store Page](https://...)</code>.
+                  </p>
+                </div>
+
+                {/* Live Preview */}
+                <div>
+                  <span className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
+                    Live Sample Preview
+                  </span>
+                  <RichMessagePreview
+                    testId="settings-template-preview"
+                    text={activeTemplate.body
+                      .replace(/\{\{\s*name\s*\}\}/gi, 'Alex')
+                      .replace(/\{\{\s*items_summary\s*\}\}/gi, '2 dozens Standard Eggs')
+                      .replace(/\{\{\s*date\s*\}\}/gi, 'Sat, Nov 28, 2026')
+                      .replace(/\{\{\s*channel\s*\}\}/gi, channels[0]?.name ?? 'Farm Store')}
+                  />
+                </div>
+              </div>
+            </section>
+          </div>
+
+          {/* Thresholds & Save Bar */}
+          <section className="rounded-lg border border-[#283340] bg-[#161D24] p-5">
+            <h2 className="font-['Plus_Jakarta_Sans'] text-base font-bold text-[#F0F6FC]">
+              Hold Timer &amp; Public Snippet Defaults
+            </h2>
+            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
                 <label htmlFor="hold-hours" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
                   Aging Hold Warning Threshold (Hours)
@@ -1127,16 +1550,24 @@ export function SettingsView({
               </div>
             </div>
 
-            <button
-              type="button"
-              data-testid="save-template-settings-btn"
-              onClick={() => void handleSaveSettings()}
-              className="min-h-[40px] rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] hover:bg-[#38BDF8]"
-            >
-              Save Templates &amp; Thresholds
-            </button>
-          </div>
-        </section>
+            <div className="mt-4 flex justify-end">
+              <button
+                type="button"
+                data-testid="save-template-settings-btn"
+                onClick={() =>
+                  void handleSaveSettings({
+                    preApprovalTemplates: draftTemplates,
+                    preApprovalTemplate:
+                      (draftTemplates.find((t) => t.isDefault) ?? draftTemplates[0]).body,
+                  })
+                }
+                className="min-h-[40px] rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] hover:bg-[#38BDF8]"
+              >
+                Save Templates &amp; Thresholds
+              </button>
+            </div>
+          </section>
+        </div>
       )}
 
       {/* 5. BACKUP & RESTORE */}

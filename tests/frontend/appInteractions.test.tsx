@@ -680,4 +680,312 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
       expect(JSON.parse(supplyCalls[0].body)).toMatchObject({ actualOnHand: null });
     });
   });
+
+  it('allows backspacing egg quantities to empty and typing a new number without leaving a leading 0', async () => {
+    const ws = makeBaseWorkspace();
+    const updateCalls: Array<{ url: string; method: string; body: string }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        const method = init?.method ?? 'GET';
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders' && method === 'POST') {
+          updateCalls.push({ url: input, method, body: String(init?.body ?? '') });
+          return new Response(JSON.stringify({ ...ws.orders[0], id: 99 }), { status: 201 });
+        }
+        if (input === './api/orders/10' && method === 'PUT') {
+          updateCalls.push({ url: input, method, body: String(init?.body ?? '') });
+          return new Response(JSON.stringify(ws.orders[0]), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    // 1. Test Quick Add Order modal quantity input
+    await user.click(await screen.findByTestId('quick-add-order-btn'));
+    const qaQty = await screen.findByTestId('quick-add-item-qty-0');
+    expect(qaQty).toHaveValue('1');
+
+    await user.click(qaQty);
+    await user.keyboard('{Backspace}');
+    expect(qaQty).toHaveValue('');
+
+    await user.type(qaQty, '6');
+    expect(qaQty).toHaveValue('6');
+
+    await user.type(screen.getByTestId('quick-add-customer-input'), 'Hannah Eggbuyer');
+    await user.click(screen.getByTestId('quick-add-submit-btn'));
+
+    await waitFor(() => {
+      const postCall = updateCalls.find((c) => c.url === './api/orders' && c.method === 'POST');
+      expect(postCall).toBeDefined();
+      expect(JSON.parse(postCall!.body).items).toEqual([{ trackedItemId: 1, quantity: 6 }]);
+    });
+
+    // 2. Test OrderDetailDrawer quantity input
+    await user.click(screen.getByTestId('order-chip-10'));
+    const drawerQty = await screen.findByTestId('order-item-qty-0');
+    expect(drawerQty).toHaveValue('2');
+
+    await user.click(drawerQty);
+    await user.keyboard('{Backspace}');
+    expect(drawerQty).toHaveValue('');
+
+    await user.type(drawerQty, '4.5');
+    expect(drawerQty).toHaveValue('4.5');
+
+    await user.click(screen.getByTestId('order-save-btn'));
+    await waitFor(() => {
+      const putCall = updateCalls.find((c) => c.url === './api/orders/10' && c.method === 'PUT');
+      expect(putCall).toBeDefined();
+      expect(JSON.parse(putCall!.body).items).toEqual([{ trackedItemId: 1, quantity: 4.5 }]);
+    });
+  });
+
+  it('supports switching between multiple pre-approval templates with clickable HTML link preview', async () => {
+    const ws = makeBaseWorkspace();
+    ws.settings.preApprovalTemplates = [
+      {
+        id: 'default-email',
+        name: 'Default Email',
+        format: 'html',
+        body: 'Hi {{name}}, place your order for {{items_summary}} at <a href="https://botlfarm.com/shop">BOTL Farm Store</a> for {{date}}.',
+        isDefault: true,
+        channelIds: [],
+        itemIds: [],
+      },
+      {
+        id: 'text-sms',
+        name: 'Text / SMS',
+        format: 'plain',
+        body: 'Hi {{name}}! Ready for {{date}} ({{channel}}): https://botlfarm.com/shop',
+        isDefault: false,
+        channelIds: [],
+        itemIds: [],
+      },
+    ];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/10/pre-approve') {
+          return new Response(
+            JSON.stringify({
+              order: { ...ws.orders[0], status: 'pre_approved' },
+              message:
+                'Hi Clara Farmer, place your order for 2 dozens Standard Eggs at <a href="https://botlfarm.com/shop">BOTL Farm Store</a> for Mon, Nov 23, 2026.',
+              selectedTemplateId: 'default-email',
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId('order-chip-10'));
+    await user.click(await screen.findByTestId('order-pre-approve-btn'));
+    expect(await screen.findByTestId('pre-approval-modal')).toBeInTheDocument();
+
+    // Live HTML link preview renders clickable <a> tag safely
+    const preview = screen.getByTestId('pre-approval-preview');
+    const link = preview.querySelector('a');
+    expect(link).not.toBeNull();
+    expect(link).toHaveAttribute('href', 'https://botlfarm.com/shop');
+    expect(link).toHaveTextContent('BOTL Farm Store');
+    expect(screen.getByTestId('copy-pre-approval-btn')).toHaveTextContent('Copy Email (with Links)');
+    expect(screen.getByTestId('copy-pre-approval-plain-btn')).toBeInTheDocument();
+
+    // Switch to Text / SMS template -> updates message for this order
+    await user.click(screen.getByTestId('pre-approval-template-btn-text-sms'));
+    expect(screen.getByTestId('pre-approval-message-textarea')).toHaveValue(
+      'Hi Clara Farmer! Ready for Mon, Nov 23, 2026 (Farm Store): https://botlfarm.com/shop'
+    );
+    expect(screen.getByTestId('copy-pre-approval-btn')).toHaveTextContent('Copy Message');
+  });
+
+  it('displays the simple Order List view with dates, per-item quantities, totals, filters, and opens OrderDetailDrawer on row click', async () => {
+    const ws = makeBaseWorkspace();
+    ws.orders.push({
+      ...ws.orders[0],
+      id: 12,
+      status: 'confirmed',
+      slottedDate: '2026-11-24',
+      customerName: 'Sam Pullet',
+      odooQuotationId: null,
+      odooQuotationName: null,
+      items: [
+        { trackedItemId: 1, quantity: 4 },
+        { trackedItemId: 2, quantity: 3 },
+      ],
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId('nav-orders'));
+    expect(await screen.findByTestId('order-list-view')).toBeInTheDocument();
+
+    // Summary totals across all 3 orders: Standard Eggs = 2 + 3 + 4 = 9 dozens, Pullet Eggs = 3 dozens
+    expect(screen.getByTestId('order-list-total-item-1')).toHaveTextContent('9 dozens');
+    expect(screen.getByTestId('order-list-total-item-2')).toHaveTextContent('3 dozens');
+
+    // Table rows exist for all 3 orders
+    expect(screen.getByTestId('order-list-row-10')).toHaveTextContent('Clara Farmer');
+    expect(screen.getByTestId('order-list-row-11')).toHaveTextContent('Waitlist Walt');
+    expect(screen.getByTestId('order-list-row-12')).toHaveTextContent('Sam Pullet');
+
+    // Filter by Confirmed -> only Sam Pullet remains (4 Standard, 3 Pullet)
+    await user.selectOptions(screen.getByTestId('order-list-status-filter'), 'confirmed');
+    expect(screen.queryByTestId('order-list-row-10')).not.toBeInTheDocument();
+    expect(screen.getByTestId('order-list-row-12')).toHaveTextContent('Sam Pullet');
+    expect(screen.getByTestId('order-list-total-item-1')).toHaveTextContent('4 dozens');
+    expect(screen.getByTestId('order-list-total-item-2')).toHaveTextContent('3 dozens');
+
+    // Clicking a row opens the OrderDetailDrawer for that order
+    await user.click(screen.getByTestId('order-list-row-12'));
+    expect(await screen.findByTestId('order-detail-drawer')).toBeInTheDocument();
+    expect(screen.getByTestId('order-customer-name-input')).toHaveValue('Sam Pullet');
+  });
+
+  it('allows editing header title, intro text, footer text, and auto-advance Today toggle on Availability Snippet', async () => {
+    const ws = makeBaseWorkspace();
+    const settingsSaves: Array<Record<string, unknown>> = [];
+    let currentSnippetHtml = '<section class="fw-cal">Default HTML</section>';
+
+    const buildSnippetResponse = (): PublicAvailabilityResult => ({
+      generatedAtDisplay: 'Nov 23, 2026, 10:00 AM EST',
+      timezone: 'America/New_York',
+      weeks: 3,
+      headerTitle: ws.settings.publicSnippetHeaderTitle || 'Upcoming Pickup Availability',
+      headerText: ws.settings.publicSnippetHeaderText || '',
+      footerText: ws.settings.publicSnippetFooterText ?? 'Default footer',
+      autoAdvanceToday: ws.settings.publicSnippetAutoAdvanceToday ?? true,
+      days: [
+        {
+          date: '2026-11-23',
+          displayDate: 'Nov 23',
+          weekdayLabel: 'Mon',
+          channelNames: ['Farm Store'],
+          items: [
+            {
+              trackedItemId: 1,
+              itemName: 'Standard Eggs',
+              unitLabel: 'dozens',
+              status: 'Available',
+              approxAvailable: 9,
+              approxLabel: 'Available (~9 dozens)',
+            },
+          ],
+        },
+      ],
+      calendarDays: [
+        {
+          date: '2026-11-23',
+          displayDate: 'Nov 23',
+          weekdayLabel: 'Mon',
+          isoWeekday: 1,
+          isPast: false,
+          isToday: true,
+          channelNames: ['Farm Store'],
+          items: [
+            {
+              trackedItemId: 1,
+              itemName: 'Standard Eggs',
+              unitLabel: 'dozens',
+              status: 'Available',
+              approxAvailable: 9,
+              approxLabel: 'Available (~9 dozens)',
+            },
+          ],
+        },
+      ],
+      html: currentSnippetHtml,
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/settings' && init?.method === 'PUT') {
+          const patch = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+          settingsSaves.push(patch);
+          ws.settings = { ...ws.settings, ...patch };
+          currentSnippetHtml = `<section class="fw-cal"><h3>${String(patch.publicSnippetHeaderTitle ?? '')}</h3><p>${String(patch.publicSnippetFooterText ?? '')}</p></section>`;
+          return new Response(JSON.stringify({ settings: ws.settings, odooStatus: ws.odooStatus }), {
+            status: 200,
+          });
+        }
+        if (input.startsWith('./api/snippet')) {
+          return new Response(JSON.stringify(buildSnippetResponse()), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId('nav-snippet'));
+    expect(await screen.findByTestId('snippet-customize-panel')).toBeInTheDocument();
+
+    // Edit header title, header intro text (with store link), and footer text
+    await user.type(screen.getByTestId('snippet-header-title-input'), 'BOTL Farm Eggs');
+    await user.type(
+      screen.getByTestId('snippet-header-text-input'),
+      'Shop at https://botlfarm.com/shop'
+    );
+    const footerInput = screen.getByTestId('snippet-footer-text-input');
+    await user.clear(footerInput);
+    await user.type(footerInput, 'Updated farm pickup disclaimer.');
+
+    // Live preview immediately reflects all custom header/footer text + clickable link
+    expect(screen.getByTestId('snippet-preview-title')).toHaveTextContent('BOTL Farm Eggs');
+    const introPreview = screen.getByTestId('snippet-preview-header-text');
+    expect(introPreview.querySelector('a')).toHaveAttribute('href', 'https://botlfarm.com/shop');
+    expect(screen.getByTestId('snippet-preview-footer-text')).toHaveTextContent(
+      'Updated farm pickup disclaimer.'
+    );
+
+    // Clicking "Save & Copy HTML" persists settings, refreshes snippet, and copies updated HTML
+    await user.click(screen.getByTestId('copy-html-snippet-btn'));
+
+    await waitFor(() => {
+      expect(settingsSaves).toHaveLength(1);
+      expect(settingsSaves[0]).toMatchObject({
+        publicSnippetHeaderTitle: 'BOTL Farm Eggs',
+        publicSnippetHeaderText: 'Shop at https://botlfarm.com/shop',
+        publicSnippetFooterText: 'Updated farm pickup disclaimer.',
+        publicSnippetAutoAdvanceToday: true,
+      });
+      expect(writeText).toHaveBeenCalledWith(
+        expect.stringContaining('BOTL Farm Eggs')
+      );
+    });
+  });
 });

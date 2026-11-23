@@ -1,7 +1,7 @@
 import { Menu, Plus, X } from 'lucide-react';
 import { useState } from 'react';
 
-export type ActiveTab = 'calendar' | 'standing' | 'snippet' | 'settings';
+export type ActiveTab = 'calendar' | 'orders' | 'standing' | 'snippet' | 'settings';
 
 interface TopBarProps {
   activeTab: ActiveTab;
@@ -11,6 +11,7 @@ interface TopBarProps {
 
 const NAV_ITEMS: Array<{ id: ActiveTab; label: string; testId: string }> = [
   { id: 'calendar', label: 'Calendar', testId: 'nav-calendar' },
+  { id: 'orders', label: 'Orders', testId: 'nav-orders' },
   { id: 'standing', label: 'Standing Orders', testId: 'nav-standing' },
   { id: 'snippet', label: 'Availability Snippet', testId: 'nav-snippet' },
   { id: 'settings', label: 'Settings', testId: 'nav-settings' },

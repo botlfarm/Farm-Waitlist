@@ -37,7 +37,7 @@ export function QuickAddOrderModal({
   const [requestedDate, setRequestedDate] = useState(today);
   const [pickupChannelId, setPickupChannelId] = useState<string>('');
   const [notes, setNotes] = useState('');
-  const [lines, setLines] = useState<OrderItemLine[]>([]);
+  const [lines, setLines] = useState<Array<{ trackedItemId: number; qtyText: string }>>([]);
   const [error, setError] = useState<string | null>(null);
   const [weekdayWarning, setWeekdayWarning] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -53,7 +53,7 @@ export function QuickAddOrderModal({
     setNotes('');
     setError(null);
     setWeekdayWarning(null);
-    setLines(activeItems[0] ? [{ trackedItemId: activeItems[0].id, quantity: 1 }] : []);
+    setLines(activeItems[0] ? [{ trackedItemId: activeItems[0].id, qtyText: '1' }] : []);
   }, [open, today]);
 
   if (!open) return null;
@@ -61,7 +61,7 @@ export function QuickAddOrderModal({
   const addLine = () => {
     const unused = activeItems.find((i) => !lines.some((l) => l.trackedItemId === i.id)) ?? activeItems[0];
     if (!unused) return;
-    setLines([...lines, { trackedItemId: unused.id, quantity: 1 }]);
+    setLines([...lines, { trackedItemId: unused.id, qtyText: '1' }]);
   };
 
   const handleSubmit = async (forceWeekday = false) => {
@@ -71,7 +71,9 @@ export function QuickAddOrderModal({
       setError('Customer name is required.');
       return;
     }
-    const validLines = lines.filter((l) => l.quantity > 0);
+    const validLines: OrderItemLine[] = lines
+      .map((l) => ({ trackedItemId: l.trackedItemId, quantity: Number(l.qtyText) }))
+      .filter((l) => Number.isFinite(l.quantity) && l.quantity > 0);
     if (validLines.length === 0) {
       setError('Add at least one Tracked Item with a quantity greater than 0.');
       return;
@@ -305,16 +307,18 @@ export function QuickAddOrderModal({
                   </select>
                   <input
                     data-testid={`quick-add-item-qty-${idx}`}
-                    type="number"
-                    step="0.5"
-                    min="0.5"
-                    value={line.quantity}
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="Qty"
+                    value={line.qtyText}
                     onChange={(e) => {
+                      const raw = e.target.value;
+                      if (raw !== '' && !/^\d*\.?\d*$/.test(raw)) return;
                       const next = [...lines];
-                      next[idx] = { ...line, quantity: Number(e.target.value) || 0 };
+                      next[idx] = { ...line, qtyText: raw };
                       setLines(next);
                     }}
-                    className="min-h-[40px] w-24 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-2 font-mono text-sm tabular-nums text-[#F0F6FC]"
+                    className="min-h-[40px] w-24 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-2 font-mono text-sm tabular-nums text-[#F0F6FC] placeholder:text-[#6E7681]"
                   />
                   {lines.length > 1 && (
                     <button
