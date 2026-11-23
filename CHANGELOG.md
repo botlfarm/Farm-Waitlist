@@ -1,4 +1,5 @@
-# 1.0.0 (2026-11-23)
+
+# [1.0.0](https://github.com/botlfarm/Farm-Waitlist/compare/5aee0f1c1b770edc7686c3a1e45137c9d09bbd12...v1.0.0) (2026-11-23)
 
 
 ### Features
