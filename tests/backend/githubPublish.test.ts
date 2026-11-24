@@ -13,6 +13,7 @@ import {
   testGithubPublishConnection,
   validateGithubTarget,
 } from '../../src/server/githubPublisher';
+import { publishSnippetSnapshotToGithub } from '../../src/server/snippetService';
 import {
   buildPublicAvailabilityJsonPayload,
   evaluateDateOrderingClosed,
@@ -538,6 +539,230 @@ describe('Open-Source GitHub Pages Publisher & API Routes', () => {
       expect(snipBody.paused).toBe(true);
       expect(snipBody.liveEmbedHtml).toContain('https://myfarm.github.io/avail/availability.json');
       expect(JSON.stringify(snipBody)).not.toContain(secretToken);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      dbManager.close();
+    }
+  });
+
+  it('auto-publish guardrails skip midnight/cutoff rollovers, defer during quiet cooldown after user edits, and publish once settled', async () => {
+    const { dbPath, backupDir } = createTempPaths();
+    const dbManager = new DatabaseManager(dbPath, backupDir);
+    await dbManager.init('America/New_York');
+
+    const config = loadRuntimeConfig({
+      dbPath,
+      backupDir,
+      haOptionsPath: '/nonexistent/options.json',
+      githubPublish: {
+        token: 'ghp_guardrails_token',
+        defaultRepo: 'myfarm/avail',
+        source: 'env',
+      },
+    });
+
+    // Clock-derived flags (isPast, isToday, isOrderingClosed) must NOT alter semantic hash
+    const days = projectDailySupply({
+      items: [eggsItem],
+      entries: [],
+      orders: [],
+      startDate: '2026-11-23',
+      endDate: '2026-11-29',
+      today: '2026-11-23',
+    });
+    const beforeCutoff = buildPublicAvailabilityJsonPayload(
+      generatePublicAvailability({
+        items: [eggsItem],
+        days,
+        channels: [],
+        today: '2026-11-23',
+        weeks: 1,
+        timezone: 'America/New_York',
+        now: new Date('2026-11-23T19:00:00Z'), // 14:00 EST (before 16:00 cutoff)
+        cutoffRules: [
+          {
+            id: 'c1',
+            enabled: true,
+            mode: 'days_before',
+            daysBefore: 1,
+            cutoffWeekday: 5,
+            cutoffTime: '16:00',
+            pickupWeekdays: [],
+          },
+        ],
+      }),
+      new Date('2026-11-23T19:00:00Z')
+    );
+    const afterCutoff = buildPublicAvailabilityJsonPayload(
+      generatePublicAvailability({
+        items: [eggsItem],
+        days,
+        channels: [],
+        today: '2026-11-23',
+        weeks: 1,
+        timezone: 'America/New_York',
+        now: new Date('2026-11-23T22:00:00Z'), // 17:00 EST (after 16:00 cutoff)
+        cutoffRules: [
+          {
+            id: 'c1',
+            enabled: true,
+            mode: 'days_before',
+            daysBefore: 1,
+            cutoffWeekday: 5,
+            cutoffTime: '16:00',
+            pickupWeekdays: [],
+          },
+        ],
+      }),
+      new Date('2026-11-23T22:00:00Z')
+    );
+    expect(computeAvailabilityPayloadHash(beforeCutoff)).toBe(
+      computeAvailabilityPayloadHash(afterCutoff)
+    );
+
+    let putCount = 0;
+    const mockFetch = vi.fn(async (input: string, init?: RequestInit) => {
+      const method = init?.method ?? 'GET';
+      if (input.includes('/readme') && method === 'GET') {
+        return new Response(JSON.stringify({ sha: 'readme-sha' }), { status: 200 });
+      }
+      if (input.includes('/contents/availability.json') && method === 'GET') {
+        return new Response(
+          JSON.stringify(putCount > 0 ? { sha: `sha-${putCount}` } : { message: 'Not Found' }),
+          { status: putCount > 0 ? 200 : 404 }
+        );
+      }
+      if (input.includes('/contents/availability.json') && method === 'PUT') {
+        putCount += 1;
+        return new Response(JSON.stringify({ commit: { sha: `commit-${putCount}` } }), {
+          status: 200,
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    let currentNow = new Date('2026-11-23T15:00:00Z');
+    const app = createExpressApp({
+      dbManager,
+      config,
+      fetchFn: mockFetch,
+      getNow: () => currentNow,
+    });
+
+    const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    try {
+      // Seed an item and configure Automatic Sync with 15-minute quiet delay
+      const itemResp = await fetch(`${baseUrl}/api/items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Standard Eggs',
+          unitLabel: 'dozens',
+          supplyMode: 'continuous',
+          defaultDailyProduction: 12,
+          globalSafetyBuffer: 4,
+          includeInPublicSnippet: true,
+        }),
+      });
+      expect(itemResp.status).toBe(201);
+      const createdItem = (await itemResp.json()) as { id: number };
+
+      await fetch(`${baseUrl}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          githubPublishRepo: 'myfarm/avail',
+          githubPublishMode: 'auto',
+          githubPublishInterval: '30m',
+          githubPublishIdleMinutes: 15,
+        }),
+      });
+
+      // 1. Manual initial publish at 15:00 UTC succeeds immediately
+      const manualRes = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: true,
+        now: currentNow,
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(manualRes.published).toBe(true);
+      expect(putCount).toBe(1);
+      expect(manualRes.githubPublishStatus.hasUnpublishedEdits).toBe(false);
+      const publishedAtBeforeMidnight = manualRes.githubPublishStatus.lastPublishedAt;
+
+      // 2. Midnight rollover (next day 05:05 UTC / 00:05 EST) with ZERO user edits -> MUST SKIP!
+      const nextDayMidnight = new Date('2026-11-24T05:05:00Z');
+      const midnightRes = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: nextDayMidnight,
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(midnightRes.published).toBe(false);
+      expect(midnightRes.skipped).toBe(true);
+      expect(midnightRes.reason).toMatch(/midnight|no user edits/i);
+      expect(putCount).toBe(1); // Zero GitHub writes!
+      expect(dbManager.getSettings().githubLastPublishedAt).toBe(publishedAtBeforeMidnight);
+
+      // 3. User edits morning inventory at 14:00 UTC -> marks availabilityLastEditedAt
+      currentNow = new Date('2026-11-24T14:00:00Z');
+      const supplyResp = await fetch(`${baseUrl}/api/supply/${createdItem.id}/2026-11-24`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actualOnHand: 40, estProduced: 12 }),
+      });
+      expect(supplyResp.status).toBe(200);
+      expect(dbManager.getSettings().availabilityLastEditedAt).toBe('2026-11-24T14:00:00.000Z');
+
+      // 4. Auto-publish check 5 minutes later (still within 15-min quiet delay) -> MUST DEFER!
+      const midEditRes = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: new Date('2026-11-24T14:05:00Z'),
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(midEditRes.published).toBe(false);
+      expect(midEditRes.skipped).toBe(true);
+      expect(midEditRes.retryAfterMs).toBe(10 * 60 * 1000);
+      expect(midEditRes.githubPublishStatus.hasUnpublishedEdits).toBe(true);
+      expect(putCount).toBe(1);
+
+      // 5. Auto-publish check after 16 quiet minutes -> PUBLISHES cleanly!
+      const settledRes = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: new Date('2026-11-24T14:16:00Z'),
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(settledRes.published).toBe(true);
+      expect(settledRes.skipped).toBe(false);
+      expect(putCount).toBe(2);
+      expect(settledRes.githubPublishStatus.hasUnpublishedEdits).toBe(false);
+      expect(settledRes.githubPublishStatus.lastPublishedAt).toBe('2026-11-24T14:16:00.000Z');
+
+      // 6. Another midnight rollover the following night -> STILL SKIPPED!
+      const nextNightRes = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: new Date('2026-11-25T05:10:00Z'),
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(nextNightRes.published).toBe(false);
+      expect(nextNightRes.skipped).toBe(true);
+      expect(putCount).toBe(2);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       dbManager.close();

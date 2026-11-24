@@ -114,6 +114,14 @@ export async function publishSnippetSnapshotToGithub(params: {
   dbManager: DatabaseManager;
   config: RuntimeConfig;
   force?: boolean;
+  /**
+   * When true (used by background Automatic Sync), skips publishing unless:
+   *  1. The user has made at least one availability-affecting edit since the last publish
+   *     (preventing midnight date rollovers or cutoff clock ticks from refreshing "accurate as of"), AND
+   *  2. At least `githubPublishIdleMinutes` of quiet time have elapsed since the latest edit
+   *     (preventing half-finished edits from being pushed mid-session).
+   */
+  requireUserEdit?: boolean;
   overrides?: {
     repo?: string;
     branch?: string;
@@ -122,9 +130,69 @@ export async function publishSnippetSnapshotToGithub(params: {
   };
   now?: Date;
   fetchFn?: typeof fetch;
-}): Promise<GithubPublishResult & { githubPublishStatus: GithubPublishStatus }> {
-  const { dbManager, config, force = false, overrides, now = new Date(), fetchFn } = params;
+}): Promise<
+  GithubPublishResult & {
+    githubPublishStatus: GithubPublishStatus;
+    retryAfterMs?: number;
+  }
+> {
+  const {
+    dbManager,
+    config,
+    force = false,
+    requireUserEdit = false,
+    overrides,
+    now = new Date(),
+    fetchFn,
+  } = params;
   const settings = dbManager.getSettings();
+
+  if (!force && requireUserEdit) {
+    const statusNow = getRedactedGithubPublishStatus(config, settings);
+    const lastEditedMs = settings.availabilityLastEditedAt
+      ? Date.parse(settings.availabilityLastEditedAt)
+      : NaN;
+    const lastPublishedMs = settings.githubLastPublishedAt
+      ? Date.parse(settings.githubLastPublishedAt)
+      : NaN;
+
+    // Guardrail 1: Never auto-publish if the user has not edited availability since the last publish
+    // (prevents midnight rollovers and ordering cutoff clock ticks from bumping "accurate as of").
+    if (
+      !Number.isFinite(lastEditedMs) ||
+      (Number.isFinite(lastPublishedMs) && lastEditedMs <= lastPublishedMs)
+    ) {
+      return {
+        published: false,
+        skipped: true,
+        reason: 'No user edits since last publish (midnight and clock rollovers are skipped)',
+        hash: settings.githubLastPublishedHash ?? '',
+        publicUrl: statusNow.publicUrl ?? '',
+        publishedAt: settings.githubLastPublishedAt ?? now.toISOString(),
+        githubPublishStatus: statusNow,
+      };
+    }
+
+    // Guardrail 2: Wait for a quiet period after the most recent edit so mid-session changes settle.
+    const idleMinutes = settings.githubPublishIdleMinutes ?? 15;
+    const idleMs = Math.max(0, idleMinutes) * 60 * 1000;
+    const elapsedMs = now.getTime() - lastEditedMs;
+    if (idleMs > 0 && elapsedMs < idleMs) {
+      const remainingMs = idleMs - elapsedMs;
+      const remainingMin = Math.max(1, Math.ceil(remainingMs / 60000));
+      return {
+        published: false,
+        skipped: true,
+        reason: `Waiting ${remainingMin} min for recent edits to settle before auto-publishing`,
+        retryAfterMs: remainingMs,
+        hash: settings.githubLastPublishedHash ?? '',
+        publicUrl: statusNow.publicUrl ?? '',
+        publishedAt: settings.githubLastPublishedAt ?? now.toISOString(),
+        githubPublishStatus: statusNow,
+      };
+    }
+  }
+
   const { jsonPayload } = buildSnippetForDatabase({ dbManager, config, now });
 
   const repo =
@@ -169,9 +237,10 @@ export async function publishSnippetSnapshotToGithub(params: {
     }
 
     // Skipped (no semantic changes) — clear stale error while preserving lastPublishedAt/Hash
-    const currentStatus = settings.githubLastPublishStatus === 'error'
-      ? dbManager.updateSettings({ githubLastPublishError: null })
-      : settings;
+    const currentStatus =
+      settings.githubLastPublishStatus === 'error'
+        ? dbManager.updateSettings({ githubLastPublishError: null })
+        : settings;
     return {
       ...result,
       githubPublishStatus: getRedactedGithubPublishStatus(config, currentStatus),

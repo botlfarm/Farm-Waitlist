@@ -130,6 +130,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   publicSnippetAutoAdvanceToday: true,
   githubPublishMode: 'manual',
   githubPublishInterval: '30m',
+  githubPublishIdleMinutes: 15,
   githubPublishRepo: '',
   githubPublishBranch: 'main',
   githubPublishPath: 'availability.json',
@@ -138,6 +139,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   githubLastPublishedHash: null,
   githubLastPublishStatus: 'never',
   githubLastPublishError: null,
+  availabilityLastEditedAt: null,
 };
 
 export const MIGRATIONS: Migration[] = [
@@ -533,6 +535,10 @@ export class DatabaseManager {
     )
       ? merged.githubPublishInterval
       : '30m';
+    const rawIdle = Number(merged.githubPublishIdleMinutes);
+    merged.githubPublishIdleMinutes = Number.isFinite(rawIdle)
+      ? Math.max(0, Math.min(120, Math.floor(rawIdle)))
+      : 15;
     merged.githubPublishRepo =
       typeof merged.githubPublishRepo === 'string' ? merged.githubPublishRepo.trim() : '';
     merged.githubPublishBranch =
@@ -545,6 +551,10 @@ export class DatabaseManager {
         : 'availability.json';
     merged.githubPublishPublicUrl =
       typeof merged.githubPublishPublicUrl === 'string' ? merged.githubPublishPublicUrl.trim() : '';
+    merged.availabilityLastEditedAt =
+      typeof merged.availabilityLastEditedAt === 'string' && merged.availabilityLastEditedAt.trim()
+        ? merged.availabilityLastEditedAt.trim()
+        : null;
 
     return merged as unknown as AppSettings;
   }
@@ -575,6 +585,13 @@ export class DatabaseManager {
         : current.githubPublishInterval ?? '30m';
     }
 
+    if (patch.githubPublishIdleMinutes !== undefined) {
+      const parsedIdle = Number(patch.githubPublishIdleMinutes);
+      next.githubPublishIdleMinutes = Number.isFinite(parsedIdle)
+        ? Math.max(0, Math.min(120, Math.floor(parsedIdle)))
+        : current.githubPublishIdleMinutes ?? 15;
+    }
+
     if (patch.githubPublishRepo !== undefined) {
       next.githubPublishRepo = String(patch.githubPublishRepo ?? '').trim();
     }
@@ -586,6 +603,12 @@ export class DatabaseManager {
     }
     if (patch.githubPublishPublicUrl !== undefined) {
       next.githubPublishPublicUrl = String(patch.githubPublishPublicUrl ?? '').trim();
+    }
+    if (patch.availabilityLastEditedAt !== undefined) {
+      next.availabilityLastEditedAt =
+        typeof patch.availabilityLastEditedAt === 'string' && patch.availabilityLastEditedAt.trim()
+          ? patch.availabilityLastEditedAt.trim()
+          : null;
     }
 
     if (Array.isArray(patch.preApprovalTemplates)) {
@@ -621,6 +644,22 @@ export class DatabaseManager {
     });
     tx();
     return this.getSettings();
+  }
+
+  /**
+   * Records that the user made an explicit edit affecting public availability (orders, supply counts,
+   * items, channels, standing orders, or snippet configuration). Used by Automatic Sync to ensure
+   * pushes only happen after real user edits have settled — never on midnight or clock rollovers.
+   */
+  public markAvailabilityEdited(now: Date = new Date()): string {
+    const iso = now.toISOString();
+    this._db
+      .prepare(
+        `INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`
+      )
+      .run('availabilityLastEditedAt', JSON.stringify(iso), iso);
+    return iso;
   }
 
   public async createBackup(trigger: BackupTrigger): Promise<BackupInfo> {

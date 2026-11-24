@@ -65,6 +65,7 @@ export interface AppSettings {
   publicSnippetAutoAdvanceToday?: boolean;
   githubPublishMode?: GithubPublishMode;
   githubPublishInterval?: GithubPublishInterval;
+  githubPublishIdleMinutes?: number;
   githubPublishRepo?: string;
   githubPublishBranch?: string;
   githubPublishPath?: string;
@@ -73,6 +74,7 @@ export interface AppSettings {
   githubLastPublishedHash?: string | null;
   githubLastPublishStatus?: 'never' | 'success' | 'error';
   githubLastPublishError?: string | null;
+  availabilityLastEditedAt?: string | null;
 }
 
 export interface TrackedItem {
@@ -268,10 +270,13 @@ export interface GithubPublishStatus {
   publicUrl: string | null;
   mode: GithubPublishMode;
   interval: GithubPublishInterval;
+  idleMinutes?: number;
   lastPublishedAt: string | null;
   lastPublishStatus: 'never' | 'success' | 'error';
   lastPublishError: string | null;
   lastPublishedHash: string | null;
+  lastEditedAt?: string | null;
+  hasUnpublishedEdits?: boolean;
 }
 
 export interface CheckpointSummary {

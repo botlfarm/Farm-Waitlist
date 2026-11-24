@@ -740,12 +740,16 @@ export function buildPublicAvailabilityJsonPayload(
 }
 
 /**
- * Produces a canonical string of the semantic availability payload (omitting volatile timestamps)
- * so scheduled auto-publish can detect real changes and skip redundant commits.
+ * Produces a canonical string of the semantic availability payload (omitting volatile timestamps
+ * and clock-derived per-day flags like isPast/isToday/isOrderingClosed) so scheduled auto-publish
+ * detects real inventory/settings changes and ignores midnight or cutoff clock rollovers.
  */
 export function serializeAvailabilityForHash(payload: PublicAvailabilityJsonPayload): string {
-  const { generatedAtIso: _iso, generatedAtDisplay: _disp, ...semantic } = payload;
-  return JSON.stringify(semantic);
+  const { generatedAtIso: _iso, generatedAtDisplay: _disp, calendarDays, ...rest } = payload;
+  const normalizedDays = calendarDays.map(
+    ({ isPast: _p, isToday: _t, isOrderingClosed: _c, ...daySemantic }) => daySemantic
+  );
+  return JSON.stringify({ ...rest, calendarDays: normalizedDays });
 }
 
 /**

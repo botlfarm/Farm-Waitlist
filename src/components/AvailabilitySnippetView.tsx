@@ -179,6 +179,7 @@ export function AvailabilitySnippetView({
   const savedGithubMode: GithubPublishMode =
     settings?.githubPublishMode === 'auto' ? 'auto' : 'manual';
   const savedGithubInterval: GithubPublishInterval = settings?.githubPublishInterval ?? '30m';
+  const savedGithubIdleMinutes = settings?.githubPublishIdleMinutes ?? 15;
   const savedGithubRepo = settings?.githubPublishRepo ?? githubPublishStatus?.repo ?? '';
   const savedGithubBranch = settings?.githubPublishBranch ?? 'main';
   const savedGithubPath = settings?.githubPublishPath ?? 'availability.json';
@@ -206,6 +207,7 @@ export function AvailabilitySnippetView({
   // GitHub Pages publish state
   const [githubMode, setGithubMode] = useState<GithubPublishMode>(savedGithubMode);
   const [githubInterval, setGithubInterval] = useState<GithubPublishInterval>(savedGithubInterval);
+  const [githubIdleMinutes, setGithubIdleMinutes] = useState<number>(savedGithubIdleMinutes);
   const [githubRepo, setGithubRepo] = useState<string>(savedGithubRepo);
   const [githubBranch, setGithubBranch] = useState<string>(savedGithubBranch);
   const [githubPath, setGithubPath] = useState<string>(savedGithubPath);
@@ -236,6 +238,7 @@ export function AvailabilitySnippetView({
     setAutoAdvanceToday(savedAutoAdvance);
     setGithubMode(savedGithubMode);
     setGithubInterval(savedGithubInterval);
+    setGithubIdleMinutes(savedGithubIdleMinutes);
     setGithubRepo(savedGithubRepo);
     setGithubBranch(savedGithubBranch);
     setGithubPath(savedGithubPath);
@@ -253,6 +256,7 @@ export function AvailabilitySnippetView({
     savedAutoAdvance,
     savedGithubMode,
     savedGithubInterval,
+    savedGithubIdleMinutes,
     savedGithubRepo,
     savedGithubBranch,
     savedGithubPath,
@@ -278,6 +282,7 @@ export function AvailabilitySnippetView({
     autoAdvanceToday !== savedAutoAdvance ||
     githubMode !== savedGithubMode ||
     githubInterval !== savedGithubInterval ||
+    githubIdleMinutes !== savedGithubIdleMinutes ||
     githubRepo !== savedGithubRepo ||
     githubBranch !== savedGithubBranch ||
     githubPath !== savedGithubPath ||
@@ -319,6 +324,7 @@ export function AvailabilitySnippetView({
       publicSnippetAutoAdvanceToday: autoAdvanceToday,
       githubPublishMode: githubMode,
       githubPublishInterval: githubInterval,
+      githubPublishIdleMinutes: githubIdleMinutes,
       githubPublishRepo: githubRepo.trim(),
       githubPublishBranch: githubBranch.trim() || 'main',
       githubPublishPath: githubPath.trim() || 'availability.json',
@@ -1157,6 +1163,17 @@ export function AvailabilitySnippetView({
                   ? `Last published ${new Date(liveStatus.lastPublishedAt).toLocaleString()}`
                   : 'Never published'}
               </span>
+              {liveStatus?.hasUnpublishedEdits && (
+                <>
+                  <span className="text-[#6E7681]">·</span>
+                  <span
+                    data-testid="github-unpublished-edits-badge"
+                    className="font-medium text-[#FBBF24]"
+                  >
+                    Unpublished edits pending
+                  </span>
+                </>
+              )}
               {liveStatus?.lastPublishStatus === 'error' && liveStatus.lastPublishError && (
                 <>
                   <span className="text-[#6E7681]">·</span>
@@ -1205,7 +1222,7 @@ export function AvailabilitySnippetView({
         )}
 
         <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-12">
-          <div className="md:col-span-5">
+          <div className="md:col-span-4">
             <label
               htmlFor="github-repo-input"
               className="mb-1 block text-xs font-medium text-[#C9D1D9]"
@@ -1241,7 +1258,7 @@ export function AvailabilitySnippetView({
             />
           </div>
 
-          <div className="md:col-span-3">
+          <div className="md:col-span-2">
             <label
               htmlFor="github-path-input"
               className="mb-1 block text-xs font-medium text-[#C9D1D9]"
@@ -1281,6 +1298,30 @@ export function AvailabilitySnippetView({
             </select>
           </div>
 
+          <div className="md:col-span-2">
+            <label
+              htmlFor="github-idle-select"
+              className="mb-1 block text-xs font-medium text-[#C9D1D9]"
+              title="Wait for this many minutes of no edits before auto-publishing so in-progress changes are never pushed"
+            >
+              Quiet Delay
+            </label>
+            <select
+              id="github-idle-select"
+              data-testid="github-idle-select"
+              disabled={githubMode !== 'auto'}
+              value={githubIdleMinutes}
+              onChange={(e) => setGithubIdleMinutes(Number(e.target.value))}
+              className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 text-xs text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none disabled:opacity-45"
+            >
+              <option value={5}>5 min idle</option>
+              <option value={10}>10 min idle</option>
+              <option value={15}>15 min idle</option>
+              <option value={30}>30 min idle</option>
+              <option value={60}>60 min idle</option>
+            </select>
+          </div>
+
           <div className="md:col-span-12">
             <label
               htmlFor="github-public-url-input"
@@ -1306,7 +1347,11 @@ export function AvailabilitySnippetView({
                   {previewPublicUrl}
                 </span>
                 {githubMode === 'auto' && (
-                  <span> · Checks every {githubInterval} and pushes only when changes occur.</span>
+                  <span>
+                    {' '}
+                    · Auto-publishes only after your edits have been quiet for {githubIdleMinutes}{' '}
+                    min (never on midnight rollovers or cutoff clock ticks).
+                  </span>
                 )}
               </p>
             )}

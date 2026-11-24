@@ -94,9 +94,67 @@ function sanitizeOrderItems(raw: unknown): OrderItemLine[] {
   }));
 }
 
+const AVAILABILITY_MUTATION_ROUTES: Array<{ method: string; pattern: RegExp }> = [
+  { method: 'POST', pattern: /^\/items$/ },
+  { method: 'PUT', pattern: /^\/items\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/items\/\d+$/ },
+  { method: 'POST', pattern: /^\/channels$/ },
+  { method: 'PUT', pattern: /^\/channels\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/channels\/\d+$/ },
+  { method: 'PUT', pattern: /^\/supply\/\d+\/[^/]+$/ },
+  { method: 'POST', pattern: /^\/orders$/ },
+  { method: 'PUT', pattern: /^\/orders\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/orders\/\d+$/ },
+  {
+    method: 'POST',
+    pattern: /^\/orders\/\d+\/(slot|pre-approve|release-hold|ignore|restore-ignored|reconcile|merge)$/,
+  },
+  { method: 'POST', pattern: /^\/orders\/auto-slot$/ },
+  { method: 'POST', pattern: /^\/standing-orders$/ },
+  { method: 'PUT', pattern: /^\/standing-orders\/\d+$/ },
+  { method: 'DELETE', pattern: /^\/standing-orders\/\d+$/ },
+  { method: 'POST', pattern: /^\/standing-orders\/\d+\/skip$/ },
+  { method: 'POST', pattern: /^\/checkpoints\/undo$/ },
+  { method: 'POST', pattern: /^\/checkpoints\/\d+\/restore$/ },
+  { method: 'POST', pattern: /^\/backups\/[^/]+\/restore$/ },
+  { method: 'POST', pattern: /^\/backups\/upload$/ },
+];
+
+const AVAILABILITY_AFFECTING_SETTINGS_KEYS: Array<keyof AppSettings> = [
+  'timezone',
+  'publicSnippetWeeks',
+  'publicSnippetEnabled',
+  'publicSnippetPausedPreset',
+  'publicSnippetPausedMessage',
+  'publicSnippetShowSameDay',
+  'publicSnippetCutoffRules',
+  'publicSnippetHeaderTitle',
+  'publicSnippetHeaderText',
+  'publicSnippetFooterText',
+  'publicSnippetAutoAdvanceToday',
+];
+
 export function createApiRouter(options: CreateAppOptions): express.Router {
   const { dbManager, config, fetchFn, getNow = () => new Date(), onSettingsUpdated } = options;
   const router = express.Router();
+
+  // Stamp availabilityLastEditedAt synchronously before responding to real user mutations
+  // (midnight rollovers, cutoff clock ticks, and background Odoo syncs intentionally do NOT set this)
+  router.use((req, res, next) => {
+    const matchesAvailabilityMutation = AVAILABILITY_MUTATION_ROUTES.some(
+      (rule) => rule.method === req.method && rule.pattern.test(req.path)
+    );
+    if (matchesAvailabilityMutation) {
+      const origJson = res.json.bind(res);
+      res.json = ((body: unknown) => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          dbManager.markAvailabilityEdited(getNow());
+        }
+        return origJson(body);
+      }) as Response['json'];
+    }
+    next();
+  });
 
   const upload = multer({
     dest: path.join(os.tmpdir(), 'farm-waitlist-uploads'),
@@ -1595,7 +1653,15 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
 
   router.put('/settings', (req: Request, res: Response) => {
     const patch = (req.body ?? {}) as Partial<AppSettings>;
-    const updated = dbManager.updateSettings(patch);
+    const previous = dbManager.getSettings();
+    const snippetFieldChanged = AVAILABILITY_AFFECTING_SETTINGS_KEYS.some(
+      (key) =>
+        patch[key] !== undefined && JSON.stringify(patch[key]) !== JSON.stringify(previous[key])
+    );
+    const nextPatch: Partial<AppSettings> = snippetFieldChanged
+      ? { ...patch, availabilityLastEditedAt: getNow().toISOString() }
+      : patch;
+    const updated = dbManager.updateSettings(nextPatch);
     onSettingsUpdated?.(updated);
     res.json({
       settings: updated,

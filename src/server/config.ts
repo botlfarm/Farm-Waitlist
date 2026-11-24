@@ -174,6 +174,14 @@ export function getRedactedGithubPublishStatus(
   const customUrl = (settings.githubPublishPublicUrl ?? '').trim();
   const publicUrl = deriveGithubPagesPublicUrl(repo, filePath, customUrl);
 
+  const lastPublishedAt = settings.githubLastPublishedAt ?? null;
+  const lastEditedAt = settings.availabilityLastEditedAt ?? null;
+  const lastEditedMs = lastEditedAt ? Date.parse(lastEditedAt) : NaN;
+  const lastPublishedMs = lastPublishedAt ? Date.parse(lastPublishedAt) : NaN;
+  const hasUnpublishedEdits =
+    Number.isFinite(lastEditedMs) &&
+    (!Number.isFinite(lastPublishedMs) || lastEditedMs > lastPublishedMs);
+
   return {
     tokenConfigured,
     tokenSource: tokenConfigured ? (config.githubPublish?.source ?? 'none') : 'none',
@@ -183,9 +191,12 @@ export function getRedactedGithubPublishStatus(
     publicUrl,
     mode: settings.githubPublishMode === 'auto' ? 'auto' : 'manual',
     interval: settings.githubPublishInterval ?? '30m',
-    lastPublishedAt: settings.githubLastPublishedAt ?? null,
+    idleMinutes: settings.githubPublishIdleMinutes ?? 15,
+    lastPublishedAt,
     lastPublishStatus: settings.githubLastPublishStatus ?? 'never',
     lastPublishError: settings.githubLastPublishError ?? null,
     lastPublishedHash: settings.githubLastPublishedHash ?? null,
+    lastEditedAt,
+    hasUnpublishedEdits,
   };
 }

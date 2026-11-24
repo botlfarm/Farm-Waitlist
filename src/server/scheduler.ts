@@ -28,6 +28,7 @@ export class BackgroundScheduler {
   private odooTimer: ReturnType<typeof setInterval> | null = null;
   private backupTimer: ReturnType<typeof setInterval> | null = null;
   private githubPublishTimer: ReturnType<typeof setInterval> | null = null;
+  private githubRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private syncInFlight = false;
   private githubPublishInFlight = false;
 
@@ -93,6 +94,10 @@ export class BackgroundScheduler {
       clearInterval(this.githubPublishTimer);
       this.githubPublishTimer = null;
     }
+    if (this.githubRetryTimer) {
+      clearTimeout(this.githubRetryTimer);
+      this.githubRetryTimer = null;
+    }
   }
 
   private async runOdooSyncSafe(): Promise<void> {
@@ -128,11 +133,25 @@ export class BackgroundScheduler {
     if (this.githubPublishInFlight) return;
     this.githubPublishInFlight = true;
     try {
-      await publishSnippetSnapshotToGithub({
+      const result = await publishSnippetSnapshotToGithub({
         dbManager: this.dbManager,
         config: this.config,
         force: false,
+        requireUserEdit: true,
       });
+
+      // If edits were too recent, schedule a single follow-up check right when the quiet window ends
+      if (result.skipped && typeof result.retryAfterMs === 'number' && result.retryAfterMs > 0) {
+        if (this.githubRetryTimer) {
+          clearTimeout(this.githubRetryTimer);
+        }
+        const delayMs = Math.min(result.retryAfterMs + 1000, 60 * 60 * 1000);
+        this.githubRetryTimer = setTimeout(() => {
+          this.githubRetryTimer = null;
+          void this.runGithubPublishSafe();
+        }, delayMs);
+        this.githubRetryTimer.unref?.();
+      }
     } catch (err) {
       console.error(
         '[Farm Waitlist] Scheduled GitHub availability publish failed:',
