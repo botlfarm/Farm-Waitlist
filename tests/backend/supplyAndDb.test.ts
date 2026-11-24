@@ -60,7 +60,7 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const mgr = new DatabaseManager(dbPath, backupDir);
     const res = await mgr.init('America/New_York');
 
-    expect(res.appliedVersions).toEqual([1, 2, 3]);
+    expect(res.appliedVersions).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(res.preMigrateBackup).toBeNull();
     expect(listTrackedItems(mgr.db)).toHaveLength(0);
     expect(listPickupChannels(mgr.db)).toHaveLength(0);
@@ -78,15 +78,15 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const extendedMigrations: Migration[] = [
       ...MIGRATIONS,
       {
-        version: 4,
+        version: 8,
         name: 'add_test_marker_table',
-        sql: 'CREATE TABLE IF NOT EXISTS migration_v4_test (id INTEGER PRIMARY KEY);',
+        sql: 'CREATE TABLE IF NOT EXISTS migration_v8_test (id INTEGER PRIMARY KEY);',
       },
     ];
 
     const mgr2 = new DatabaseManager(dbPath, backupDir, extendedMigrations);
     const res = await mgr2.init('America/New_York');
-    expect(res.appliedVersions).toEqual([4]);
+    expect(res.appliedVersions).toEqual([8]);
     expect(res.preMigrateBackup).toMatch(/^pre-migrate-.*\.db$/);
     expect(fs.existsSync(path.join(backupDir, res.preMigrateBackup!))).toBe(true);
     mgr2.close();
@@ -1076,5 +1076,340 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
 
     expect(staticNoFooter.html).not.toContain('<p class="fw-cal-foot">');
     expect(staticNoFooter.html).not.toContain('<script');
+  });
+
+  it('supports end-of-day physical count adjustments (actualEndOfDay), pre-startDate EOD carry-over, and Undo persistence', async () => {
+    const eggsItem: TrackedItem = {
+      id: 1,
+      name: 'Standard Eggs',
+      unitLabel: 'dozens',
+      isActive: true,
+      supplyMode: 'continuous',
+      defaultDailyProduction: 10,
+      globalSafetyBuffer: 4,
+      includeInPublicSnippet: true,
+      keywordRules: ['standard'],
+      sortOrder: 0,
+      createdAt: '',
+      updatedAt: '',
+    };
+
+    // 1. Pre-startDate EOD count on Sunday (2026-11-22) sets Monday morning starting stock to 22
+    // 2. Monday (2026-11-23): Morning expected 22, slotted 4 -> remaining 18 + harvest 10 = expected EOD 28,
+    //    overridden by actualEndOfDay = 24 -> Tuesday morning starts at 24!
+    // 3. Tuesday (2026-11-24): Morning expected 24, slotted 22 -> ending 2 (buffer 4 -> rawSellableOpen -2).
+    //    Because Monday has actualEndOfDay = 24, Tuesday's tight supply does NOT constrain Monday's daytime ATP!
+    const projected = projectDailySupply({
+      items: [eggsItem],
+      entries: [
+        {
+          id: 1,
+          trackedItemId: 1,
+          date: '2026-11-22',
+          actualOnHand: null,
+          estProduced: null,
+          actualEndOfDay: 22,
+          isCascadeAnchor: false,
+          bufferOverride: null,
+          extraBuffer: 0,
+          notes: null,
+        },
+        {
+          id: 2,
+          trackedItemId: 1,
+          date: '2026-11-23',
+          actualOnHand: null,
+          estProduced: null,
+          actualEndOfDay: 24,
+          isCascadeAnchor: false,
+          bufferOverride: null,
+          extraBuffer: 0,
+          notes: null,
+        },
+      ],
+      orders: [
+        {
+          id: 101,
+          source: 'manual',
+          status: 'slotted',
+          timingType: 'specific_date',
+          requestedDate: '2026-11-23',
+          slottedDate: '2026-11-23',
+          isLocked: false,
+          customerName: 'Mon Buyer',
+          customerNameOverridden: false,
+          customerEmail: null,
+          customerPhone: null,
+          pickupChannelId: null,
+          freeTextPickup: null,
+          notes: null,
+          preApprovedAt: null,
+          standingOrderId: null,
+          standingOccurrenceDate: null,
+          odooQuotationId: null,
+          odooQuotationName: null,
+          odooPartnerId: null,
+          odooCreatedAtLocal: null,
+          odooRawNotes: null,
+          odooRawLines: [],
+          odooUpdatedAfterSlot: false,
+          odooMissingFlagged: false,
+          odooSuggestedConfirmed: null,
+          items: [{ trackedItemId: 1, quantity: 4 }],
+          chatter: [],
+          createdAt: '',
+          updatedAt: '',
+        },
+        {
+          id: 102,
+          source: 'manual',
+          status: 'slotted',
+          timingType: 'specific_date',
+          requestedDate: '2026-11-24',
+          slottedDate: '2026-11-24',
+          isLocked: false,
+          customerName: 'Tue Buyer',
+          customerNameOverridden: false,
+          customerEmail: null,
+          customerPhone: null,
+          pickupChannelId: null,
+          freeTextPickup: null,
+          notes: null,
+          preApprovedAt: null,
+          standingOrderId: null,
+          standingOccurrenceDate: null,
+          odooQuotationId: null,
+          odooQuotationName: null,
+          odooPartnerId: null,
+          odooCreatedAtLocal: null,
+          odooRawNotes: null,
+          odooRawLines: [],
+          odooUpdatedAfterSlot: false,
+          odooMissingFlagged: false,
+          odooSuggestedConfirmed: null,
+          items: [{ trackedItemId: 1, quantity: 22 }],
+          chatter: [],
+          createdAt: '',
+          updatedAt: '',
+        },
+      ],
+      startDate: '2026-11-23',
+      endDate: '2026-11-25',
+      today: '2026-11-23',
+    });
+
+    const mon = projected[0].byItem[1];
+    const tue = projected[1].byItem[1];
+    const wed = projected[2].byItem[1];
+
+    expect(mon.expectedStartingBalance).toBe(22);
+    expect(mon.startingBalance).toBe(22);
+    expect(mon.endingBalance).toBe(18);
+    expect(mon.expectedProduced).toBe(10);
+    expect(mon.expectedNextDayStarting).toBe(28);
+    expect(mon.actualEndOfDay).toBe(24);
+    expect(mon.nextDayStarting).toBe(24);
+    // Monday ATP is unconstrained by Tuesday because Monday's EOD is physically pinned at 24
+    expect(mon.sellableOpen).toBe(14);
+    expect(mon.reservedForFuture).toBe(0);
+
+    expect(tue.expectedStartingBalance).toBe(24);
+    expect(tue.startingBalance).toBe(24);
+    expect(tue.endingBalance).toBe(2);
+    expect(tue.expectedNextDayStarting).toBe(12);
+    expect(tue.nextDayStarting).toBe(12);
+    expect(tue.sellableOpen).toBe(-2);
+
+    expect(wed.expectedStartingBalance).toBe(12);
+    expect(wed.startingBalance).toBe(12);
+
+    // Verify SQLite persistence + checkpoint Undo restores actual_end_of_day cleanly
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+    const now = new Date().toISOString();
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, keyword_rules_json, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 10, 4, 1, '[]', 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+
+    mgr.db
+      .prepare(
+        `INSERT INTO daily_supply_entries (tracked_item_id, date, actual_on_hand, est_produced, actual_end_of_day, is_cascade_anchor, buffer_override, extra_buffer, notes)
+         VALUES (?, '2026-11-23', 20, 11, 27, 0, NULL, 0, 'Evening recount')`
+      )
+      .run(itemId);
+
+    captureCheckpoint(mgr.db, 'Before changing EOD');
+    mgr.db
+      .prepare(
+        `UPDATE daily_supply_entries SET actual_end_of_day = 19 WHERE tracked_item_id = ? AND date = '2026-11-23'`
+      )
+      .run(itemId);
+    expect(listDailySupplyEntries(mgr.db)[0].actualEndOfDay).toBe(19);
+
+    undoLastCheckpoint(mgr.db);
+    expect(listDailySupplyEntries(mgr.db)[0].actualEndOfDay).toBe(27);
+    mgr.close();
+  });
+
+  it('sorts waitlist orders by earliest arrival date by default and persists custom waitlist_sort_order priority', async () => {
+    const { compareWaitlistOrders, getOrderArrivalInfo } = await import('../../src/shared/timezone');
+    const { createExpressApp } = await import('../../src/server/app');
+
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const now = new Date().toISOString();
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, keyword_rules_json, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 10, 0, 1, '[]', 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+
+    const insertOrder = (name: string, odooLocal: string | null, createdAt: string) => {
+      const id = Number(
+        mgr.db
+          .prepare(
+            `INSERT INTO orders (source, status, timing_type, customer_name, odoo_created_at_local, created_at, updated_at)
+             VALUES (?, 'waitlist', 'asap', ?, ?, ?, ?)`
+          )
+          .run(odooLocal ? 'odoo' : 'manual', name, odooLocal, createdAt, createdAt).lastInsertRowid
+      );
+      mgr.db
+        .prepare(`INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 5)`)
+        .run(id, itemId);
+      return id;
+    };
+
+    const idNov22 = insertOrder('Newest Buyer', '2026-11-22 14:00:00', '2026-11-22T19:00:00Z');
+    const idNov18 = insertOrder('Oldest Buyer', '2026-11-18 09:30:00', '2026-11-18T14:30:00Z');
+    const idNov20 = insertOrder('Middle Manual', null, '2026-11-20T16:00:00Z');
+
+    const initial = listAllOrders(mgr.db).sort((a, b) =>
+      compareWaitlistOrders(a, b, 'America/New_York')
+    );
+    expect(initial.map((o) => o.id)).toEqual([idNov18, idNov20, idNov22]);
+    expect(getOrderArrivalInfo(initial[0], 'America/New_York', '2026-11-24').shortLabel).toBe('Nov 18');
+    expect(getOrderArrivalInfo(initial[0], 'America/New_York', '2026-11-24').ageLabel).toBe('6d ago');
+
+    // Reorder via PUT /api/orders/waitlist-order
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+      },
+    });
+
+    const server = app.listen(0);
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+    try {
+      const reorderRes = await fetch(`http://127.0.0.1:${port}/api/orders/waitlist-order`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orderIds: [idNov22, idNov18, idNov20] }),
+      });
+      expect(reorderRes.status).toBe(200);
+
+      const reordered = listAllOrders(mgr.db).sort((a, b) =>
+        compareWaitlistOrders(a, b, 'America/New_York')
+      );
+      expect(reordered.map((o) => o.id)).toEqual([idNov22, idNov18, idNov20]);
+      expect(reordered.map((o) => o.waitlistSortOrder)).toEqual([0, 1, 2]);
+
+      const resetRes = await fetch(`http://127.0.0.1:${port}/api/orders/waitlist-order`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reset: true }),
+      });
+      expect(resetRes.status).toBe(200);
+
+      const resetList = listAllOrders(mgr.db).sort((a, b) =>
+        compareWaitlistOrders(a, b, 'America/New_York')
+      );
+      expect(resetList.map((o) => o.id)).toEqual([idNov18, idNov20, idNov22]);
+      expect(resetList.every((o) => o.waitlistSortOrder === null)).toBe(true);
+    } finally {
+      server.close();
+      mgr.close();
+    }
+  });
+
+  it('persists dismissed duplicate pairs symmetrically via POST /api/orders/:id/dismiss-duplicate and cleans up on order deletion', async () => {
+    const { createExpressApp } = await import('../../src/server/app');
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const now = new Date().toISOString();
+    const idA = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, customer_name, customer_email, created_at, updated_at)
+           VALUES ('manual', 'slotted', 'asap', 'Sam Buyer', 'sam@example.com', ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+    const idB = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, customer_name, customer_email, created_at, updated_at)
+           VALUES ('manual', 'waitlist', 'asap', 'Sam Buyer', 'sam@example.com', ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+      },
+    });
+    const server = app.listen(0);
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/orders/${idB}/dismiss-duplicate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ otherOrderId: idA }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { ok: boolean; orderIdA: number; orderIdB: number };
+      expect(body).toEqual({ ok: true, orderIdA: Math.min(idA, idB), orderIdB: Math.max(idA, idB) });
+
+      // Both orders symmetrically list each other in dismissedDuplicateOrderIds
+      const orders = listAllOrders(mgr.db);
+      expect(orders.find((o) => o.id === idA)?.dismissedDuplicateOrderIds).toEqual([idB]);
+      expect(orders.find((o) => o.id === idB)?.dismissedDuplicateOrderIds).toEqual([idA]);
+
+      // Deleting one order cascades the dismissal row cleanly
+      mgr.db.prepare('DELETE FROM orders WHERE id = ?').run(idB);
+      const afterDelete = listAllOrders(mgr.db);
+      expect(afterDelete.find((o) => o.id === idA)?.dismissedDuplicateOrderIds).toEqual([]);
+    } finally {
+      server.close();
+      mgr.close();
+    }
   });
 });

@@ -6,6 +6,7 @@ interface CheckpointState {
   orderItems: Record<string, unknown>[];
   orderChatter: Record<string, unknown>[];
   mergedOdooLinks?: Record<string, unknown>[];
+  dismissedDuplicatePairs?: Record<string, unknown>[];
   dailySupplyEntries: Record<string, unknown>[];
   standingOrderExceptions: Record<string, unknown>[];
 }
@@ -23,6 +24,9 @@ export function captureCheckpoint(
     orderChatter: db.prepare('SELECT * FROM order_chatter').all() as Record<string, unknown>[],
     mergedOdooLinks: db
       .prepare('SELECT * FROM merged_odoo_links')
+      .all() as Record<string, unknown>[],
+    dismissedDuplicatePairs: db
+      .prepare('SELECT * FROM dismissed_duplicate_pairs')
       .all() as Record<string, unknown>[],
     dailySupplyEntries: db
       .prepare('SELECT * FROM daily_supply_entries')
@@ -100,6 +104,7 @@ export function restoreCheckpointById(
   const state = JSON.parse(row.snapshot_json) as CheckpointState;
 
   const tx = db.transaction(() => {
+    db.prepare('DELETE FROM dismissed_duplicate_pairs').run();
     db.prepare('DELETE FROM merged_odoo_links').run();
     db.prepare('DELETE FROM order_chatter').run();
     db.prepare('DELETE FROM order_items').run();
@@ -112,6 +117,9 @@ export function restoreCheckpointById(
     insertRows(db, 'order_chatter', state.orderChatter);
     if (Array.isArray(state.mergedOdooLinks)) {
       insertRows(db, 'merged_odoo_links', state.mergedOdooLinks);
+    }
+    if (Array.isArray(state.dismissedDuplicatePairs)) {
+      insertRows(db, 'dismissed_duplicate_pairs', state.dismissedDuplicatePairs);
     }
     insertRows(db, 'daily_supply_entries', state.dailySupplyEntries);
     insertRows(db, 'standing_order_exceptions', state.standingOrderExceptions);

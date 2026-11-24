@@ -1,12 +1,14 @@
 import { Plus, Trash2, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import type { OrderItemLine, OrderTimingType, PickupChannel, TrackedItem } from '../shared/types';
+import { CustomerAutocompleteInput } from './CustomerAutocompleteInput';
 
 interface QuickAddOrderModalProps {
   open: boolean;
   today: string;
   items: TrackedItem[];
   channels: PickupChannel[];
+  odooConfigured?: boolean;
   onClose: () => void;
   onSubmit: (payload: {
     customerName: string;
@@ -26,6 +28,7 @@ export function QuickAddOrderModal({
   today,
   items,
   channels,
+  odooConfigured = false,
   onClose,
   onSubmit,
 }: QuickAddOrderModalProps) {
@@ -34,7 +37,7 @@ export function QuickAddOrderModal({
   const [customerPhone, setCustomerPhone] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
   const [timingType, setTimingType] = useState<OrderTimingType>('asap');
-  const [requestedDate, setRequestedDate] = useState(today);
+  const [requestedDate, setRequestedDate] = useState('');
   const [pickupChannelId, setPickupChannelId] = useState<string>('');
   const [notes, setNotes] = useState('');
   const [lines, setLines] = useState<Array<{ trackedItemId: number; qtyText: string }>>([]);
@@ -48,7 +51,7 @@ export function QuickAddOrderModal({
     setCustomerPhone('');
     setCustomerEmail('');
     setTimingType('asap');
-    setRequestedDate(today);
+    setRequestedDate('');
     setPickupChannelId(channels.find((c) => c.isActive)?.id ? String(channels.find((c) => c.isActive)!.id) : '');
     setNotes('');
     setError(null);
@@ -79,6 +82,11 @@ export function QuickAddOrderModal({
       return;
     }
 
+    if (timingType === 'specific_date' && !requestedDate) {
+      setError('Choose a pickup date to slot directly on the calendar.');
+      return;
+    }
+
     setSubmitting(true);
     try {
       await onSubmit({
@@ -86,7 +94,7 @@ export function QuickAddOrderModal({
         customerPhone: customerPhone.trim() || undefined,
         customerEmail: customerEmail.trim() || undefined,
         timingType,
-        requestedDate: timingType === 'specific_date' ? requestedDate : null,
+        requestedDate: requestedDate || null,
         pickupChannelId: pickupChannelId ? Number(pickupChannelId) : null,
         notes: notes.trim() || undefined,
         items: validLines,
@@ -156,20 +164,19 @@ export function QuickAddOrderModal({
             </div>
           )}
 
-          <div>
-            <label htmlFor="qa-customer" className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
-              Customer Name
-            </label>
-            <input
-              id="qa-customer"
-              data-testid="quick-add-customer-input"
-              type="text"
-              value={customerName}
-              onChange={(e) => setCustomerName(e.target.value)}
-              placeholder="e.g., Sarah Miller"
-              className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] placeholder:text-[#6E7681] focus:border-[#38BDF8] focus:outline-none"
-            />
-          </div>
+          <CustomerAutocompleteInput
+            id="qa-customer"
+            testId="quick-add-customer-input"
+            label="Customer Name"
+            value={customerName}
+            placeholder="e.g., Sarah Miller"
+            odooConfigured={odooConfigured}
+            onChange={setCustomerName}
+            onSelectCustomer={(cust) => {
+              if (cust.phone) setCustomerPhone(cust.phone);
+              if (cust.email) setCustomerEmail(cust.email);
+            }}
+          />
 
           <div className="grid grid-cols-2 gap-3">
             <div>
@@ -221,14 +228,17 @@ export function QuickAddOrderModal({
                 <button
                   type="button"
                   data-testid="quick-add-timing-specific"
-                  onClick={() => setTimingType('specific_date')}
+                  onClick={() => {
+                    setTimingType('specific_date');
+                    if (!requestedDate) setRequestedDate(today);
+                  }}
                   className={`flex-1 rounded py-1.5 text-xs font-medium ${
                     timingType === 'specific_date'
                       ? 'bg-[#0EA5E9] text-[#0B1117]'
                       : 'text-[#8B949E] hover:text-[#E6EDF3]'
                   }`}
                 >
-                  Specific Date
+                  Slot on Date
                 </button>
               </div>
             </div>
@@ -256,21 +266,38 @@ export function QuickAddOrderModal({
             </div>
           </div>
 
-          {timingType === 'specific_date' && (
-            <div>
-              <label htmlFor="qa-date" className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
-                Pickup Date
+          <div>
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <label htmlFor="qa-date" className="block text-xs font-medium text-[#C9D1D9]">
+                {timingType === 'specific_date'
+                  ? 'Requested & Slotted Pickup Date'
+                  : 'Requested Pickup Date (Optional)'}
               </label>
-              <input
-                id="qa-date"
-                data-testid="quick-add-date-input"
-                type="date"
-                value={requestedDate}
-                onChange={(e) => setRequestedDate(e.target.value)}
-                className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 font-mono text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
-              />
+              {requestedDate && timingType === 'asap' && (
+                <button
+                  type="button"
+                  data-testid="quick-add-clear-date-btn"
+                  onClick={() => setRequestedDate('')}
+                  className="text-[11px] font-medium text-[#8B949E] hover:text-[#F0F6FC]"
+                >
+                  Clear
+                </button>
+              )}
             </div>
-          )}
+            <input
+              id="qa-date"
+              data-testid="quick-add-date-input"
+              type="date"
+              value={requestedDate}
+              onChange={(e) => setRequestedDate(e.target.value)}
+              className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 font-mono text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+            />
+            {timingType === 'asap' && (
+              <p className="mt-1 text-[11px] text-[#8B949E]">
+                Customer’s preferred pickup date — shown prominently in the waitlist so you can fulfill it when stock allows.
+              </p>
+            )}
+          </div>
 
           <div>
             <div className="mb-1.5 flex items-center justify-between">

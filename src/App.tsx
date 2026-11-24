@@ -271,12 +271,22 @@ export default function App() {
                 await refreshWorkspace();
                 showToast('Quotation restored to Waitlist');
               }}
+              onReorderWaitlist={async (orderIds) => {
+                await api.reorderWaitlistOrders({ orderIds });
+                await refreshWorkspace();
+              }}
+              onResetWaitlistOrder={async () => {
+                await api.reorderWaitlistOrders({ reset: true });
+                await refreshWorkspace();
+                showToast('Waitlist sorted by arrival date (oldest first)');
+              }}
             />
           )}
 
           {activeTab === 'orders' && (
             <OrderListView
               today={workspace.today}
+              timezone={workspace.settings.timezone}
               orders={workspace.orders}
               items={workspace.items}
               channels={workspace.channels}
@@ -291,6 +301,7 @@ export default function App() {
               items={workspace.items}
               channels={workspace.channels}
               standingOrders={workspace.standingOrders}
+              odooConfigured={workspace.odooStatus.configured}
               onCreate={async (payload) => {
                 await api.createStandingOrder(payload);
                 await refreshWorkspace();
@@ -313,6 +324,7 @@ export default function App() {
             <AvailabilitySnippetView
               defaultWeeks={workspace.settings.publicSnippetWeeks}
               settings={workspace.settings}
+              githubPublishStatus={workspace.githubPublishStatus}
               onSettingsSaved={() => refreshWorkspace()}
               onToast={showToast}
             />
@@ -349,7 +361,7 @@ export default function App() {
               );
               setSelectedDayDate(null);
             }}
-            onClearActualOverride={async (itemId, targetDate) => {
+            onClearActualOverride={async (itemId, targetDate, scope = 'both') => {
               const targetDay = workspace.days.find((d) => d.date === targetDate);
               const existingProj = targetDay?.byItem[itemId];
               const existingBaseBuffer = existingProj?.hasBufferOverride
@@ -361,13 +373,14 @@ export default function App() {
               await api.updateDailySupply(itemId, targetDate, {
                 actualOnHand: null,
                 estProduced: existingProj?.isManualProducedOverride ? existingProj.estProduced : null,
+                actualEndOfDay: scope === 'morning' ? (existingProj?.actualEndOfDay ?? null) : null,
                 cascadeForward: Boolean(existingProj?.isCascadeAnchor),
                 bufferOverride: existingBaseBuffer,
                 extraBuffer: existingProj?.extraBuffer ?? 0,
                 notes: existingProj?.notes ?? null,
               });
               await refreshWorkspace();
-              showToast(`Cleared manual On-Hand override on ${targetDate} — carry-over reconnected`);
+              showToast(`Cleared manual count override on ${targetDate} — carry-over reconnected`);
             }}
             onToggleChannelDate={async (channel, date, attach) => {
               const currentDates = channel.specificDates ?? [];
@@ -394,7 +407,9 @@ export default function App() {
             today={workspace.today}
             weeks={workspace.weeks}
             holdThresholdHours={workspace.settings.holdThresholdHours}
+            odooConfigured={workspace.odooStatus.configured}
             onClose={() => setSelectedOrderId(null)}
+            onSelectOrder={(orderId) => setSelectedOrderId(orderId)}
             onSaveOrder={async (orderId, patch) => {
               await api.updateOrder(orderId, patch);
               await refreshWorkspace();
@@ -454,6 +469,18 @@ export default function App() {
                 showToast(err instanceof Error ? err.message : 'Failed to merge orders', 'error');
               }
             }}
+            onDismissDuplicate={async (orderId, otherOrderId) => {
+              try {
+                await api.dismissDuplicateOrder(orderId, otherOrderId);
+                await refreshWorkspace();
+                showToast('Dismissed — marked as not a duplicate');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to dismiss duplicate notice',
+                  'error'
+                );
+              }
+            }}
             onDeleteOrder={async (orderId) => {
               await api.deleteOrder(orderId);
               await refreshWorkspace();
@@ -474,6 +501,7 @@ export default function App() {
             today={workspace.today}
             items={workspace.items}
             channels={workspace.channels}
+            odooConfigured={workspace.odooStatus.configured}
             onClose={() => setQuickAddOpen(false)}
             onSubmit={async (payload) => {
               await api.createOrder(payload);

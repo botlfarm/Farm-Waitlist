@@ -114,47 +114,70 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
 
     // Determine initial cascade production rate and carried-over balance from any anchor strictly before startDate
     let activeCascadeRate = item.supplyMode === 'continuous' ? item.defaultDailyProduction : 0;
-    const priorOnHand = Array.from(itemEntries.values())
-      .filter((e) => e.date < startDate && e.actualOnHand !== null)
+    const priorAnchors = Array.from(itemEntries.values())
+      .filter(
+        (e) =>
+          e.date < startDate &&
+          (e.actualOnHand !== null || (e.actualEndOfDay !== undefined && e.actualEndOfDay !== null))
+      )
       .sort((a, b) => a.date.localeCompare(b.date));
 
     let runningBalance = 0;
-    if (priorOnHand.length > 0) {
-      const latestAnchor = priorOnHand[priorOnHand.length - 1];
-      // Initialize cascade rate from any anchor on or before latestAnchor.date
+    if (priorAnchors.length > 0) {
+      const latestAnchor = priorAnchors[priorAnchors.length - 1];
+      const latestHasEod =
+        latestAnchor.actualEndOfDay !== undefined && latestAnchor.actualEndOfDay !== null;
+
+      // Initialize cascade rate from any anchor prior to our carry-forward start date
       const preAnchorCascades = Array.from(itemEntries.values())
-        .filter((e) => e.date < latestAnchor.date && e.isCascadeAnchor && e.estProduced !== null)
+        .filter(
+          (e) =>
+            (latestHasEod ? e.date <= latestAnchor.date : e.date < latestAnchor.date) &&
+            e.isCascadeAnchor &&
+            e.estProduced !== null
+        )
         .sort((a, b) => a.date.localeCompare(b.date));
       if (preAnchorCascades.length > 0 && item.supplyMode === 'continuous') {
         activeCascadeRate = preAnchorCascades[preAnchorCascades.length - 1].estProduced!;
       }
 
-      // Roll forward day-by-day from latestAnchor.date through the day before startDate
-      const carryDates = listDateRange(latestAnchor.date, addDays(startDate, -1));
-      runningBalance = roundQty(latestAnchor.actualOnHand!);
-      for (const carryDate of carryDates) {
-        const carryEntry = itemEntries.get(carryDate);
-        const startBal =
-          carryEntry && carryEntry.actualOnHand !== null
-            ? roundQty(carryEntry.actualOnHand)
-            : roundQty(runningBalance);
+      const carryStart = latestHasEod ? addDays(latestAnchor.date, 1) : latestAnchor.date;
+      const carryEnd = addDays(startDate, -1);
+      runningBalance = latestHasEod
+        ? roundQty(latestAnchor.actualEndOfDay!)
+        : roundQty(latestAnchor.actualOnHand!);
 
-        let prod = 0;
-        if (item.supplyMode === 'continuous') {
-          if (carryEntry && carryEntry.estProduced !== null) {
-            prod = roundQty(carryEntry.estProduced);
-            if (carryEntry.isCascadeAnchor) {
-              activeCascadeRate = prod;
+      // Roll forward day-by-day through the day before startDate
+      if (carryStart <= carryEnd) {
+        const carryDates = listDateRange(carryStart, carryEnd);
+        for (const carryDate of carryDates) {
+          const carryEntry = itemEntries.get(carryDate);
+          const startBal =
+            carryEntry && carryEntry.actualOnHand !== null
+              ? roundQty(carryEntry.actualOnHand)
+              : roundQty(runningBalance);
+
+          let prod = 0;
+          if (item.supplyMode === 'continuous') {
+            if (carryEntry && carryEntry.estProduced !== null) {
+              prod = roundQty(carryEntry.estProduced);
+              if (carryEntry.isCascadeAnchor) {
+                activeCascadeRate = prod;
+              }
+            } else {
+              prod = roundQty(activeCascadeRate);
             }
-          } else {
-            prod = roundQty(activeCascadeRate);
+          } else if (carryEntry && carryEntry.estProduced !== null) {
+            prod = roundQty(carryEntry.estProduced);
           }
-        } else if (carryEntry && carryEntry.estProduced !== null) {
-          prod = roundQty(carryEntry.estProduced);
-        }
 
-        const slotted = roundQty(itemSlotted.get(carryDate) ?? 0);
-        runningBalance = roundQty(startBal - slotted + prod);
+          const slotted = roundQty(itemSlotted.get(carryDate) ?? 0);
+          const carryEod =
+            carryEntry && carryEntry.actualEndOfDay !== undefined && carryEntry.actualEndOfDay !== null
+              ? roundQty(carryEntry.actualEndOfDay)
+              : null;
+          runningBalance = carryEod !== null ? carryEod : roundQty(startBal - slotted + prod);
+        }
       }
     } else {
       const priorAnchorDates = Array.from(itemEntries.values())
@@ -170,9 +193,10 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
     for (const date of dates) {
       const entry = itemEntries.get(date);
 
-      // Determine starting balance: Actual On-Hand overrides carried-over stock from prior day's harvest
+      // Determine expected vs actual morning starting balance
+      const expectedStartingBalance = roundQty(runningBalance);
       const startingBalance =
-        entry && entry.actualOnHand !== null ? roundQty(entry.actualOnHand) : roundQty(runningBalance);
+        entry && entry.actualOnHand !== null ? roundQty(entry.actualOnHand) : expectedStartingBalance;
 
       // Determine afternoon Est. Produced (rolls into tomorrow's starting inventory)
       let estProduced = 0;
@@ -199,11 +223,20 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
         }
       }
 
+      const expectedProduced =
+        item.supplyMode === 'continuous' ? roundQty(activeCascadeRate) : 0;
+
       const slottedQty = roundQty(itemSlotted.get(date) ?? 0);
 
       // Orders today draw ONLY from today's starting stock; afternoon harvest becomes available tomorrow
       const endingBalance = roundQty(startingBalance - slottedQty);
-      const nextDayStarting = roundQty(endingBalance + estProduced);
+      const expectedNextDayStarting = roundQty(endingBalance + estProduced);
+      const actualEndOfDay =
+        entry && entry.actualEndOfDay !== undefined && entry.actualEndOfDay !== null
+          ? roundQty(entry.actualEndOfDay)
+          : null;
+      const nextDayStarting = actualEndOfDay !== null ? actualEndOfDay : expectedNextDayStarting;
+
       const hasBufferOverride = entry !== undefined && entry.bufferOverride !== null;
       const baseBuffer = hasBufferOverride
         ? roundQty(entry!.bufferOverride!)
@@ -218,11 +251,15 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
       dayMap.set(date, {
         trackedItemId: item.id,
         date,
+        expectedStartingBalance,
         startingBalance,
+        expectedProduced,
         estProduced,
         actualOnHand: entry?.actualOnHand ?? null,
+        actualEndOfDay,
         slottedQty,
         endingBalance,
+        expectedNextDayStarting,
         nextDayStarting,
         effectiveBuffer,
         extraBuffer,
@@ -238,13 +275,13 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
         notes: entry?.notes ?? null,
       });
 
-      // Carry forward remaining balance + afternoon harvest into tomorrow's starting inventory
+      // Carry forward end-of-day physical count (or remaining balance + afternoon harvest) into tomorrow's morning stock
       runningBalance = nextDayStarting;
     }
 
     // Second pass (Backward Available-to-Promise / ATP pass):
     // You cannot sell stock on Day D that is already required to fulfill slotted/pre-approved/confirmed
-    // orders on future dates k > D (stopping at any morning Actual On-Hand physical reset).
+    // orders on future dates k > D (stopping at any morning Actual On-Hand or end-of-day physical reset).
     let downstreamMinOpen = Infinity;
     let downstreamMinOpenDate: string | null = null;
     let downstreamMinEnding = Infinity;
@@ -253,6 +290,14 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
       const date = dates[i];
       const proj = dayMap.get(date);
       if (!proj) continue;
+
+      // If this day has an explicit physical End-of-Day count, tomorrow's inventory is pinned
+      // independently of today's daytime sales, so downstream days do not constrain today.
+      if (proj.actualEndOfDay !== null && proj.actualEndOfDay !== undefined) {
+        downstreamMinOpen = Infinity;
+        downstreamMinOpenDate = null;
+        downstreamMinEnding = Infinity;
+      }
 
       const atpOpen =
         downstreamMinOpen < proj.rawSellableOpen
@@ -306,6 +351,162 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
       isoWeekday: getIsoWeekday(date),
       isToday: date === today,
       isPast: date < today,
+      byItem,
+    };
+  });
+}
+
+/**
+ * Live drag-and-drop forecast preview: simulates slotting (or moving) `order` onto `targetDate`
+ * across all calendar days, updating forward balances (`startingBalance`, `slottedQty`,
+ * `endingBalance`, `nextDayStarting`) and backward ATP (`sellableOpen`, `availablePhysical`,
+ * `reservedForFuture`, `constrainedByDate`, `tier`) identically to `projectDailySupply`.
+ */
+export function previewOrderMoveProjections(
+  days: CalendarDayProjection[],
+  items: TrackedItem[],
+  order: OrderRecord,
+  targetDate: string
+): CalendarDayProjection[] {
+  if (days.length === 0 || order.items.length === 0) return days;
+
+  const isCurrentlySlotted =
+    Boolean(order.slottedDate) && order.status !== 'waitlist' && order.status !== 'ignored';
+  const sourceDate = isCurrentlySlotted ? order.slottedDate : null;
+  if (sourceDate === targetDate) return days;
+
+  // Aggregate item quantities for the dragged order
+  const qtyByItem = new Map<number, number>();
+  for (const line of order.items) {
+    if (line.quantity <= 0) continue;
+    qtyByItem.set(line.trackedItemId, roundQty((qtyByItem.get(line.trackedItemId) ?? 0) + line.quantity));
+  }
+  if (qtyByItem.size === 0) return days;
+
+  // Recompute forward + backward ATP only for affected tracked items
+  const updatedByItem = new Map<number, DailyItemProjection[]>();
+
+  for (const item of items) {
+    const orderQty = qtyByItem.get(item.id);
+    if (!orderQty) continue;
+
+    const itemDays: DailyItemProjection[] = [];
+    let prevNextDayStarting = 0;
+
+    for (let i = 0; i < days.length; i++) {
+      const day = days[i];
+      const base = day.byItem[item.id];
+      if (!base) {
+        continue;
+      }
+
+      const expectedStartingBalance =
+        i === 0 ? (base.expectedStartingBalance ?? base.startingBalance) : roundQty(prevNextDayStarting);
+      const startingBalance =
+        i === 0
+          ? base.startingBalance
+          : base.actualOnHand !== null
+            ? base.actualOnHand
+            : expectedStartingBalance;
+
+      let deltaSlotted = 0;
+      if (sourceDate && day.date === sourceDate) {
+        deltaSlotted = roundQty(deltaSlotted - orderQty);
+      }
+      if (day.date === targetDate) {
+        deltaSlotted = roundQty(deltaSlotted + orderQty);
+      }
+
+      const slottedQty = roundQty(base.slottedQty + deltaSlotted);
+      const endingBalance = roundQty(startingBalance - slottedQty);
+      const expectedNextDayStarting = roundQty(endingBalance + base.estProduced);
+      const nextDayStarting =
+        base.actualEndOfDay !== null && base.actualEndOfDay !== undefined
+          ? base.actualEndOfDay
+          : expectedNextDayStarting;
+      const rawSellableOpen = roundQty(endingBalance - base.effectiveBuffer);
+
+      itemDays.push({
+        ...base,
+        expectedStartingBalance,
+        startingBalance,
+        slottedQty,
+        endingBalance,
+        expectedNextDayStarting,
+        nextDayStarting,
+        rawSellableOpen,
+        availablePhysical: endingBalance,
+        reservedForFuture: 0,
+        constrainedByDate: null,
+        sellableOpen: rawSellableOpen,
+        tier: computeTier(endingBalance, rawSellableOpen),
+      });
+
+      prevNextDayStarting = nextDayStarting;
+    }
+
+    // Backward ATP reservation pass (identical boundary rules to projectDailySupply)
+    let downstreamMinOpen = Infinity;
+    let downstreamMinOpenDate: string | null = null;
+    let downstreamMinEnding = Infinity;
+
+    for (let i = itemDays.length - 1; i >= 0; i--) {
+      const proj = itemDays[i];
+
+      if (proj.actualEndOfDay !== null && proj.actualEndOfDay !== undefined) {
+        downstreamMinOpen = Infinity;
+        downstreamMinOpenDate = null;
+        downstreamMinEnding = Infinity;
+      }
+
+      const atpOpen =
+        downstreamMinOpen < proj.rawSellableOpen
+          ? roundQty(downstreamMinOpen)
+          : proj.rawSellableOpen;
+      const atpPhysical =
+        downstreamMinEnding < proj.endingBalance
+          ? roundQty(downstreamMinEnding)
+          : proj.endingBalance;
+
+      const constrainedByDate =
+        downstreamMinOpen < proj.rawSellableOpen ? downstreamMinOpenDate : null;
+      const rawHeld = Math.max(0, roundQty(proj.rawSellableOpen - atpOpen));
+      const reservedForFuture = Math.min(Math.max(0, proj.endingBalance), rawHeld);
+
+      proj.sellableOpen = atpOpen;
+      proj.availablePhysical = atpPhysical;
+      proj.reservedForFuture = reservedForFuture;
+      proj.constrainedByDate = constrainedByDate;
+      proj.tier = computeTier(atpPhysical, atpOpen);
+
+      if (proj.actualOnHand !== null) {
+        downstreamMinOpen = Infinity;
+        downstreamMinOpenDate = null;
+        downstreamMinEnding = Infinity;
+      } else {
+        if (proj.rawSellableOpen <= downstreamMinOpen) {
+          downstreamMinOpen = proj.rawSellableOpen;
+          downstreamMinOpenDate = proj.date;
+        }
+        if (proj.endingBalance <= downstreamMinEnding) {
+          downstreamMinEnding = proj.endingBalance;
+        }
+      }
+    }
+
+    updatedByItem.set(item.id, itemDays);
+  }
+
+  return days.map((day, idx) => {
+    const byItem: Record<number, DailyItemProjection> = { ...day.byItem };
+    for (const [itemId, projList] of updatedByItem.entries()) {
+      const updated = projList[idx];
+      if (updated) {
+        byItem[itemId] = updated;
+      }
+    }
+    return {
+      ...day,
       byItem,
     };
   });
@@ -442,6 +643,7 @@ export function evaluateCandidateSlotDates(params: {
   order: Pick<OrderRecord, 'status' | 'slottedDate' | 'requestedDate' | 'timingType' | 'items'>;
   draftItems?: OrderRecord['items'];
   draftPickupChannelId?: number | null;
+  draftRequestedDate?: string | null;
   days: CalendarDayProjection[];
   items: TrackedItem[];
   channels: PickupChannel[];
@@ -503,7 +705,11 @@ export function evaluateCandidateSlotDates(params: {
 
       if (oldSlottedIdx >= 0 && i === oldSlottedIdx) {
         restoringOld = true;
-      } else if (restoringOld && proj.actualOnHand !== null) {
+      } else if (
+        restoringOld &&
+        (proj.actualOnHand !== null ||
+          (i > 0 && days[i - 1].byItem[trackedItemId]?.actualEndOfDay != null))
+      ) {
         restoringOld = false;
       }
 
@@ -526,8 +732,9 @@ export function evaluateCandidateSlotDates(params: {
 
     const channelAllowed = !channel || isChannelActiveOnDate(channel, day.date, day.isoWeekday);
     const isCurrentSlot = isCurrentlyCounted && order.slottedDate === day.date;
-    const isRequestedDate =
-      order.timingType === 'specific_date' && order.requestedDate === day.date;
+    const effectiveRequestedDate =
+      params.draftRequestedDate !== undefined ? params.draftRequestedDate : order.requestedDate;
+    const isRequestedDate = Boolean(effectiveRequestedDate && effectiveRequestedDate === day.date);
 
     if (draftQtyByItem.size === 0) {
       results.push({
@@ -557,20 +764,24 @@ export function evaluateCandidateSlotDates(params: {
       let currentAtpEnding = baseEndings[candIdx] ?? 0;
       let constrainingDate: string | null = null;
 
-      for (let i = candIdx + 1; i < days.length; i++) {
-        const proj = days[i].byItem[trackedItemId];
-        if (!proj) continue;
-        if (proj.actualOnHand !== null) break;
+      const candHasEodOverride = days[candIdx].byItem[trackedItemId]?.actualEndOfDay != null;
+      if (!candHasEodOverride) {
+        for (let i = candIdx + 1; i < days.length; i++) {
+          const proj = days[i].byItem[trackedItemId];
+          if (!proj) continue;
+          if (proj.actualOnHand !== null) break;
+          if (days[i - 1].byItem[trackedItemId]?.actualEndOfDay != null) break;
 
-        const nextOpen = baseRawOpens[i] ?? 0;
-        const nextEnding = baseEndings[i] ?? 0;
+          const nextOpen = baseRawOpens[i] ?? 0;
+          const nextEnding = baseEndings[i] ?? 0;
 
-        if (nextOpen < currentAtpOpen) {
-          currentAtpOpen = nextOpen;
-          constrainingDate = days[i].date;
-        }
-        if (nextEnding < currentAtpEnding) {
-          currentAtpEnding = nextEnding;
+          if (nextOpen < currentAtpOpen) {
+            currentAtpOpen = nextOpen;
+            constrainingDate = days[i].date;
+          }
+          if (nextEnding < currentAtpEnding) {
+            currentAtpEnding = nextEnding;
+          }
         }
       }
 

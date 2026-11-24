@@ -1,8 +1,9 @@
-import type { AppSettings, SyncInterval } from '../shared/types';
+import type { AppSettings, GithubPublishInterval, SyncInterval } from '../shared/types';
 import type { RuntimeConfig } from './config';
 import type { DatabaseManager } from './db';
 import { syncOdooQuotations } from './odooService';
 import { listPickupChannels, listTrackedItems } from './repository';
+import { publishSnippetSnapshotToGithub } from './snippetService';
 
 const INTERVAL_MS: Record<SyncInterval, number | null> = {
   '15m': 15 * 60 * 1000,
@@ -12,6 +13,13 @@ const INTERVAL_MS: Record<SyncInterval, number | null> = {
   manual: null,
 };
 
+const GITHUB_INTERVAL_MS: Record<GithubPublishInterval, number> = {
+  '15m': 15 * 60 * 1000,
+  '30m': 30 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '6h': 6 * 60 * 60 * 1000,
+};
+
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 export class BackgroundScheduler {
@@ -19,7 +27,9 @@ export class BackgroundScheduler {
   private config: RuntimeConfig;
   private odooTimer: ReturnType<typeof setInterval> | null = null;
   private backupTimer: ReturnType<typeof setInterval> | null = null;
+  private githubPublishTimer: ReturnType<typeof setInterval> | null = null;
   private syncInFlight = false;
+  private githubPublishInFlight = false;
 
   constructor(dbManager: DatabaseManager, config: RuntimeConfig) {
     this.dbManager = dbManager;
@@ -49,6 +59,25 @@ export class BackgroundScheduler {
       }, ONE_DAY_MS);
       this.backupTimer.unref?.();
     }
+
+    // 3. Automatic change-only GitHub Pages availability publish
+    const configuredRepo = (
+      settings.githubPublishRepo ||
+      this.config.githubPublish?.defaultRepo ||
+      ''
+    ).trim();
+    if (
+      settings.githubPublishMode === 'auto' &&
+      this.config.githubPublish?.token &&
+      configuredRepo
+    ) {
+      const intervalKey = settings.githubPublishInterval ?? '30m';
+      const publishMs = GITHUB_INTERVAL_MS[intervalKey] ?? GITHUB_INTERVAL_MS['30m'];
+      this.githubPublishTimer = setInterval(() => {
+        void this.runGithubPublishSafe();
+      }, publishMs);
+      this.githubPublishTimer.unref?.();
+    }
   }
 
   public stop(): void {
@@ -59,6 +88,10 @@ export class BackgroundScheduler {
     if (this.backupTimer) {
       clearInterval(this.backupTimer);
       this.backupTimer = null;
+    }
+    if (this.githubPublishTimer) {
+      clearInterval(this.githubPublishTimer);
+      this.githubPublishTimer = null;
     }
   }
 
@@ -88,6 +121,25 @@ export class BackgroundScheduler {
       this.dbManager.pruneScheduledBackups(settings.backupRetentionDays);
     } catch (err) {
       console.error('[Farm Waitlist] Scheduled backup failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
+  private async runGithubPublishSafe(): Promise<void> {
+    if (this.githubPublishInFlight) return;
+    this.githubPublishInFlight = true;
+    try {
+      await publishSnippetSnapshotToGithub({
+        dbManager: this.dbManager,
+        config: this.config,
+        force: false,
+      });
+    } catch (err) {
+      console.error(
+        '[Farm Waitlist] Scheduled GitHub availability publish failed:',
+        err instanceof Error ? err.message : err
+      );
+    } finally {
+      this.githubPublishInFlight = false;
     }
   }
 }

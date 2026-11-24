@@ -17,8 +17,12 @@ options:
   odoo_url: ""
   odoo_db: ""
   odoo_api_key: ""
+  github_publish_token: ""
+  github_publish_repo: ""
 schema:
   odoo_url: url?
   odoo_db: str?
   odoo_api_key: password?
+  github_publish_token: password?
+  github_publish_repo: str?
 image: ghcr.io/botlfarm/farm-waitlist-{arch}

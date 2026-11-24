@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import type {
+  CustomerSuggestion,
   DailySupplyEntry,
   OrderChatterMessage,
   OrderItemLine,
@@ -89,6 +90,7 @@ export function listDailySupplyEntries(db: Database.Database): DailySupplyEntry[
     date: string;
     actual_on_hand: number | null;
     est_produced: number | null;
+    actual_end_of_day?: number | null;
     is_cascade_anchor: number;
     buffer_override: number | null;
     extra_buffer?: number | null;
@@ -101,6 +103,7 @@ export function listDailySupplyEntries(db: Database.Database): DailySupplyEntry[
     date: r.date,
     actualOnHand: r.actual_on_hand,
     estProduced: r.est_produced,
+    actualEndOfDay: typeof r.actual_end_of_day === 'number' ? r.actual_end_of_day : null,
     isCascadeAnchor: Boolean(r.is_cascade_anchor),
     bufferOverride: r.buffer_override,
     extraBuffer: typeof r.extra_buffer === 'number' ? r.extra_buffer : 0,
@@ -135,6 +138,7 @@ interface RawOrderRow {
   odoo_updated_after_slot: number;
   odoo_missing_flagged: number;
   odoo_suggested_confirmed_json: string | null;
+  waitlist_sort_order?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -213,6 +217,21 @@ function hydrateOrders(db: Database.Database, rows: RawOrderRow[]): OrderRecord[
     mergedNamesByOrder.set(m.target_order_id, arr);
   }
 
+  const dismissedRows = db
+    .prepare('SELECT order_id_a, order_id_b FROM dismissed_duplicate_pairs')
+    .all() as Array<{ order_id_a: number; order_id_b: number }>;
+
+  const dismissedByOrder = new Map<number, number[]>();
+  for (const pair of dismissedRows) {
+    const arrA = dismissedByOrder.get(pair.order_id_a) ?? [];
+    arrA.push(pair.order_id_b);
+    dismissedByOrder.set(pair.order_id_a, arrA);
+
+    const arrB = dismissedByOrder.get(pair.order_id_b) ?? [];
+    arrB.push(pair.order_id_a);
+    dismissedByOrder.set(pair.order_id_b, arrB);
+  }
+
   return rows.map((r) => ({
     id: r.id,
     source: r.source,
@@ -244,6 +263,8 @@ function hydrateOrders(db: Database.Database, rows: RawOrderRow[]): OrderRecord[
       null
     ),
     mergedOdooNames: mergedNamesByOrder.get(r.id) ?? [],
+    dismissedDuplicateOrderIds: dismissedByOrder.get(r.id) ?? [],
+    waitlistSortOrder: typeof r.waitlist_sort_order === 'number' ? r.waitlist_sort_order : null,
     items: itemsByOrder.get(r.id) ?? [],
     chatter: chatterByOrder.get(r.id) ?? [],
     createdAt: r.created_at,
@@ -262,4 +283,187 @@ export function getOrderById(db: Database.Database, id: number): OrderRecord | n
   const row = db.prepare('SELECT * FROM orders WHERE id = ?').get(id) as RawOrderRow | undefined;
   if (!row) return null;
   return hydrateOrders(db, [row])[0] ?? null;
+}
+
+export function countOdooCustomers(db: Database.Database): number {
+  const row = db.prepare('SELECT COUNT(*) as cnt FROM odoo_customers').get() as
+    | { cnt: number }
+    | undefined;
+  return row?.cnt ?? 0;
+}
+
+/**
+ * Returns deduplicated customer autocomplete suggestions combining synced Odoo contacts
+ * (`odoo_customers`) and local order / standing order customer history.
+ */
+export function listCustomerDirectory(
+  db: Database.Database,
+  query = '',
+  limit = 50
+): CustomerSuggestion[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(200, Math.floor(limit))) : 50;
+
+  const odooRows = db
+    .prepare(
+      `SELECT odoo_partner_id, name, email, phone
+       FROM odoo_customers
+       ORDER BY name COLLATE NOCASE ASC`
+    )
+    .all() as Array<{
+    odoo_partner_id: number;
+    name: string;
+    email: string | null;
+    phone: string | null;
+  }>;
+
+  const localOrderRows = db
+    .prepare(
+      `SELECT customer_name, customer_email, customer_phone, odoo_partner_id, updated_at
+       FROM orders
+       WHERE TRIM(customer_name) != ''
+       ORDER BY updated_at DESC, id DESC`
+    )
+    .all() as Array<{
+    customer_name: string;
+    customer_email: string | null;
+    customer_phone: string | null;
+    odoo_partner_id: number | null;
+    updated_at: string;
+  }>;
+
+  const standingRows = db
+    .prepare(
+      `SELECT customer_name, customer_contact, updated_at
+       FROM standing_orders
+       WHERE TRIM(customer_name) != ''
+       ORDER BY updated_at DESC, id DESC`
+    )
+    .all() as Array<{
+    customer_name: string;
+    customer_contact: string | null;
+    updated_at: string;
+  }>;
+
+  const byKey = new Map<string, CustomerSuggestion>();
+  const byPartnerId = new Map<number, CustomerSuggestion>();
+
+  const normalizeNameKey = (name: string) => name.trim().toLowerCase().replace(/\s+/g, ' ');
+
+  // 1. Seed with Odoo directory first (authoritative contact details + partner ID)
+  for (const row of odooRows) {
+    const cleanName = row.name.trim();
+    if (!cleanName) continue;
+    const entry: CustomerSuggestion = {
+      key: `odoo:${row.odoo_partner_id}`,
+      name: cleanName,
+      email: row.email?.trim() || null,
+      phone: row.phone?.trim() || null,
+      odooPartnerId: row.odoo_partner_id,
+      source: 'odoo',
+    };
+    const nameKey = normalizeNameKey(cleanName);
+    const dedupeKey = entry.email ? `${nameKey}|${entry.email.toLowerCase()}` : nameKey;
+    if (!byKey.has(dedupeKey)) {
+      byKey.set(dedupeKey, entry);
+    }
+    byPartnerId.set(row.odoo_partner_id, entry);
+  }
+
+  // 2. Supplement with local order customers not already represented
+  for (const row of localOrderRows) {
+    const cleanName = row.customer_name.trim();
+    if (!cleanName) continue;
+    const email = row.customer_email?.trim() || null;
+    const phone = row.customer_phone?.trim() || null;
+
+    if (row.odoo_partner_id && byPartnerId.has(row.odoo_partner_id)) {
+      const existing = byPartnerId.get(row.odoo_partner_id)!;
+      if (!existing.email && email) existing.email = email;
+      if (!existing.phone && phone) existing.phone = phone;
+      continue;
+    }
+
+    const nameKey = normalizeNameKey(cleanName);
+    const existingByName = Array.from(byKey.values()).find(
+      (c) => normalizeNameKey(c.name) === nameKey
+    );
+    if (existingByName) {
+      if (!existingByName.email && email) existingByName.email = email;
+      if (!existingByName.phone && phone) existingByName.phone = phone;
+      continue;
+    }
+
+    const key = `local:${nameKey}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        key,
+        name: cleanName,
+        email,
+        phone,
+        odooPartnerId: row.odoo_partner_id,
+        source: 'local',
+      });
+    }
+  }
+
+  // 3. Supplement with standing order customers
+  for (const row of standingRows) {
+    const cleanName = row.customer_name.trim();
+    if (!cleanName) continue;
+    const contact = row.customer_contact?.trim() || null;
+    const looksLikeEmail = Boolean(contact && contact.includes('@'));
+    const email = looksLikeEmail ? contact : null;
+    const phone = !looksLikeEmail ? contact : null;
+
+    const nameKey = normalizeNameKey(cleanName);
+    const existingByName = Array.from(byKey.values()).find(
+      (c) => normalizeNameKey(c.name) === nameKey
+    );
+    if (existingByName) {
+      if (!existingByName.email && email) existingByName.email = email;
+      if (!existingByName.phone && phone) existingByName.phone = phone;
+      continue;
+    }
+
+    const key = `local:${nameKey}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        key,
+        name: cleanName,
+        email,
+        phone,
+        odooPartnerId: null,
+        source: 'local',
+      });
+    }
+  }
+
+  const all = Array.from(byKey.values());
+  const filtered = normalizedQuery
+    ? all.filter((c) => {
+        const hayName = c.name.toLowerCase();
+        const hayEmail = (c.email ?? '').toLowerCase();
+        const hayPhone = (c.phone ?? '').toLowerCase();
+        return (
+          hayName.includes(normalizedQuery) ||
+          hayEmail.includes(normalizedQuery) ||
+          hayPhone.includes(normalizedQuery)
+        );
+      })
+    : all;
+
+  filtered.sort((a, b) => {
+    if (normalizedQuery) {
+      const aStarts = a.name.toLowerCase().startsWith(normalizedQuery) ? 0 : 1;
+      const bStarts = b.name.toLowerCase().startsWith(normalizedQuery) ? 0 : 1;
+      if (aStarts !== bStarts) return aStarts - bStarts;
+    }
+    if (a.source !== b.source) {
+      return a.source === 'odoo' ? -1 : 1;
+    }
+    return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+  });
+
+  return filtered.slice(0, safeLimit);
 }

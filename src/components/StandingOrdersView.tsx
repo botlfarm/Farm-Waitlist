@@ -9,12 +9,14 @@ import type {
   StandingOrder,
   TrackedItem,
 } from '../shared/types';
+import { CustomerAutocompleteInput } from './CustomerAutocompleteInput';
 
 interface StandingOrdersViewProps {
   today: string;
   items: TrackedItem[];
   channels: PickupChannel[];
   standingOrders: StandingOrder[];
+  odooConfigured?: boolean;
   onCreate: (payload: {
     customerName: string;
     customerContact?: string;
@@ -35,6 +37,7 @@ export function StandingOrdersView({
   items,
   channels,
   standingOrders,
+  odooConfigured = false,
   onCreate,
   onToggleActive,
   onDelete,
@@ -126,20 +129,19 @@ export function StandingOrdersView({
           )}
 
           <div className="mt-4 space-y-4">
-            <div>
-              <label htmlFor="so-name" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
-                Customer Name
-              </label>
-              <input
-                id="so-name"
-                data-testid="standing-customer-input"
-                type="text"
-                value={customerName}
-                onChange={(e) => setCustomerName(e.target.value)}
-                placeholder="e.g., Oak Street Bakery"
-                className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] placeholder:text-[#6E7681]"
-              />
-            </div>
+            <CustomerAutocompleteInput
+              id="so-name"
+              testId="standing-customer-input"
+              label="Customer Name"
+              value={customerName}
+              placeholder="e.g., Oak Street Bakery"
+              odooConfigured={odooConfigured}
+              onChange={setCustomerName}
+              onSelectCustomer={(cust) => {
+                const contact = [cust.phone, cust.email].filter(Boolean).join(' · ');
+                if (contact) setCustomerContact(contact);
+              }}
+            />
 
             <div>
               <label htmlFor="so-contact" className="mb-1 block text-xs font-medium text-[#C9D1D9]">

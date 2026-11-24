@@ -75,6 +75,23 @@ export function formatLocalSqlTimestamp(date: Date, timezone: string = DEFAULT_T
 }
 
 /**
+ * Formats a Date into 24-hour local "HH:MM" in the target timezone (e.g., "16:05").
+ */
+export function formatLocalTimeHHMM(date: Date, timezone: string = DEFAULT_TIMEZONE): string {
+  if (Number.isNaN(date.getTime())) return '00:00';
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = formatter.formatToParts(date);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '00';
+  const hour = get('hour') === '24' ? '00' : get('hour');
+  return `${hour}:${get('minute')}`;
+}
+
+/**
  * Converts an Odoo UTC string directly to a local YYYY-MM-DD calendar date key.
  */
 export function odooUtcToLocalDateKey(odooUtcStr: string, timezone: string = DEFAULT_TIMEZONE): string {
@@ -242,4 +259,104 @@ export function formatAgingBadge(hours: number): string {
   }
   const days = Math.floor(hours / 24);
   return `Waiting ${days}d`;
+}
+
+export interface OrderArrivalInfo {
+  sortKey: string; // "YYYY-MM-DD HH:mm:ss" in local farm timezone
+  dateKey: string; // "YYYY-MM-DD" in local farm timezone
+  shortLabel: string; // e.g. "Nov 20" (or "Nov 20, 2025" if prior year)
+  ageLabel: string | null; // e.g. "Today", "1d ago", "4d ago"
+  fullLabel: string; // e.g. "Nov 20, 2026 09:15"
+}
+
+export function getOrderArrivalInfo(
+  order: { odooCreatedAtLocal: string | null; createdAt: string },
+  timezone: string = DEFAULT_TIMEZONE,
+  today?: string
+): OrderArrivalInfo {
+  let sortKey = '';
+  const odooLocal = order.odooCreatedAtLocal?.trim() ?? '';
+  if (/^\d{4}-\d{2}-\d{2}/.test(odooLocal)) {
+    sortKey = odooLocal.length >= 19 ? odooLocal.slice(0, 19) : `${odooLocal.slice(0, 10)} 00:00:00`;
+  } else if (order.createdAt) {
+    const dt = new Date(order.createdAt);
+    if (!Number.isNaN(dt.getTime())) {
+      sortKey = formatLocalSqlTimestamp(dt, timezone);
+    }
+  }
+
+  const dateKey = /^\d{4}-\d{2}-\d{2}/.test(sortKey) ? sortKey.slice(0, 10) : '';
+  if (!dateKey) {
+    return {
+      sortKey: '9999-12-31 23:59:59',
+      dateKey: '',
+      shortLabel: 'Unknown',
+      ageLabel: null,
+      fullLabel: 'Unknown arrival date',
+    };
+  }
+
+  const todayYear = today && /^\d{4}/.test(today) ? today.slice(0, 4) : dateKey.slice(0, 4);
+  const shortLabel =
+    dateKey.slice(0, 4) !== todayYear
+      ? `${formatShortCalendarDate(dateKey)}, ${dateKey.slice(0, 4)}`
+      : formatShortCalendarDate(dateKey);
+
+  let ageLabel: string | null = null;
+  if (today && /^\d{4}-\d{2}-\d{2}$/.test(today)) {
+    const daysAgo = diffDays(dateKey, today);
+    if (daysAgo === 0) ageLabel = 'Today';
+    else if (daysAgo > 0) ageLabel = `${daysAgo}d ago`;
+  }
+
+  const timePart = sortKey.length >= 16 ? sortKey.slice(11, 16) : '';
+  const fullLabel = `${formatFullDisplayDate(dateKey)}${timePart ? ` at ${timePart}` : ''}`;
+
+  return { sortKey, dateKey, shortLabel, ageLabel, fullLabel };
+}
+
+export function compareWaitlistOrders(
+  a: {
+    id: number;
+    status: string;
+    odooCreatedAtLocal: string | null;
+    createdAt: string;
+    waitlistSortOrder?: number | null;
+  },
+  b: {
+    id: number;
+    status: string;
+    odooCreatedAtLocal: string | null;
+    createdAt: string;
+    waitlistSortOrder?: number | null;
+  },
+  timezone: string = DEFAULT_TIMEZONE
+): number {
+  const aRank = typeof a.waitlistSortOrder === 'number' && Number.isFinite(a.waitlistSortOrder)
+    ? a.waitlistSortOrder
+    : null;
+  const bRank = typeof b.waitlistSortOrder === 'number' && Number.isFinite(b.waitlistSortOrder)
+    ? b.waitlistSortOrder
+    : null;
+
+  if (aRank !== null && bRank !== null && aRank !== bRank) {
+    return aRank - bRank;
+  }
+  if (aRank !== null && bRank === null) return -1;
+  if (aRank === null && bRank !== null) return 1;
+
+  // Default order when not manually ranked: confirmed-needs-date first, then earliest arrival first
+  const aConfirmed = a.status === 'confirmed' ? 0 : 1;
+  const bConfirmed = b.status === 'confirmed' ? 0 : 1;
+  if (aConfirmed !== bConfirmed) {
+    return aConfirmed - bConfirmed;
+  }
+
+  const aArrival = getOrderArrivalInfo(a, timezone).sortKey;
+  const bArrival = getOrderArrivalInfo(b, timezone).sortKey;
+  if (aArrival !== bArrival) {
+    return aArrival.localeCompare(bArrival);
+  }
+
+  return a.id - b.id;
 }

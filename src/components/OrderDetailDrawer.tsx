@@ -1,6 +1,11 @@
 import {
+  Calendar,
   CalendarCheck,
   Check,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  Eye,
   GitMerge,
   Lock,
   Mail,
@@ -12,6 +17,7 @@ import {
   X,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { CustomerAutocompleteInput } from './CustomerAutocompleteInput';
 import { formatQty } from '../shared/generators';
 import {
   channelHasScheduleRestriction,
@@ -24,6 +30,7 @@ import {
   formatAgingBadge,
   formatShortCalendarDate,
   getAgingHoldHours,
+  getIsoWeekday,
 } from '../shared/timezone';
 import type {
   CalendarDayProjection,
@@ -41,6 +48,7 @@ export type OrderSavePatch = Partial<{
   customerPhone: string | null;
   pickupChannelId: number | null;
   status: OrderStatus;
+  requestedDate: string | null;
   slottedDate: string | null;
   isLocked: boolean;
   notes: string | null;
@@ -57,7 +65,9 @@ interface OrderDetailDrawerProps {
   today: string;
   weeks: number;
   holdThresholdHours: number;
+  odooConfigured?: boolean;
   onClose: () => void;
+  onSelectOrder?: (orderId: number) => void;
   onSaveOrder: (orderId: number, patch: OrderSavePatch) => Promise<void>;
   onQuickSlotOrder: (
     orderId: number,
@@ -76,6 +86,7 @@ interface OrderDetailDrawerProps {
     itemStrategy: OrderMergeItemStrategy,
     keepDate?: string | null
   ) => Promise<void>;
+  onDismissDuplicate?: (orderId: number, otherOrderId: number) => Promise<void>;
   onDeleteOrder: (orderId: number) => Promise<void>;
   onSkipStandingOccurrence: (standingId: number, occurrenceDate: string) => Promise<void>;
 }
@@ -121,7 +132,14 @@ function formatCandidateDateLabel(dateYmd: string, isoWeekday: number, isToday: 
   return isToday ? `${base} (Today)` : base;
 }
 
+function isStandingRecurringOrder(order: OrderRecord): boolean {
+  return order.source === 'standing' || order.standingOrderId !== null;
+}
+
 function scoreDuplicateOrder(target: OrderRecord, candidate: OrderRecord): number {
+  if (isStandingRecurringOrder(target) || isStandingRecurringOrder(candidate)) {
+    return 0;
+  }
   let score = 0;
 
   if (
@@ -172,6 +190,155 @@ function scoreDuplicateOrder(target: OrderRecord, candidate: OrderRecord): numbe
   return score;
 }
 
+function DuplicateOrderDetailsBody({
+  candidate,
+  items,
+  channels,
+  chatterTestId = 'duplicate-compare-chatter',
+}: {
+  candidate: OrderRecord;
+  items: TrackedItem[];
+  channels: PickupChannel[];
+  chatterTestId?: string;
+}) {
+  const channelName = candidate.pickupChannelId
+    ? channels.find((c) => c.id === candidate.pickupChannelId)?.name ?? null
+    : null;
+  const arrivalLabel = candidate.odooCreatedAtLocal || candidate.createdAt.slice(0, 16).replace('T', ' ');
+  const trimmedNotes = (candidate.notes || '').trim();
+  const trimmedRawNotes = (candidate.odooRawNotes || '').trim();
+  const showSeparateRawNotes = Boolean(trimmedRawNotes && trimmedRawNotes !== trimmedNotes);
+
+  return (
+    <div className="space-y-3 text-xs text-[#C9D1D9]">
+      {/* Metadata summary grid */}
+      <div className="grid grid-cols-1 gap-1.5 rounded-md border border-[#283340] bg-[#0B1117] p-2.5 text-[11px] sm:grid-cols-2">
+        <div>
+          <span className="text-[#8B949E]">Status: </span>
+          <span className="font-semibold capitalize text-[#F0F6FC]">
+            {candidate.status.replace('_', ' ')}
+          </span>
+        </div>
+        <div>
+          <span className="text-[#8B949E]">Scheduled: </span>
+          <span className="font-mono text-[#F0F6FC]">
+            {candidate.slottedDate ? formatShortCalendarDate(candidate.slottedDate) : 'Unslotted'}
+          </span>
+        </div>
+        <div>
+          <span className="text-[#8B949E]">Arrived: </span>
+          <span className="font-mono text-[#C9D1D9]">{arrivalLabel}</span>
+        </div>
+        <div>
+          <span className="text-[#8B949E]">Channel: </span>
+          <span className="text-[#C9D1D9]">
+            {channelName || candidate.freeTextPickup || 'Unassigned'}
+          </span>
+        </div>
+        {candidate.requestedDate && (
+          <div>
+            <span className="text-[#8B949E]">Requested Date: </span>
+            <span className="font-mono text-[#FBBF24]">
+              {formatShortCalendarDate(candidate.requestedDate)}
+            </span>
+          </div>
+        )}
+        {(candidate.customerPhone || candidate.customerEmail) && (
+          <div className="sm:col-span-2">
+            <span className="text-[#8B949E]">Contact: </span>
+            <span className="text-[#C9D1D9]">
+              {[candidate.customerPhone, candidate.customerEmail].filter(Boolean).join(' · ')}
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Tracked Items + Raw Odoo Lines */}
+      <div>
+        <div className="text-[11px] font-semibold text-[#F0F6FC]">Items</div>
+        <div className="mt-1 font-mono text-[11px] text-[#C9D1D9]">
+          {candidate.items.length === 0
+            ? 'No tracked items assigned'
+            : candidate.items
+                .map((l) => {
+                  const meta = items.find((i) => i.id === l.trackedItemId);
+                  return `${formatQty(l.quantity)} ${meta ? `${meta.unitLabel} ${meta.name}` : `#${l.trackedItemId}`}`;
+                })
+                .join(', ')}
+        </div>
+        {candidate.odooRawLines.length > 0 && (
+          <ul className="mt-1.5 space-y-0.5 text-[11px] text-[#8B949E]">
+            {candidate.odooRawLines.map((rawLine, idx) => (
+              <li key={idx} className="font-mono">
+                • {rawLine}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* Notes & Odoo Raw Notes */}
+      {(trimmedNotes || showSeparateRawNotes) && (
+        <div>
+          <div className="text-[11px] font-semibold text-[#F0F6FC]">Notes</div>
+          {trimmedNotes && (
+            <pre className="mt-1 whitespace-pre-wrap rounded border border-[#283340] bg-[#0B1117] p-2 font-sans text-[11px] leading-relaxed text-[#C9D1D9]">
+              {trimmedNotes}
+            </pre>
+          )}
+          {showSeparateRawNotes && (
+            <pre className="mt-1.5 whitespace-pre-wrap rounded border border-[#283340] bg-[#0B1117] p-2 font-sans text-[11px] leading-relaxed text-[#8B949E]">
+              {trimmedRawNotes}
+            </pre>
+          )}
+        </div>
+      )}
+
+      {/* Full Odoo Chatter for comparison */}
+      <div data-testid={chatterTestId}>
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] font-semibold text-[#F0F6FC]">
+            Odoo Chatter ({candidate.chatter.length})
+          </span>
+          {candidate.chatter.length > 0 && (
+            <span className="text-[10px] text-[#8B949E]">Comments &amp; Emails</span>
+          )}
+        </div>
+        {candidate.chatter.length === 0 ? (
+          <p className="mt-1 text-[11px] text-[#8B949E]">
+            No chatter messages on this order.
+          </p>
+        ) : (
+          <div className="mt-1.5 max-h-56 space-y-2 overflow-y-auto pr-0.5">
+            {candidate.chatter.map((msg) => (
+              <div
+                key={msg.id}
+                data-testid={`duplicate-chatter-msg-${msg.odooMessageId}`}
+                className="rounded border border-[#283340] bg-[#0B1117] p-2.5"
+              >
+                <div className="flex items-center justify-between gap-2 text-[11px] text-[#8B949E]">
+                  <span className="inline-flex items-center gap-1 font-medium text-[#E6EDF3]">
+                    {msg.messageType === 'email' ? (
+                      <Mail className="h-3 w-3 text-[#38BDF8]" aria-hidden="true" />
+                    ) : (
+                      <MessageSquare className="h-3 w-3 text-[#8B949E]" aria-hidden="true" />
+                    )}
+                    {msg.authorName}
+                  </span>
+                  <span className="font-mono text-[10px] tabular-nums">{msg.createdAtLocal}</span>
+                </div>
+                <p className="mt-1.5 whitespace-pre-wrap text-[11px] leading-relaxed text-[#C9D1D9]">
+                  {msg.bodyText}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function OrderDetailDrawer({
   order,
   allOrders = [],
@@ -181,7 +348,9 @@ export function OrderDetailDrawer({
   today,
   weeks,
   holdThresholdHours,
+  odooConfigured = false,
   onClose,
+  onSelectOrder,
   onSaveOrder,
   onQuickSlotOrder,
   onExtendWeeks,
@@ -191,6 +360,7 @@ export function OrderDetailDrawer({
   onRestoreIgnored,
   onReconcile,
   onMergeOrders,
+  onDismissDuplicate,
   onDeleteOrder,
   onSkipStandingOccurrence,
 }: OrderDetailDrawerProps) {
@@ -198,6 +368,7 @@ export function OrderDetailDrawer({
   const [customerEmail, setCustomerEmail] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
   const [pickupChannelId, setPickupChannelId] = useState<string>('');
+  const [requestedDate, setRequestedDate] = useState<string>('');
   const [slottedDate, setSlottedDate] = useState<string>('');
   const [status, setStatus] = useState<OrderStatus>('waitlist');
   const [isLocked, setIsLocked] = useState(false);
@@ -210,12 +381,17 @@ export function OrderDetailDrawer({
   const [onlyOpenDates, setOnlyOpenDates] = useState(false);
   const [showOffChannel, setShowOffChannel] = useState(false);
 
-  // Merge orders state
+  // Merge orders & duplicate inspection state
   const [mergePanelOpen, setMergePanelOpen] = useState(false);
   const [mergeSourceId, setMergeSourceId] = useState<string>('');
   const [mergeStrategy, setMergeStrategy] = useState<OrderMergeItemStrategy>('keep_target');
   const [mergeKeepDate, setMergeKeepDate] = useState<string>('');
   const [merging, setMerging] = useState(false);
+  const [dismissingDuplicateId, setDismissingDuplicateId] = useState<number | null>(null);
+  const [localDismissedIds, setLocalDismissedIds] = useState<number[]>([]);
+  const [inspectingDuplicateId, setInspectingDuplicateId] = useState<number | null>(null);
+  const [showAllDuplicates, setShowAllDuplicates] = useState(false);
+  const [showMergeSourceDetails, setShowMergeSourceDetails] = useState(true);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const rowKeyCounter = useRef(0);
 
@@ -225,6 +401,7 @@ export function OrderDetailDrawer({
     setCustomerEmail(order.customerEmail ?? '');
     setCustomerPhone(order.customerPhone ?? '');
     setPickupChannelId(order.pickupChannelId ? String(order.pickupChannelId) : '');
+    setRequestedDate(order.requestedDate ?? '');
     setSlottedDate(order.slottedDate ?? '');
     setStatus(order.status);
     setIsLocked(order.isLocked);
@@ -244,15 +421,30 @@ export function OrderDetailDrawer({
     setMergeStrategy('keep_target');
     setMergeKeepDate(order.slottedDate ?? '');
     setMerging(false);
+    setDismissingDuplicateId(null);
+    setLocalDismissedIds([]);
+    setInspectingDuplicateId(null);
+    setShowAllDuplicates(false);
+    setShowMergeSourceDetails(true);
   }, [order]);
 
   const mergeCandidates = useMemo(() => {
-    if (!order) return { likely: [] as OrderRecord[], others: [] as OrderRecord[] };
-    const eligible = allOrders.filter((o) => o.id !== order.id && o.status !== 'ignored');
+    if (!order || isStandingRecurringOrder(order)) {
+      return { likely: [] as OrderRecord[], others: [] as OrderRecord[] };
+    }
+    const dismissedSet = new Set<number>([
+      ...(order.dismissedDuplicateOrderIds ?? []),
+      ...localDismissedIds,
+    ]);
+    const eligible = allOrders.filter(
+      (o) => o.id !== order.id && o.status !== 'ignored' && !isStandingRecurringOrder(o)
+    );
     const likelyScored: Array<{ cand: OrderRecord; score: number }> = [];
     const others: OrderRecord[] = [];
     for (const cand of eligible) {
-      const score = scoreDuplicateOrder(order, cand);
+      const isDismissed =
+        dismissedSet.has(cand.id) || (cand.dismissedDuplicateOrderIds ?? []).includes(order.id);
+      const score = isDismissed ? 0 : scoreDuplicateOrder(order, cand);
       if (score > 0) {
         likelyScored.push({ cand, score });
       } else {
@@ -261,7 +453,7 @@ export function OrderDetailDrawer({
     }
     likelyScored.sort((a, b) => b.score - a.score || b.cand.id - a.cand.id);
     return { likely: likelyScored.map((entry) => entry.cand), others };
-  }, [allOrders, order]);
+  }, [allOrders, order, localDismissedIds]);
 
   const selectedMergeSource = useMemo(() => {
     const id = Number(mergeSourceId);
@@ -307,16 +499,22 @@ export function OrderDetailDrawer({
       order,
       draftItems: parsedOrderItems,
       draftPickupChannelId: parsedChannelId,
+      draftRequestedDate: requestedDate || null,
       days,
       items,
       channels,
       today,
     });
-  }, [order, parsedOrderItems, parsedChannelId, days, items, channels, today]);
+  }, [order, parsedOrderItems, parsedChannelId, requestedDate, days, items, channels, today]);
 
   const firstAvailable = useMemo(
     () => candidateDates.find((c) => c.isFirstAvailable) ?? null,
     [candidateDates]
+  );
+
+  const requestedDateCandidate = useMemo(
+    () => (requestedDate ? candidateDates.find((c) => c.date === requestedDate) ?? null : null),
+    [candidateDates, requestedDate]
   );
 
   const visibleCandidates = useMemo(() => {
@@ -359,6 +557,7 @@ export function OrderDetailDrawer({
     customerEmail: customerEmail.trim() || null,
     customerPhone: customerPhone.trim() || null,
     pickupChannelId: parsedChannelId,
+    requestedDate: requestedDate || null,
     isLocked,
     notes: notes.trim() || null,
     items: validDraftItems,
@@ -383,6 +582,7 @@ export function OrderDetailDrawer({
     if ((customerEmail.trim() || null) !== order.customerEmail) return true;
     if ((customerPhone.trim() || null) !== order.customerPhone) return true;
     if (parsedChannelId !== order.pickupChannelId) return true;
+    if ((requestedDate || null) !== order.requestedDate) return true;
     if (isLocked !== order.isLocked) return true;
     if ((notes.trim() || null) !== order.notes) return true;
     if (validDraftItems.length !== order.items.length) return true;
@@ -468,6 +668,18 @@ export function OrderDetailDrawer({
             <p className="mt-0.5 truncate font-mono text-xs tabular-nums text-[#C9D1D9]">
               {itemsSummary}
             </p>
+            {requestedDate && (
+              <div
+                data-testid="order-header-requested-pickup"
+                className="mt-1.5 inline-flex items-center gap-1.5 rounded border border-[#D97706]/50 bg-[#D97706]/15 px-2 py-0.5 text-[11px] font-semibold text-[#FBBF24]"
+              >
+                <Calendar className="h-3 w-3 shrink-0" aria-hidden="true" />
+                <span>
+                  Requested Pickup: {ISO_WEEKDAY_LABELS[getIsoWeekday(requestedDate)]},{' '}
+                  {formatShortCalendarDate(requestedDate)}
+                </span>
+              </div>
+            )}
           </div>
           <button
             type="button"
@@ -538,37 +750,185 @@ export function OrderDetailDrawer({
                 {mergeCandidates.likely.length > 0 && !mergePanelOpen && (
                   <div
                     data-testid="possible-duplicate-banner"
-                    className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-[#38BDF8]/50 bg-[#0EA5E9]/10 px-3.5 py-2.5 text-xs"
+                    className="space-y-2.5 rounded-md border border-[#38BDF8]/50 bg-[#0EA5E9]/10 px-3.5 py-2.5 text-xs"
                   >
-                    <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <p className="font-semibold text-[#38BDF8]">
                         Possible Duplicate Order Found ({mergeCandidates.likely.length})
                       </p>
-                      <p className="mt-0.5 truncate text-[#C9D1D9]">
-                        {mergeCandidates.likely[0].customerName}
-                        {mergeCandidates.likely[0].odooQuotationName
-                          ? ` · ${mergeCandidates.likely[0].odooQuotationName}`
-                          : ''}
-                        {' · '}
-                        {mergeCandidates.likely[0].status.replace('_', ' ')}
-                        {mergeCandidates.likely[0].slottedDate
-                          ? ` (${formatShortCalendarDate(mergeCandidates.likely[0].slottedDate)})`
-                          : ' (Unslotted)'}
-                      </p>
+                      <span className="text-[11px] text-[#8B949E]">
+                        Click an order to inspect full details &amp; chatter
+                      </span>
                     </div>
-                    <button
-                      type="button"
-                      data-testid="open-merge-duplicate-btn"
-                      onClick={() => {
-                        setMergeSourceId(String(mergeCandidates.likely[0].id));
-                        setMergeStrategy('keep_target');
-                        setMergePanelOpen(true);
-                      }}
-                      className="inline-flex min-h-[34px] shrink-0 items-center gap-1.5 rounded-md bg-[#0EA5E9] px-3 py-1.5 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8]"
-                    >
-                      <GitMerge className="h-3.5 w-3.5" />
-                      Merge Duplicate
-                    </button>
+
+                    <div className="space-y-2">
+                      {(showAllDuplicates
+                        ? mergeCandidates.likely
+                        : mergeCandidates.likely.slice(0, 1)
+                      ).map((cand, idx) => {
+                        const isInspecting = inspectingDuplicateId === cand.id;
+                        return (
+                          <div
+                            key={cand.id}
+                            className="rounded-md border border-[#283340] bg-[#11171D] p-2.5"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <button
+                                type="button"
+                                data-testid={
+                                  idx === 0
+                                    ? 'inspect-duplicate-btn'
+                                    : `inspect-duplicate-btn-${cand.id}`
+                                }
+                                data-candidate-id={cand.id}
+                                onClick={() =>
+                                  setInspectingDuplicateId((prev) =>
+                                    prev === cand.id ? null : cand.id
+                                  )
+                                }
+                                className="group flex min-w-0 flex-1 items-center gap-2 text-left"
+                              >
+                                <Eye
+                                  className="h-3.5 w-3.5 shrink-0 text-[#38BDF8]"
+                                  aria-hidden="true"
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <div className="truncate font-semibold text-[#F0F6FC] group-hover:text-[#38BDF8] group-hover:underline">
+                                    {cand.customerName}
+                                    {cand.odooQuotationName ? ` · ${cand.odooQuotationName}` : ''}
+                                  </div>
+                                  <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-[#8B949E]">
+                                    <span className="capitalize">{cand.status.replace('_', ' ')}</span>
+                                    <span>·</span>
+                                    <span>
+                                      {cand.slottedDate
+                                        ? formatShortCalendarDate(cand.slottedDate)
+                                        : 'Unslotted'}
+                                    </span>
+                                    {cand.chatter.length > 0 && (
+                                      <>
+                                        <span>·</span>
+                                        <span className="text-[#38BDF8]">
+                                          {cand.chatter.length} chatter
+                                        </span>
+                                      </>
+                                    )}
+                                    <span>·</span>
+                                    <span className="text-[#38BDF8]">
+                                      {isInspecting ? 'Hide Details' : 'Inspect Details'}
+                                    </span>
+                                  </div>
+                                </div>
+                              </button>
+
+                              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                                {onDismissDuplicate && (
+                                  <button
+                                    type="button"
+                                    data-testid={
+                                      idx === 0
+                                        ? 'dismiss-duplicate-btn'
+                                        : `dismiss-duplicate-btn-${cand.id}`
+                                    }
+                                    disabled={dismissingDuplicateId === cand.id}
+                                    onClick={async () => {
+                                      setDismissingDuplicateId(cand.id);
+                                      setLocalDismissedIds((prev) =>
+                                        prev.includes(cand.id) ? prev : [...prev, cand.id]
+                                      );
+                                      if (inspectingDuplicateId === cand.id) {
+                                        setInspectingDuplicateId(null);
+                                      }
+                                      try {
+                                        await onDismissDuplicate(order.id, cand.id);
+                                      } finally {
+                                        setDismissingDuplicateId(null);
+                                      }
+                                    }}
+                                    className="inline-flex min-h-[32px] shrink-0 items-center rounded-md border border-[#283340] bg-[#161D24] px-2.5 py-1 text-xs font-medium text-[#C9D1D9] hover:border-[#8B949E] hover:text-[#F0F6FC] disabled:opacity-50"
+                                  >
+                                    Not a Duplicate
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  data-testid={
+                                    idx === 0
+                                      ? 'open-merge-duplicate-btn'
+                                      : `open-merge-duplicate-btn-${cand.id}`
+                                  }
+                                  onClick={() => {
+                                    setMergeSourceId(String(cand.id));
+                                    setMergeStrategy('keep_target');
+                                    setMergePanelOpen(true);
+                                    setInspectingDuplicateId(null);
+                                  }}
+                                  className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#0EA5E9] px-2.5 py-1 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8]"
+                                >
+                                  <GitMerge className="h-3.5 w-3.5" />
+                                  Merge Duplicate
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Expanded Full Duplicate Comparison Panel (including Chatter) */}
+                            {isInspecting && (
+                              <div
+                                data-testid="duplicate-comparison-card"
+                                className="mt-3 border-t border-[#283340] pt-3"
+                              >
+                                <div className="mb-2 flex items-center justify-between gap-2">
+                                  <span className="text-[11px] font-bold uppercase tracking-wide text-[#38BDF8]">
+                                    Full Potential Duplicate Details
+                                  </span>
+                                  <div className="flex items-center gap-2">
+                                    {onSelectOrder && (
+                                      <button
+                                        type="button"
+                                        data-testid="switch-to-duplicate-btn"
+                                        onClick={() => onSelectOrder(cand.id)}
+                                        className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
+                                      >
+                                        <ExternalLink className="h-3 w-3" />
+                                        Open Order
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => setInspectingDuplicateId(null)}
+                                      className="text-[11px] text-[#8B949E] hover:text-[#F0F6FC]"
+                                    >
+                                      Close
+                                    </button>
+                                  </div>
+                                </div>
+                                <DuplicateOrderDetailsBody
+                                  candidate={cand}
+                                  items={items}
+                                  channels={channels}
+                                  chatterTestId="duplicate-compare-chatter"
+                                />
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {mergeCandidates.likely.length > 1 && (
+                      <button
+                        type="button"
+                        data-testid="toggle-extra-duplicates-btn"
+                        onClick={() => setShowAllDuplicates((prev) => !prev)}
+                        className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
+                      >
+                        {showAllDuplicates
+                          ? 'Show top match only'
+                          : `Show ${mergeCandidates.likely.length - 1} more possible ${
+                              mergeCandidates.likely.length - 1 === 1 ? 'match' : 'matches'
+                            }`}
+                      </button>
+                    )}
                   </div>
                 )}
 
@@ -584,13 +944,41 @@ export function OrderDetailDrawer({
                           Merge Order / Quotation Into This One
                         </h3>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setMergePanelOpen(false)}
-                        className="text-xs text-[#8B949E] hover:text-[#F0F6FC]"
-                      >
-                        Cancel
-                      </button>
+                      <div className="flex items-center gap-3">
+                        {onDismissDuplicate &&
+                          selectedMergeSource &&
+                          mergeCandidates.likely.some((c) => c.id === selectedMergeSource.id) && (
+                            <button
+                              type="button"
+                              data-testid="panel-dismiss-duplicate-btn"
+                              disabled={dismissingDuplicateId === selectedMergeSource.id}
+                              onClick={async () => {
+                                const candId = selectedMergeSource.id;
+                                setDismissingDuplicateId(candId);
+                                setLocalDismissedIds((prev) =>
+                                  prev.includes(candId) ? prev : [...prev, candId]
+                                );
+                                setMergePanelOpen(false);
+                                setMergeSourceId('');
+                                try {
+                                  await onDismissDuplicate(order.id, candId);
+                                } finally {
+                                  setDismissingDuplicateId(null);
+                                }
+                              }}
+                              className="text-xs font-medium text-[#C9D1D9] hover:text-[#F0F6FC] hover:underline disabled:opacity-50"
+                            >
+                              Not a Duplicate
+                            </button>
+                          )}
+                        <button
+                          type="button"
+                          onClick={() => setMergePanelOpen(false)}
+                          className="text-xs text-[#8B949E] hover:text-[#F0F6FC]"
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     </div>
 
                     <p className="mt-1.5 text-xs text-[#8B949E]">
@@ -672,31 +1060,70 @@ export function OrderDetailDrawer({
                     {selectedMergeSource && (
                       <div className="mt-3 space-y-2.5">
                         <div className="rounded border border-[#283340] bg-[#0F1419] p-2.5 text-[11px] text-[#C9D1D9]">
-                          <div className="flex flex-wrap items-center justify-between gap-1">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
                             <span className="font-semibold text-[#F0F6FC]">
                               Absorbing: {selectedMergeSource.customerName}
                               {selectedMergeSource.odooQuotationName
                                 ? ` · ${selectedMergeSource.odooQuotationName}`
                                 : ''}
                             </span>
-                            <span className="capitalize text-[#8B949E]">
-                              {selectedMergeSource.status.replace('_', ' ')}
-                              {selectedMergeSource.slottedDate
-                                ? ` · ${formatShortCalendarDate(selectedMergeSource.slottedDate)}`
-                                : ' · Unslotted'}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              {onSelectOrder && (
+                                <button
+                                  type="button"
+                                  data-testid="merge-open-source-order-btn"
+                                  onClick={() => onSelectOrder(selectedMergeSource.id)}
+                                  className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
+                                >
+                                  <ExternalLink className="h-3 w-3" />
+                                  Open
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                data-testid="toggle-merge-source-details-btn"
+                                onClick={() => setShowMergeSourceDetails((prev) => !prev)}
+                                className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
+                              >
+                                {showMergeSourceDetails ? (
+                                  <>
+                                    <ChevronUp className="h-3.5 w-3.5" />
+                                    Hide Details
+                                  </>
+                                ) : (
+                                  <>
+                                    <ChevronDown className="h-3.5 w-3.5" />
+                                    Inspect Details &amp; Chatter ({selectedMergeSource.chatter.length})
+                                  </>
+                                )}
+                              </button>
+                            </div>
                           </div>
-                          <div className="mt-1 font-mono text-[#8B949E]">
-                            Items:{' '}
-                            {selectedMergeSource.items.length === 0
-                              ? 'None'
-                              : selectedMergeSource.items
-                                  .map((l) => {
-                                    const meta = items.find((i) => i.id === l.trackedItemId);
-                                    return `${formatQty(l.quantity)} ${meta ? `${meta.unitLabel} ${meta.name}` : `#${l.trackedItemId}`}`;
-                                  })
-                                  .join(', ')}
-                          </div>
+                          {showMergeSourceDetails ? (
+                            <div
+                              data-testid="merge-source-details"
+                              className="mt-2.5 border-t border-[#283340] pt-2.5"
+                            >
+                              <DuplicateOrderDetailsBody
+                                candidate={selectedMergeSource}
+                                items={items}
+                                channels={channels}
+                                chatterTestId="merge-source-chatter"
+                              />
+                            </div>
+                          ) : (
+                            <div className="mt-1 font-mono text-[#8B949E]">
+                              Items:{' '}
+                              {selectedMergeSource.items.length === 0
+                                ? 'None'
+                                : selectedMergeSource.items
+                                    .map((l) => {
+                                      const meta = items.find((i) => i.id === l.trackedItemId);
+                                      return `${formatQty(l.quantity)} ${meta ? `${meta.unitLabel} ${meta.name}` : `#${l.trackedItemId}`}`;
+                                    })
+                                    .join(', ')}
+                            </div>
+                          )}
                         </div>
 
                         {hasDifferentMergeDates &&
@@ -874,6 +1301,63 @@ export function OrderDetailDrawer({
                   <span className="font-mono text-xs tabular-nums text-[#38BDF8]">
                     Current: {formatShortCalendarDate(order.slottedDate)}
                   </span>
+                )}
+              </div>
+
+              {/* Customer Requested Pickup Date (Editable + 1-Tap Try Requested Date) */}
+              <div className="mt-3 rounded-md border border-[#D97706]/40 bg-[#D97706]/8 p-2.5">
+                <div className="flex items-end gap-2">
+                  <div className="flex-1">
+                    <label
+                      htmlFor="order-requested-date"
+                      className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-[#FBBF24]"
+                    >
+                      <Calendar className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      <span>Requested Pickup Date</span>
+                    </label>
+                    <input
+                      id="order-requested-date"
+                      data-testid="order-requested-date-input"
+                      type="date"
+                      value={requestedDate}
+                      onChange={(e) => setRequestedDate(e.target.value)}
+                      className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 font-mono text-xs text-[#F0F6FC] focus:border-[#FBBF24] focus:outline-none"
+                    />
+                  </div>
+                  {requestedDate && (
+                    <button
+                      type="button"
+                      data-testid="clear-requested-date-btn"
+                      onClick={() => setRequestedDate('')}
+                      className="min-h-[38px] shrink-0 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 text-xs font-medium text-[#8B949E] hover:text-[#F0F6FC]"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                {requestedDate && order.slottedDate !== requestedDate && (
+                  <button
+                    type="button"
+                    data-testid="slot-requested-date-btn"
+                    disabled={isLocked || slottingTarget !== null}
+                    onClick={() => void handleQuickSlot(requestedDate)}
+                    className={`mt-2 flex min-h-[38px] w-full items-center justify-between gap-2 rounded-md border px-3 py-1.5 text-left text-xs font-semibold transition-colors disabled:opacity-50 ${
+                      requestedDateCandidate?.fit === 'fits'
+                        ? 'border-[#22C55E]/60 bg-[#16A34A]/15 text-[#4ADE80] hover:bg-[#16A34A]/25'
+                        : 'border-[#D97706]/60 bg-[#D97706]/15 text-[#FBBF24] hover:bg-[#D97706]/25'
+                    }`}
+                  >
+                    <span className="truncate">
+                      {slottingTarget === requestedDate
+                        ? 'Scheduling...'
+                        : `Slot on Requested Date · ${ISO_WEEKDAY_LABELS[getIsoWeekday(requestedDate)]}, ${formatShortCalendarDate(requestedDate)}`}
+                    </span>
+                    {requestedDateCandidate && (
+                      <span className="shrink-0 font-mono text-[11px]">
+                        {fitStyle(requestedDateCandidate.fit).label}
+                      </span>
+                    )}
+                  </button>
                 )}
               </div>
 
@@ -1270,22 +1754,24 @@ export function OrderDetailDrawer({
           {/* Customer Info */}
           <div className="grid grid-cols-1 gap-4 border-t border-[#283340] pt-4 sm:grid-cols-2">
             <div className="sm:col-span-2">
-              <label
-                htmlFor="order-customer-name"
-                className="mb-1.5 flex items-center justify-between text-xs font-medium text-[#C9D1D9]"
-              >
-                <span>Customer Name</span>
-                {order.customerNameOverridden && (
-                  <span className="text-[11px] text-[#38BDF8]">Local override preserved on Odoo sync</span>
-                )}
-              </label>
-              <input
+              <CustomerAutocompleteInput
                 id="order-customer-name"
-                data-testid="order-customer-name-input"
-                type="text"
+                testId="order-customer-name-input"
+                label="Customer Name"
+                labelRight={
+                  order.customerNameOverridden ? (
+                    <span className="text-[11px] text-[#38BDF8]">
+                      Local override preserved on Odoo sync
+                    </span>
+                  ) : undefined
+                }
                 value={customerName}
-                onChange={(e) => setCustomerName(e.target.value)}
-                className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+                odooConfigured={odooConfigured}
+                onChange={setCustomerName}
+                onSelectCustomer={(cust) => {
+                  if (cust.email) setCustomerEmail(cust.email);
+                  if (cust.phone) setCustomerPhone(cust.phone);
+                }}
               />
             </div>
 

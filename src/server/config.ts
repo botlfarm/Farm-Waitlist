@@ -1,12 +1,19 @@
 import fs from 'fs';
 import path from 'path';
 import { DEFAULT_TIMEZONE } from '../shared/timezone';
-import type { OdooConnectionStatus } from '../shared/types';
+import type { AppSettings, GithubPublishStatus, OdooConnectionStatus } from '../shared/types';
+import { deriveGithubPagesPublicUrl } from './githubPublisher';
 
 export interface OdooCredentials {
   url: string;
   db: string;
   apiKey: string;
+  source: 'ha_options' | 'env' | 'none';
+}
+
+export interface GithubPublishCredentials {
+  token: string;
+  defaultRepo: string;
   source: 'ha_options' | 'env' | 'none';
 }
 
@@ -17,6 +24,7 @@ export interface RuntimeConfig {
   haOptionsPath: string;
   timezone: string;
   odoo: OdooCredentials;
+  githubPublish?: GithubPublishCredentials;
 }
 
 interface HaOptionsFile {
@@ -24,6 +32,8 @@ interface HaOptionsFile {
   odoo_base_url?: string;
   odoo_db?: string;
   odoo_api_key?: string;
+  github_publish_token?: string;
+  github_publish_repo?: string;
   timezone?: string;
 }
 
@@ -102,6 +112,28 @@ export function loadRuntimeConfig(overrides?: Partial<RuntimeConfig>): RuntimeCo
     };
   }
 
+  let githubPublish: GithubPublishCredentials = {
+    token: '',
+    defaultRepo: '',
+    source: 'none',
+  };
+
+  if (overrides?.githubPublish) {
+    githubPublish = overrides.githubPublish;
+  } else if (haOpts && (haOpts.github_publish_token || haOpts.github_publish_repo)) {
+    githubPublish = {
+      token: (haOpts.github_publish_token ?? '').trim(),
+      defaultRepo: (haOpts.github_publish_repo ?? '').trim(),
+      source: (haOpts.github_publish_token ?? '').trim() ? 'ha_options' : 'none',
+    };
+  } else if (process.env.GITHUB_PUBLISH_TOKEN || process.env.GITHUB_PUBLISH_REPO) {
+    githubPublish = {
+      token: (process.env.GITHUB_PUBLISH_TOKEN ?? '').trim(),
+      defaultRepo: (process.env.GITHUB_PUBLISH_REPO ?? '').trim(),
+      source: (process.env.GITHUB_PUBLISH_TOKEN ?? '').trim() ? 'env' : 'none',
+    };
+  }
+
   return {
     port,
     dbPath,
@@ -109,6 +141,7 @@ export function loadRuntimeConfig(overrides?: Partial<RuntimeConfig>): RuntimeCo
     haOptionsPath,
     timezone,
     odoo,
+    githubPublish,
   };
 }
 
@@ -127,5 +160,32 @@ export function getRedactedOdooStatus(config: RuntimeConfig): OdooConnectionStat
     source: configured ? config.odoo.source : 'none',
     urlHost,
     database: config.odoo.db || null,
+  };
+}
+
+export function getRedactedGithubPublishStatus(
+  config: RuntimeConfig,
+  settings: AppSettings
+): GithubPublishStatus {
+  const tokenConfigured = Boolean(config.githubPublish?.token);
+  const repo = (settings.githubPublishRepo ?? '').trim() || config.githubPublish?.defaultRepo || '';
+  const branch = (settings.githubPublishBranch ?? '').trim() || 'main';
+  const filePath = (settings.githubPublishPath ?? '').trim() || 'availability.json';
+  const customUrl = (settings.githubPublishPublicUrl ?? '').trim();
+  const publicUrl = deriveGithubPagesPublicUrl(repo, filePath, customUrl);
+
+  return {
+    tokenConfigured,
+    tokenSource: tokenConfigured ? (config.githubPublish?.source ?? 'none') : 'none',
+    repo,
+    branch,
+    filePath,
+    publicUrl,
+    mode: settings.githubPublishMode === 'auto' ? 'auto' : 'manual',
+    interval: settings.githubPublishInterval ?? '30m',
+    lastPublishedAt: settings.githubLastPublishedAt ?? null,
+    lastPublishStatus: settings.githubLastPublishStatus ?? 'never',
+    lastPublishError: settings.githubLastPublishError ?? null,
+    lastPublishedHash: settings.githubLastPublishedHash ?? null,
   };
 }

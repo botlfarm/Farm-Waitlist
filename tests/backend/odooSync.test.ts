@@ -8,6 +8,7 @@ import { DatabaseManager } from '../../src/server/db';
 import {
   callOdooJson2,
   stripHtmlToPlainText,
+  syncOdooCustomers,
   syncOdooQuotations,
   type FetchLike,
 } from '../../src/server/odooService';
@@ -1101,5 +1102,303 @@ describe('Odoo 19.3 /json/2/ Synchronization, Chatter Filtering & Reconciliation
           }),
       })
     ).rejects.toThrow(/Redirected to https:\/\/botlfarm\.odoo\.com\/web\/database\/selector/);
+  });
+
+  it('syncs active Odoo res.partner customers read-only (excluding mobile) and serves deduplicated autocomplete via /api/customers', async () => {
+    const mgr = createTempDb();
+    await mgr.init('America/New_York');
+    const now = new Date().toISOString();
+
+    // Seed a local manual order customer to test merging Odoo + local history
+    mgr.db
+      .prepare(
+        `INSERT INTO orders (
+           source, status, timing_type, customer_name, customer_name_overridden,
+           customer_email, customer_phone, created_at, updated_at
+         ) VALUES ('manual', 'waitlist', 'asap', 'Local Laura', 0, 'laura@local.test', '555-7777', ?, ?)`
+      )
+      .run(now, now);
+
+    const partnerCalls: Array<{ url: string; fields?: unknown }> = [];
+    const mockFetch: FetchLike = async (url, init) => {
+      const body = JSON.parse(String(init?.body || '{}')) as { fields?: unknown };
+      if (url.endsWith('/json/2/res.partner/search_read')) {
+        partnerCalls.push({ url, fields: body.fields });
+        return new Response(
+          JSON.stringify([
+            { id: 1001, name: 'Elena Vance', email: 'elena@farm.test', phone: '555-1001' },
+            { id: 1002, name: 'Eliot Green', email: false, phone: '555-1002' },
+            { id: 1003, name: '   ', email: 'blank@skip.test', phone: false },
+          ]),
+          { status: 200 }
+        );
+      }
+      return new Response('[]', { status: 200 });
+    };
+
+    const odooCreds = {
+      url: 'https://demo.odoo.example',
+      db: 'farm_db',
+      apiKey: 'secret-key',
+      source: 'env' as const,
+    };
+
+    const directSync = await syncOdooCustomers({
+      db: mgr.db,
+      odoo: odooCreds,
+      fetchFn: mockFetch,
+    });
+    expect(directSync).toEqual({ fetchedCount: 3, syncedCount: 2 });
+    expect(partnerCalls).toHaveLength(1);
+    expect(partnerCalls[0].fields).toEqual(['id', 'name', 'email', 'phone']);
+    expect(partnerCalls[0].fields).not.toContain('mobile');
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath: mgr.dbPath,
+        backupDir: mgr.backupDir,
+        timezone: 'America/New_York',
+        haOptionsPath: '/nonexistent/options.json',
+        odoo: odooCreds,
+      },
+      fetchFn: mockFetch,
+    });
+    const server = await new Promise<import('http').Server>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const port = (server.address() as import('net').AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      const syncRes = await fetch(`${baseUrl}/api/odoo/customers/sync`, { method: 'POST' });
+      expect(syncRes.status).toBe(200);
+      const syncBody = (await syncRes.json()) as { syncedCount: number; odooCustomersCount: number };
+      expect(syncBody.syncedCount).toBe(2);
+      expect(syncBody.odooCustomersCount).toBe(2);
+
+      // Search "el" -> returns both Elena Vance & Eliot Green from Odoo
+      const searchEl = await fetch(`${baseUrl}/api/customers?q=el`);
+      expect(searchEl.status).toBe(200);
+      const elBody = (await searchEl.json()) as {
+        customers: Array<{ name: string; email: string | null; phone: string | null; source: string }>;
+        odooCustomersCount: number;
+        odooConfigured: boolean;
+      };
+      expect(elBody.odooConfigured).toBe(true);
+      expect(elBody.odooCustomersCount).toBe(2);
+      expect(elBody.customers.map((c) => c.name)).toEqual(['Elena Vance', 'Eliot Green']);
+      expect(elBody.customers[0]).toMatchObject({
+        email: 'elena@farm.test',
+        phone: '555-1001',
+        source: 'odoo',
+      });
+      expect(elBody.customers[1]).toMatchObject({
+        email: null,
+        phone: '555-1002',
+        source: 'odoo',
+      });
+
+      // Empty query includes both Odoo contacts and Local Laura
+      const allRes = await fetch(`${baseUrl}/api/customers`);
+      const allBody = (await allRes.json()) as {
+        customers: Array<{ name: string; source: string }>;
+      };
+      expect(allBody.customers.map((c) => c.name)).toEqual([
+        'Elena Vance',
+        'Eliot Green',
+        'Local Laura',
+      ]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      mgr.close();
+    }
+  });
+
+  it('auto-discovers Odoo "Requested Pickup" quotation field read-only, parses free-text fallback, and supports manual requestedDate CRUD', async () => {
+    const mgr = createTempDb();
+    await mgr.init('America/New_York');
+    const now = new Date().toISOString();
+
+    const stdId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, keyword_rules_json, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 20, 4, 1, '["standard","eggs"]', 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+
+    const saleOrderFieldsRequested: string[][] = [];
+
+    const mockFetch: FetchLike = async (url, init) => {
+      const body = JSON.parse(String(init?.body || '{}')) as { fields?: string[] };
+
+      if (url.endsWith('/json/2/ir.model.fields/search_read')) {
+        return new Response(
+          JSON.stringify([
+            {
+              name: 'x_studio_requested_pickup',
+              field_description: 'Requested Pickup',
+              ttype: 'date',
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      if (url.endsWith('/json/2/sale.order/search_read')) {
+        if (Array.isArray(body.fields)) {
+          saleOrderFieldsRequested.push(body.fields);
+        }
+        return new Response(
+          JSON.stringify([
+            {
+              id: 2101,
+              name: 'S02101',
+              state: 'draft',
+              create_date: '2026-11-24 14:00:00',
+              date_order: '2026-11-24 14:00:00',
+              commitment_date: false,
+              x_studio_requested_pickup: '2026-11-28',
+              partner_id: [1201, 'Clara Woods'],
+              note: false,
+              order_line: [3101],
+            },
+            {
+              id: 2102,
+              name: 'S02102',
+              state: 'draft',
+              create_date: '2026-11-24 15:00:00',
+              date_order: '2026-11-24 15:00:00',
+              commitment_date: false,
+              x_studio_requested_pickup: false,
+              partner_id: [1202, 'Devon Brooks'],
+              note: '<p>Requested Pickup: 11/30/2026</p>',
+              order_line: [3102],
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      if (url.endsWith('/json/2/sale.order.line/search_read')) {
+        return new Response(
+          JSON.stringify([
+            { id: 3101, order_id: [2101, 'S02101'], name: 'Standard Eggs', product_uom_qty: 2 },
+            { id: 3102, order_id: [2102, 'S02102'], name: 'Standard Eggs', product_uom_qty: 3 },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      if (url.endsWith('/json/2/res.partner/search_read')) {
+        return new Response(
+          JSON.stringify([
+            { id: 1201, name: 'Clara Woods', email: 'clara@farm.test', phone: '555-3101' },
+            { id: 1202, name: 'Devon Brooks', email: 'devon@farm.test', phone: '555-3102' },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      return new Response('[]', { status: 200 });
+    };
+
+    const odooCreds = {
+      url: 'https://demo.odoo.example',
+      db: 'farm_db',
+      apiKey: 'secret-key',
+      source: 'env' as const,
+    };
+
+    await syncOdooQuotations({
+      db: mgr.db,
+      odoo: odooCreds,
+      settings: mgr.getSettings(),
+      trackedItems: listTrackedItems(mgr.db),
+      channels: listPickupChannels(mgr.db),
+      fetchFn: mockFetch,
+    });
+
+    // Discovered custom Odoo field must have been requested on sale.order/search_read
+    expect(saleOrderFieldsRequested[0]).toContain('x_studio_requested_pickup');
+
+    const orders = listAllOrders(mgr.db);
+    const clara = orders.find((o) => o.odooQuotationId === 2101)!;
+    const devon = orders.find((o) => o.odooQuotationId === 2102)!;
+
+    // Draft quotations stay on the Waitlist (unslotted) while preserving customer Requested Pickup Date!
+    expect(clara.status).toBe('waitlist');
+    expect(clara.slottedDate).toBeNull();
+    expect(clara.requestedDate).toBe('2026-11-28');
+
+    expect(devon.status).toBe('waitlist');
+    expect(devon.slottedDate).toBeNull();
+    expect(devon.requestedDate).toBe('2026-11-30');
+
+    // Verify manual POST /api/orders (Waitlist with requestedDate) and PUT /api/orders/:id update/clear
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath: mgr.dbPath,
+        backupDir: mgr.backupDir,
+        timezone: 'America/New_York',
+        haOptionsPath: '/nonexistent/options.json',
+        odoo: odooCreds,
+      },
+      fetchFn: mockFetch,
+    });
+    const server = await new Promise<import('http').Server>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const port = (server.address() as import('net').AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      const createRes = await fetch(`${baseUrl}/api/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customerName: 'Waitlist With Target',
+          timingType: 'asap',
+          requestedDate: '2026-12-03',
+          items: [{ trackedItemId: stdId, quantity: 2 }],
+        }),
+      });
+      expect(createRes.status).toBe(201);
+      const created = (await createRes.json()) as {
+        id: number;
+        status: string;
+        slottedDate: string | null;
+        requestedDate: string | null;
+      };
+      expect(created.status).toBe('waitlist');
+      expect(created.slottedDate).toBeNull();
+      expect(created.requestedDate).toBe('2026-12-03');
+
+      const updateRes = await fetch(`${baseUrl}/api/orders/${created.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestedDate: '2026-12-05' }),
+      });
+      expect(updateRes.status).toBe(200);
+      const updated = (await updateRes.json()) as { requestedDate: string | null };
+      expect(updated.requestedDate).toBe('2026-12-05');
+
+      const clearRes = await fetch(`${baseUrl}/api/orders/${created.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestedDate: null }),
+      });
+      expect(clearRes.status).toBe(200);
+      const cleared = (await clearRes.json()) as { requestedDate: string | null };
+      expect(cleared.requestedDate).toBeNull();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      mgr.close();
+    }
   });
 });

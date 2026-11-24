@@ -8,6 +8,23 @@ export type SyncInterval = '15m' | '30m' | '1h' | '6h' | 'manual';
 export type BackupTrigger = 'manual' | 'scheduled' | 'pre-migrate' | 'pre-restore';
 export type OrderMergeItemStrategy = 'keep_target' | 'use_source' | 'combine';
 export type TemplateFormat = 'html' | 'plain';
+export type SnippetCutoffMode = 'days_before' | 'weekly_day';
+export type GithubPublishMode = 'manual' | 'auto';
+export type GithubPublishInterval = '15m' | '30m' | '1h' | '6h';
+
+export interface SnippetCutoffRule {
+  id: string;
+  enabled: boolean;
+  mode: SnippetCutoffMode;
+  /** Used when mode === 'days_before': 0 = same day, 1 = day before, 2 = 2 days before, etc. */
+  daysBefore: number;
+  /** Used when mode === 'weekly_day': ISO weekday 1 (Mon) .. 7 (Sun) when ordering closes. */
+  cutoffWeekday: number;
+  /** 24-hour local farm time "HH:MM" (e.g., "16:00"). */
+  cutoffTime: string;
+  /** ISO weekdays 1..7 of pickup dates this rule applies to. Empty = every pickup day. */
+  pickupWeekdays: number[];
+}
 
 export interface PreApprovalTemplate {
   id: string;
@@ -37,10 +54,25 @@ export interface AppSettings {
   backupScheduleEnabled: boolean;
   backupRetentionDays: number;
   publicSnippetWeeks: number;
+  publicSnippetEnabled?: boolean;
+  publicSnippetPausedPreset?: string;
+  publicSnippetPausedMessage?: string;
+  publicSnippetShowSameDay?: boolean;
+  publicSnippetCutoffRules?: SnippetCutoffRule[];
   publicSnippetHeaderTitle?: string;
   publicSnippetHeaderText?: string;
   publicSnippetFooterText?: string;
   publicSnippetAutoAdvanceToday?: boolean;
+  githubPublishMode?: GithubPublishMode;
+  githubPublishInterval?: GithubPublishInterval;
+  githubPublishRepo?: string;
+  githubPublishBranch?: string;
+  githubPublishPath?: string;
+  githubPublishPublicUrl?: string;
+  githubLastPublishedAt?: string | null;
+  githubLastPublishedHash?: string | null;
+  githubLastPublishStatus?: 'never' | 'success' | 'error';
+  githubLastPublishError?: string | null;
 }
 
 export interface TrackedItem {
@@ -74,6 +106,7 @@ export interface DailySupplyEntry {
   date: string; // YYYY-MM-DD
   actualOnHand: number | null;
   estProduced: number | null;
+  actualEndOfDay?: number | null;
   isCascadeAnchor: boolean;
   bufferOverride: number | null;
   extraBuffer?: number; // Additional single-day safety buffer / walk-up event holdback added on top of base buffer
@@ -136,6 +169,8 @@ export interface OrderRecord {
   odooMissingFlagged: boolean;
   odooSuggestedConfirmed: SuggestedConfirmedOrder | null;
   mergedOdooNames?: string[];
+  dismissedDuplicateOrderIds?: number[];
+  waitlistSortOrder?: number | null;
   items: OrderItemLine[];
   chatter: OrderChatterMessage[];
   createdAt: string;
@@ -173,11 +208,15 @@ export interface StandingOrderException {
 export interface DailyItemProjection {
   trackedItemId: number;
   date: string;
+  expectedStartingBalance?: number;
   startingBalance: number;
+  expectedProduced?: number;
   estProduced: number;
   actualOnHand: number | null;
+  actualEndOfDay?: number | null;
   slottedQty: number;
   endingBalance: number;
+  expectedNextDayStarting?: number;
   nextDayStarting: number;
   effectiveBuffer: number;
   extraBuffer: number;
@@ -220,6 +259,21 @@ export interface OdooConnectionStatus {
   database: string | null;
 }
 
+export interface GithubPublishStatus {
+  tokenConfigured: boolean;
+  tokenSource: 'ha_options' | 'env' | 'none';
+  repo: string;
+  branch: string;
+  filePath: string;
+  publicUrl: string | null;
+  mode: GithubPublishMode;
+  interval: GithubPublishInterval;
+  lastPublishedAt: string | null;
+  lastPublishStatus: 'never' | 'success' | 'error';
+  lastPublishError: string | null;
+  lastPublishedHash: string | null;
+}
+
 export interface CheckpointSummary {
   id: number;
   label: string;
@@ -234,6 +288,15 @@ export interface BackupInfo {
   createdAt: string;
 }
 
+export interface CustomerSuggestion {
+  key: string;
+  name: string;
+  email: string | null;
+  phone: string | null;
+  odooPartnerId: number | null;
+  source: 'odoo' | 'local';
+}
+
 export interface WorkspacePayload {
   today: string;
   startDate: string;
@@ -241,6 +304,8 @@ export interface WorkspacePayload {
   weeks: number;
   settings: AppSettings;
   odooStatus: OdooConnectionStatus;
+  odooCustomersCount?: number;
+  githubPublishStatus?: GithubPublishStatus;
   lastSync: SyncLog | null;
   items: TrackedItem[];
   channels: PickupChannel[];
@@ -272,12 +337,35 @@ export interface PublicAvailabilityCalendarDay extends PublicAvailabilityDay {
   isoWeekday: number;
   isPast: boolean;
   isToday: boolean;
+  isOrderingClosed?: boolean;
+}
+
+export interface PublicAvailabilityJsonPayload {
+  version: 1;
+  generatedAtIso: string;
+  generatedAtDisplay: string;
+  timezone: string;
+  weeks: number;
+  paused: boolean;
+  pausedMessage: string;
+  headerTitle: string;
+  headerText: string;
+  footerText: string;
+  showSameDay: boolean;
+  cutoffRules: SnippetCutoffRule[];
+  autoAdvanceToday: boolean;
+  singleItemName: string | null;
+  calendarDays: PublicAvailabilityCalendarDay[];
 }
 
 export interface PublicAvailabilityResult {
   generatedAtDisplay: string;
   timezone: string;
   weeks: number;
+  paused?: boolean;
+  pausedMessage?: string;
+  showSameDay?: boolean;
+  cutoffRules?: SnippetCutoffRule[];
   headerTitle?: string;
   headerText?: string;
   footerText?: string;
@@ -285,4 +373,6 @@ export interface PublicAvailabilityResult {
   days: PublicAvailabilityDay[];
   calendarDays: PublicAvailabilityCalendarDay[];
   html: string;
+  liveEmbedHtml?: string | null;
+  githubPublishStatus?: GithubPublishStatus;
 }

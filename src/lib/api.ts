@@ -7,6 +7,8 @@ import type {
   AppSettings,
   BackupInfo,
   CheckpointSummary,
+  CustomerSuggestion,
+  GithubPublishStatus,
   OdooConnectionStatus,
   OrderItemLine,
   OrderMergeItemStrategy,
@@ -114,13 +116,19 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
 
 /**
  * Copies a message with clickable HTML links (text/html + text/plain) for email composers,
- * with a safe DOM-node execCommand fallback for non-HTTPS local Home Assistant Ingress iframes.
+ * guaranteeing clean, email-safe HTML (no inherited dark-mode background or light text colors)
+ * across both the Async Clipboard API and the legacy execCommand('copy') fallback used in
+ * non-HTTPS local Home Assistant Ingress iframes.
  */
 export async function copyRichMessageToClipboard(rawMessage: string): Promise<boolean> {
   const html = renderMessageToSafeHtml(rawMessage);
   const plainText = renderMessageToPlainText(rawMessage);
   const segments = parseSafeRichMessageSegments(rawMessage);
   const hasLinks = segments.some((s) => s.type === 'link');
+
+  if (!hasLinks) {
+    return copyTextToClipboard(plainText);
+  }
 
   if (
     typeof navigator !== 'undefined' &&
@@ -135,17 +143,25 @@ export async function copyRichMessageToClipboard(rawMessage: string): Promise<bo
       await navigator.clipboard.write([item]);
       return true;
     } catch {
-      // Fall through to safe DOM copy
+      // Fall through to safe copy-event / DOM copy
     }
   }
 
-  if (hasLinks && typeof document !== 'undefined' && typeof window !== 'undefined') {
+  if (typeof document !== 'undefined' && typeof window !== 'undefined') {
     const container = document.createElement('div');
     container.setAttribute('contenteditable', 'true');
+    // Explicitly isolate from the app's dark theme so browsers never serialize
+    // white-text-on-black-background inline styles into email composers.
+    container.style.all = 'initial';
     container.style.position = 'fixed';
     container.style.top = '-9999px';
     container.style.left = '-9999px';
     container.style.whiteSpace = 'pre-wrap';
+    container.style.background = 'transparent';
+    container.style.backgroundColor = 'transparent';
+    container.style.color = '#000000';
+    container.style.fontFamily = 'Arial, Helvetica, sans-serif';
+    container.style.fontSize = '14px';
 
     for (const seg of segments) {
       if (seg.type === 'newline') {
@@ -154,12 +170,26 @@ export async function copyRichMessageToClipboard(rawMessage: string): Promise<bo
         const anchor = document.createElement('a');
         anchor.href = seg.href;
         anchor.textContent = seg.label;
+        anchor.style.color = '#1155cc';
+        anchor.style.backgroundColor = 'transparent';
         container.appendChild(anchor);
       } else {
         container.appendChild(document.createTextNode(seg.text));
       }
     }
 
+    // Intercept the browser's copy event to write strictly clean, unstyled email-safe HTML
+    // directly into clipboardData (bypassing Chromium/Safari computed-style serialization).
+    let intercepted = false;
+    const handleCopy = (event: ClipboardEvent) => {
+      if (!event.clipboardData) return;
+      event.preventDefault();
+      event.clipboardData.setData('text/html', html);
+      event.clipboardData.setData('text/plain', plainText);
+      intercepted = true;
+    };
+
+    document.addEventListener('copy', handleCopy, true);
     document.body.appendChild(container);
     const selection = window.getSelection();
     const range = document.createRange();
@@ -169,10 +199,11 @@ export async function copyRichMessageToClipboard(rawMessage: string): Promise<bo
       selection?.addRange(range);
       const ok = document.execCommand('copy');
       selection?.removeAllRanges();
-      if (ok) return true;
+      if (ok || intercepted) return true;
     } catch {
       // Fall through to plain text copy
     } finally {
+      document.removeEventListener('copy', handleCopy, true);
       document.body.removeChild(container);
     }
   }
@@ -237,6 +268,7 @@ export const api = {
     body: {
       actualOnHand: number | null;
       estProduced: number | null;
+      actualEndOfDay?: number | null;
       cascadeForward: boolean;
       bufferOverride: number | null;
       extraBuffer?: number;
@@ -275,6 +307,7 @@ export const api = {
       customerPhone: string | null;
       pickupChannelId: number | null;
       status: OrderRecord['status'];
+      requestedDate: string | null;
       slottedDate: string | null;
       isLocked: boolean;
       notes: string | null;
@@ -340,6 +373,21 @@ export const api = {
       }
     ),
 
+  dismissDuplicateOrder: (orderId: number, otherOrderId: number) =>
+    requestJson<{ ok: boolean; orderIdA: number; orderIdB: number }>(
+      `./api/orders/${orderId}/dismiss-duplicate`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ otherOrderId }),
+      }
+    ),
+
+  reorderWaitlistOrders: (payload: { orderIds: number[] } | { reset: true }) =>
+    requestJson<{ ok: boolean }>('./api/orders/waitlist-order', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+
   autoSlotAsap: (weeks = 6) =>
     requestJson<{
       slottedCount: number;
@@ -384,7 +432,11 @@ export const api = {
 
   // Settings & Odoo
   updateSettings: (patch: Partial<AppSettings>) =>
-    requestJson<{ settings: AppSettings; odooStatus: OdooConnectionStatus }>('./api/settings', {
+    requestJson<{
+      settings: AppSettings;
+      odooStatus: OdooConnectionStatus;
+      githubPublishStatus?: GithubPublishStatus;
+    }>('./api/settings', {
       method: 'PUT',
       body: JSON.stringify(patch),
     }),
@@ -395,9 +447,64 @@ export const api = {
   syncOdoo: () =>
     requestJson<{ syncLog: SyncLog }>('./api/odoo/sync', { method: 'POST' }),
 
-  // Public Availability Snippet
-  getSnippet: (weeks = 3) =>
-    requestJson<PublicAvailabilityResult>(`./api/snippet?weeks=${weeks}`),
+  listCustomers: (query = '', limit = 50) => {
+    const params = new URLSearchParams();
+    if (query.trim()) params.set('q', query.trim());
+    params.set('limit', String(limit));
+    return requestJson<{
+      customers: CustomerSuggestion[];
+      odooCustomersCount: number;
+      odooConfigured: boolean;
+    }>(`./api/customers?${params.toString()}`);
+  },
+
+  syncOdooCustomers: () =>
+    requestJson<{
+      fetchedCount: number;
+      syncedCount: number;
+      odooCustomersCount: number;
+    }>('./api/odoo/customers/sync', { method: 'POST' }),
+
+  // Public Availability Snippet & GitHub Pages Live Sync
+  getSnippet: (weeks?: number) =>
+    requestJson<PublicAvailabilityResult>(
+      weeks !== undefined ? `./api/snippet?weeks=${weeks}` : './api/snippet'
+    ),
+
+  testGithubPublish: (payload?: {
+    repo?: string;
+    branch?: string;
+    filePath?: string;
+    publicUrl?: string;
+  }) =>
+    requestJson<{ ok: boolean; message: string; publicUrl: string | null }>(
+      './api/snippet/github/test',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload ?? {}),
+      }
+    ),
+
+  publishSnippetToGithub: (payload?: {
+    force?: boolean;
+    repo?: string;
+    branch?: string;
+    filePath?: string;
+    publicUrl?: string;
+  }) =>
+    requestJson<{
+      published: boolean;
+      skipped: boolean;
+      reason?: string;
+      hash: string;
+      publicUrl: string;
+      publishedAt: string;
+      commitSha?: string;
+      githubPublishStatus: GithubPublishStatus;
+    }>('./api/snippet/github/publish', {
+      method: 'POST',
+      body: JSON.stringify(payload ?? { force: true }),
+    }),
 
   // Checkpoints & Undo
   createCheckpoint: (label?: string) =>

@@ -39,6 +39,13 @@ interface OdooSaleOrder {
   note?: string | false | null;
   order_line?: number[];
   amount_total?: number;
+  [key: string]: unknown;
+}
+
+interface OdooFieldMeta {
+  name: string;
+  field_description?: string | false | null;
+  ttype?: string | false | null;
 }
 
 const BASE_SALE_ORDER_FIELDS = [
@@ -51,8 +58,6 @@ const BASE_SALE_ORDER_FIELDS = [
   'note',
   'order_line',
 ] as const;
-
-const EXTENDED_SALE_ORDER_FIELDS = [...BASE_SALE_ORDER_FIELDS, 'commitment_date'] as const;
 
 const SYNCABLE_ODOO_STATES = ['draft', 'sent', 'sale', 'done'] as const;
 
@@ -247,6 +252,120 @@ export async function callOdooJson2<T>(params: {
   return parsedBody as T;
 }
 
+const MONTH_NAME_MAP: Record<string, number> = {
+  jan: 1,
+  january: 1,
+  feb: 2,
+  february: 2,
+  mar: 3,
+  march: 3,
+  apr: 4,
+  april: 4,
+  may: 5,
+  jun: 6,
+  june: 6,
+  jul: 7,
+  july: 7,
+  aug: 8,
+  august: 8,
+  sep: 9,
+  sept: 9,
+  september: 9,
+  oct: 10,
+  october: 10,
+  nov: 11,
+  november: 11,
+  dec: 12,
+  december: 12,
+};
+
+function toValidYmd(year: number, month: number, day: number): string | null {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
+  if (year < 2000 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() + 1 !== month ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+/**
+ * Normalizes an Odoo "Requested Pickup" field or free-text date value into YYYY-MM-DD.
+ * Supports Odoo date ("YYYY-MM-DD"), Odoo UTC datetime ("YYYY-MM-DD HH:MM:SS"),
+ * US slash dates ("11/28/2026" or "11/28/26"), and month-name dates ("Nov 28, 2026" or "Nov 28").
+ */
+export function parseRequestedPickupDateValue(
+  raw: unknown,
+  timezone: string = DEFAULT_TIMEZONE,
+  referenceDateYmd?: string
+): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // 1. Exact Odoo date field: YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const [y, m, d] = trimmed.split('-').map(Number);
+    return toValidYmd(y, m, d);
+  }
+
+  // 2. Odoo UTC datetime or ISO timestamp: YYYY-MM-DD[ T]HH:MM(:SS)?
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(trimmed)) {
+    const localKey = odooUtcToLocalDateKey(trimmed, timezone);
+    return /^\d{4}-\d{2}-\d{2}$/.test(localKey) ? localKey : null;
+  }
+
+  // 3. Embedded YYYY-MM-DD inside free text
+  const embeddedIso = /\b(20\d{2})-(\d{2})-(\d{2})\b/.exec(trimmed);
+  if (embeddedIso) {
+    return toValidYmd(Number(embeddedIso[1]), Number(embeddedIso[2]), Number(embeddedIso[3]));
+  }
+
+  // 4. US numeric date: MM/DD/YYYY or MM/DD/YY (or with hyphens)
+  const usMatch = /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/.exec(trimmed);
+  if (usMatch) {
+    const month = Number(usMatch[1]);
+    const day = Number(usMatch[2]);
+    let year = Number(usMatch[3]);
+    if (year < 100) year += 2000;
+    return toValidYmd(year, month, day);
+  }
+
+  // 5. Month name + day (+ optional year): e.g. "Saturday, Nov 28, 2026" or "November 28th"
+  const monthMatch =
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:\s*,?\s*(20\d{2}))?\b/i.exec(
+      trimmed
+    );
+  if (monthMatch) {
+    const month = MONTH_NAME_MAP[monthMatch[1].toLowerCase()];
+    const day = Number(monthMatch[2]);
+    let year = monthMatch[3] ? Number(monthMatch[3]) : null;
+    if (!year) {
+      const refYear =
+        referenceDateYmd && /^\d{4}-\d{2}-\d{2}$/.test(referenceDateYmd)
+          ? Number(referenceDateYmd.slice(0, 4))
+          : new Date().getUTCFullYear();
+      year = refYear;
+      const candidate = toValidYmd(year, month, day);
+      if (candidate && referenceDateYmd && /^\d{4}-\d{2}-\d{2}$/.test(referenceDateYmd)) {
+        // If month/day without a year falls more than 60 days before reference date, assume next year
+        const candMs = Date.parse(`${candidate}T00:00:00Z`);
+        const refMs = Date.parse(`${referenceDateYmd}T00:00:00Z`);
+        if (Number.isFinite(candMs) && Number.isFinite(refMs) && refMs - candMs > 60 * 86_400_000) {
+          year += 1;
+        }
+      }
+    }
+    return toValidYmd(year, month, day);
+  }
+
+  return null;
+}
+
 export interface ParsedOrderSignals {
   matchedItems: OrderItemLine[];
   timingType: OrderTimingType;
@@ -271,8 +390,11 @@ export function parseOdooOrderSignals(params: {
   chatterTexts: string[];
   trackedItems: TrackedItem[];
   channels: PickupChannel[];
+  timezone?: string;
+  referenceDateYmd?: string;
 }): ParsedOrderSignals {
-  const { noteText, lines, chatterTexts, trackedItems, channels } = params;
+  const { noteText, lines, chatterTexts, trackedItems, channels, timezone, referenceDateYmd } =
+    params;
   const lineDescriptions = lines.map((l) => `${l.product_uom_qty} ${l.name}`.trim());
   const combinedText = [noteText, ...lineDescriptions, ...chatterTexts].filter(Boolean).join('\n');
   const combinedLower = combinedText.toLowerCase();
@@ -328,16 +450,35 @@ export function parseOdooOrderSignals(params: {
   const pickupLineMatch = /(?:pickup|location|market|channel)\s*[:\-]\s*([^\n]+)/i.exec(combinedText);
   const freeTextPickup = pickupLineMatch ? pickupLineMatch[1].trim().slice(0, 120) : null;
 
-  // 4. Timing extraction (YYYY-MM-DD explicit date vs ASAP)
+  // 4. Timing / Requested Pickup extraction (labeled "Requested Pickup" first, then YYYY-MM-DD vs ASAP)
   let timingType: OrderTimingType = 'asap';
   let requestedDate: string | null = null;
-  const isoDateMatch = /\b(20\d{2}-\d{2}-\d{2})\b/.exec(combinedText);
-  if (isoDateMatch && !/\basap\b/i.test(combinedText)) {
-    timingType = 'specific_date';
-    requestedDate = isoDateMatch[1];
-  } else if (isoDateMatch && /(?:for|on|date|pickup)\s*[:\-]?\s*20\d{2}-\d{2}-\d{2}/i.test(combinedText)) {
-    timingType = 'specific_date';
-    requestedDate = isoDateMatch[1];
+  const labeledPickupRe =
+    /(?:requested\s+pickup(?:\s+date)?|pickup\s+date)\s*[:\-]\s*([^\n<]{4,60})/i;
+  const labeledPickupMatch = labeledPickupRe.exec(combinedText);
+  if (labeledPickupMatch) {
+    const parsedLabeled = parseRequestedPickupDateValue(
+      labeledPickupMatch[1],
+      timezone ?? DEFAULT_TIMEZONE,
+      referenceDateYmd
+    );
+    if (parsedLabeled) {
+      timingType = 'specific_date';
+      requestedDate = parsedLabeled;
+    }
+  }
+  if (!requestedDate) {
+    const isoDateMatch = /\b(20\d{2}-\d{2}-\d{2})\b/.exec(combinedText);
+    if (isoDateMatch && !/\basap\b/i.test(combinedText)) {
+      timingType = 'specific_date';
+      requestedDate = isoDateMatch[1];
+    } else if (
+      isoDateMatch &&
+      /(?:for|on|date|pickup)\s*[:\-]?\s*20\d{2}-\d{2}-\d{2}/i.test(combinedText)
+    ) {
+      timingType = 'specific_date';
+      requestedDate = isoDateMatch[1];
+    }
   }
 
   // 5. Fallback customer name from form text if partner_id missing
@@ -433,7 +574,65 @@ export async function syncOdooQuotations(params: {
     .run(startedAt);
   const logId = Number(logInsert.lastInsertRowid);
 
+  // Read-only auto-discovery of any custom/Studio sale.order field labeled "Requested Pickup"
+  let requestedPickupFieldNames: string[] = [];
+  let fieldDiscoveryFailed = false;
+  try {
+    const fieldRows = await callOdooJson2<OdooFieldMeta[]>({
+      odoo,
+      model: 'ir.model.fields',
+      method: 'search_read',
+      payload: {
+        domain: [
+          ['model', '=', 'sale.order'],
+          '|',
+          '|',
+          '|',
+          ['field_description', 'ilike', 'Requested Pickup'],
+          ['name', 'ilike', 'requested_pickup'],
+          ['name', '=', 'x_studio_requested_pickup'],
+          ['name', '=', 'x_requested_pickup'],
+        ],
+        fields: ['name', 'field_description', 'ttype'],
+        limit: 10,
+        context: { lang: 'en_US' },
+      },
+      fetchFn,
+    });
+    if (Array.isArray(fieldRows) && fieldRows.length > 0) {
+      const allowedTypes = new Set(['date', 'datetime', 'char', 'text']);
+      const scored = fieldRows
+        .filter(
+          (f) =>
+            typeof f?.name === 'string' &&
+            f.name.trim().length > 0 &&
+            (!f.ttype || allowedTypes.has(String(f.ttype)))
+        )
+        .map((f) => {
+          const label = typeof f.field_description === 'string' ? f.field_description.trim().toLowerCase() : '';
+          const tech = f.name.trim().toLowerCase();
+          let score = 0;
+          if (label === 'requested pickup') score += 100;
+          else if (label.startsWith('requested pickup')) score += 80;
+          else if (label.includes('requested pickup')) score += 60;
+          if (tech === 'x_studio_requested_pickup' || tech === 'x_requested_pickup') score += 50;
+          else if (tech.includes('requested_pickup')) score += 30;
+          if (f.ttype === 'date' || f.ttype === 'datetime') score += 15;
+          return { name: f.name.trim(), score };
+        })
+        .sort((a, b) => b.score - a.score);
+      requestedPickupFieldNames = Array.from(new Set(scored.map((s) => s.name)));
+    }
+  } catch {
+    // Non-fatal: some restricted Odoo API keys cannot read ir.model.fields.
+    // In that case, we can safely probe standard Studio technical name with automatic invalid-field fallback.
+    fieldDiscoveryFailed = true;
+    requestedPickupFieldNames = ['x_studio_requested_pickup'];
+  }
+
   let supportsCommitmentDate = true;
+  let activeRequestedPickupFields = [...requestedPickupFieldNames];
+
   const searchReadSaleOrders = async (
     domain: unknown[],
     options: { order?: string; limit: number }
@@ -453,19 +652,48 @@ export async function syncOdooQuotations(params: {
         fetchFn,
       });
 
-    if (!supportsCommitmentDate) {
-      return queryWithFields(BASE_SALE_ORDER_FIELDS);
-    }
-    try {
-      return await queryWithFields(EXTENDED_SALE_ORDER_FIELDS);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '';
-      if (/commitment_date|invalid field/i.test(msg)) {
-        supportsCommitmentDate = false;
-        return queryWithFields(BASE_SALE_ORDER_FIELDS);
+    const buildFields = () => {
+      const set = new Set<string>(BASE_SALE_ORDER_FIELDS);
+      if (supportsCommitmentDate) set.add('commitment_date');
+      for (const f of activeRequestedPickupFields) set.add(f);
+      return Array.from(set);
+    };
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const currentFields = buildFields();
+      try {
+        return await queryWithFields(currentFields);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (!/invalid field|commitment_date|x_studio_requested_pickup|x_requested_pickup/i.test(msg)) {
+          throw err;
+        }
+        let changed = false;
+        if (supportsCommitmentDate && /commitment_date/i.test(msg)) {
+          supportsCommitmentDate = false;
+          changed = true;
+        }
+        const remainingCustom = activeRequestedPickupFields.filter((f) => !msg.includes(f));
+        if (remainingCustom.length !== activeRequestedPickupFields.length) {
+          activeRequestedPickupFields = remainingCustom;
+          changed = true;
+        }
+        if (!changed) {
+          // Generic "Invalid field" message: drop custom probe fields first, then commitment_date
+          if (activeRequestedPickupFields.length > 0 && (fieldDiscoveryFailed || attempt === 0)) {
+            activeRequestedPickupFields = [];
+            changed = true;
+          } else if (supportsCommitmentDate) {
+            supportsCommitmentDate = false;
+            changed = true;
+          }
+        }
+        if (!changed) {
+          throw err;
+        }
       }
-      throw err;
     }
+    return queryWithFields(BASE_SALE_ORDER_FIELDS);
   };
 
   try {
@@ -672,10 +900,20 @@ export async function syncOdooQuotations(params: {
         const chatterTexts = qMsgs.map((m) => stripHtmlToPlainText(m.body)).filter(Boolean);
         const rawLineStrings = qLines.map((l) => `${l.product_uom_qty} × ${l.name}`);
         const createdAtLocal = odooUtcToLocalTimestamp(q.create_date, timezone);
+        const createdDateLocal = createdAtLocal.slice(0, 10);
         const commitmentDateLocal =
           typeof q.commitment_date === 'string' && q.commitment_date.trim()
             ? odooUtcToLocalDateKey(q.commitment_date, timezone)
             : null;
+
+        let requestedPickupFieldDate: string | null = null;
+        for (const fieldName of activeRequestedPickupFields) {
+          const parsed = parseRequestedPickupDateValue(q[fieldName], timezone, createdDateLocal);
+          if (parsed) {
+            requestedPickupFieldDate = parsed;
+            break;
+          }
+        }
 
         const signals = parseOdooOrderSignals({
           noteText,
@@ -683,9 +921,12 @@ export async function syncOdooQuotations(params: {
           chatterTexts,
           trackedItems,
           channels,
+          timezone,
+          referenceDateYmd: createdDateLocal,
         });
 
-        const explicitPickupDate = signals.requestedDate || commitmentDateLocal || null;
+        const explicitPickupDate =
+          requestedPickupFieldDate || signals.requestedDate || commitmentDateLocal || null;
         const resolvedTimingType: OrderTimingType = explicitPickupDate
           ? 'specific_date'
           : signals.timingType;
@@ -855,9 +1096,19 @@ export async function syncOdooQuotations(params: {
           );
         }
       }
+      if (allPartners.length > 0) {
+        upsertOdooCustomers(db, allPartners, nowIso);
+      }
     });
 
     upsertTx();
+
+    // Non-fatal refresh of full active Odoo customer directory so customer autocomplete stays up to date
+    try {
+      await syncOdooCustomers({ db, odoo, fetchFn });
+    } catch {
+      // Do not fail quotation sync if full partner listing is restricted by Odoo ACLs
+    }
 
     // 5. Deleted / Cancelled Quotation Reconciliation (ALWAYS flag for 1-click manual confirmation; NEVER auto-confirm)
     const missingLocalOrders = localOdooRows.filter(
@@ -1005,4 +1256,97 @@ export function getLatestSyncLog(db: Database.Database): SyncLog | null {
     | { id: number }
     | undefined;
   return row ? getSyncLogById(db, row.id) : null;
+}
+
+function cleanOdooText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Upserts a batch of Odoo `res.partner` contacts into the local `odoo_customers` cache.
+ */
+export function upsertOdooCustomers(
+  db: Database.Database,
+  partners: OdooPartner[],
+  nowIso: string = new Date().toISOString()
+): number {
+  const stmt = db.prepare(
+    `INSERT INTO odoo_customers (odoo_partner_id, name, email, phone, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(odoo_partner_id) DO UPDATE SET
+       name = excluded.name,
+       email = COALESCE(excluded.email, odoo_customers.email),
+       phone = COALESCE(excluded.phone, odoo_customers.phone),
+       updated_at = excluded.updated_at`
+  );
+  let count = 0;
+  for (const partner of partners) {
+    if (!partner || !Number.isInteger(partner.id) || partner.id <= 0) continue;
+    const name = cleanOdooText(partner.name);
+    if (!name) continue;
+    const email = cleanOdooText(partner.email);
+    const phone = cleanOdooText(partner.phone);
+    stmt.run(partner.id, name, email, phone, nowIso);
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Strictly READ-ONLY sync of active Odoo contacts (`res.partner`) into the local
+ * `odoo_customers` cache for customer name autocomplete.
+ * Never requests deprecated `mobile` (removed in Odoo 19).
+ */
+export async function syncOdooCustomers(params: {
+  db: Database.Database;
+  odoo: OdooCredentials | null;
+  fetchFn?: FetchLike;
+}): Promise<{ fetchedCount: number; syncedCount: number }> {
+  const { db, odoo, fetchFn } = params;
+  if (!odoo) {
+    throw new Error(
+      'Odoo credentials are not configured. Set odoo_url, odoo_db, and odoo_api_key in Add-on Options or environment variables.'
+    );
+  }
+
+  const pageSize = 1000;
+  const maxPages = 5;
+  const allFetched: OdooPartner[] = [];
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const batch = await callOdooJson2<OdooPartner[]>({
+      odoo,
+      model: 'res.partner',
+      method: 'search_read',
+      payload: {
+        domain: [
+          ['active', '=', true],
+          ['name', '!=', false],
+        ],
+        fields: ['id', 'name', 'email', 'phone'],
+        order: 'name asc',
+        limit: pageSize,
+        offset: page * pageSize,
+        context: { lang: 'en_US' },
+      },
+      fetchFn,
+    });
+
+    if (!Array.isArray(batch) || batch.length === 0) {
+      break;
+    }
+    allFetched.push(...batch);
+    if (batch.length < pageSize) {
+      break;
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const syncedCount = db.transaction(() => upsertOdooCustomers(db, allFetched, nowIso))();
+  return {
+    fetchedCount: allFetched.length,
+    syncedCount,
+  };
 }

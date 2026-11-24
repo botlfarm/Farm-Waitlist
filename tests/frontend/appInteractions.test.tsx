@@ -4,6 +4,9 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from '../../src/App';
+import { computeDragAutoScrollStep } from '../../src/components/CalendarWorkspace';
+import { resetCustomerAutocompleteSessionCache } from '../../src/components/CustomerAutocompleteInput';
+import { copyRichMessageToClipboard } from '../../src/lib/api';
 import type { PublicAvailabilityResult, WorkspacePayload } from '../../src/shared/types';
 
 function makeBaseWorkspace(overrides?: Partial<WorkspacePayload>): WorkspacePayload {
@@ -986,6 +989,1146 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
       expect(writeText).toHaveBeenCalledWith(
         expect.stringContaining('BOTL Farm Eggs')
       );
+    });
+  });
+
+  it('supports Weeks Ahead, Paused mode presets, flexible cutoff rules, dimmed past days, and GitHub Pages live publishing on Availability Snippet', async () => {
+    const ws = makeBaseWorkspace({
+      githubPublishStatus: {
+        tokenConfigured: true,
+        tokenSource: 'ha_options',
+        repo: '',
+        branch: 'main',
+        filePath: 'availability.json',
+        publicUrl: null,
+        mode: 'manual',
+        interval: '30m',
+        lastPublishedAt: null,
+        lastPublishStatus: 'never',
+        lastPublishError: null,
+        lastPublishedHash: null,
+      },
+    });
+
+    const settingsSaves: Array<Record<string, unknown>> = [];
+    const publishCalls: Array<Record<string, unknown>> = [];
+
+    const buildSnippet = (): PublicAvailabilityResult => ({
+      generatedAtDisplay: 'Nov 24, 2026, 4:30 PM EST',
+      timezone: 'America/New_York',
+      weeks: ws.settings.publicSnippetWeeks,
+      paused: ws.settings.publicSnippetEnabled === false,
+      pausedMessage: ws.settings.publicSnippetPausedMessage ?? 'Availability is currently unknown.',
+      showSameDay: ws.settings.publicSnippetShowSameDay !== false,
+      cutoffRules: ws.settings.publicSnippetCutoffRules ?? [],
+      liveEmbedHtml: ws.settings.githubPublishRepo
+        ? `<section class="fw-cal" data-fw-src="https://myfarm.github.io/avail/availability.json"></section>`
+        : null,
+      githubPublishStatus: ws.githubPublishStatus,
+      days: [],
+      calendarDays: [
+        {
+          date: '2026-11-23',
+          displayDate: 'Nov 23',
+          weekdayLabel: 'Mon',
+          isoWeekday: 1,
+          isPast: true,
+          isToday: false,
+          isOrderingClosed: false,
+          channelNames: [],
+          items: [],
+        },
+        {
+          date: '2026-11-24',
+          displayDate: 'Nov 24',
+          weekdayLabel: 'Tue',
+          isoWeekday: 2,
+          isPast: false,
+          isToday: true,
+          isOrderingClosed: false,
+          channelNames: ['Farm Store'],
+          items: [
+            {
+              trackedItemId: 1,
+              itemName: 'Standard Eggs',
+              unitLabel: 'dozens',
+              status: 'Available',
+              approxAvailable: 8,
+              approxLabel: 'Available (~8 dozens)',
+            },
+          ],
+        },
+      ],
+      html: '<section class="fw-cal">Snapshot</section>',
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/settings' && init?.method === 'PUT') {
+          const patch = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+          settingsSaves.push(patch);
+          ws.settings = { ...ws.settings, ...patch };
+          if (typeof patch.githubPublishRepo === 'string' && ws.githubPublishStatus) {
+            ws.githubPublishStatus = {
+              ...ws.githubPublishStatus,
+              repo: patch.githubPublishRepo,
+              publicUrl: patch.githubPublishRepo
+                ? 'https://myfarm.github.io/avail/availability.json'
+                : null,
+              mode: patch.githubPublishMode === 'auto' ? 'auto' : 'manual',
+            };
+          }
+          return new Response(
+            JSON.stringify({
+              settings: ws.settings,
+              odooStatus: ws.odooStatus,
+              githubPublishStatus: ws.githubPublishStatus,
+            }),
+            { status: 200 }
+          );
+        }
+        if (input === './api/snippet/github/publish' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+          publishCalls.push(body);
+          if (ws.githubPublishStatus) {
+            ws.githubPublishStatus = {
+              ...ws.githubPublishStatus,
+              lastPublishedAt: '2026-11-24T21:30:00Z',
+              lastPublishStatus: 'success',
+              lastPublishError: null,
+            };
+          }
+          return new Response(
+            JSON.stringify({
+              published: true,
+              skipped: false,
+              hash: 'abc123',
+              publicUrl: 'https://myfarm.github.io/avail/availability.json',
+              publishedAt: '2026-11-24T21:30:00Z',
+              githubPublishStatus: ws.githubPublishStatus,
+            }),
+            { status: 200 }
+          );
+        }
+        if (input.startsWith('./api/snippet')) {
+          return new Response(JSON.stringify(buildSnippet()), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId('nav-snippet'));
+    expect(await screen.findByTestId('snippet-rules-panel')).toBeInTheDocument();
+
+    // Past day is rendered visibly (dimmed, not hidden on mobile)
+    const pastDay = await screen.findByTestId('snippet-past-day-2026-11-23');
+    expect(pastDay).toBeInTheDocument();
+    expect(pastDay.className).not.toContain('hidden');
+
+    // Toggle Same-Day Availability off -> Today immediately previews "Ordering Closed"
+    await user.click(screen.getByTestId('snippet-show-same-day-checkbox'));
+    expect(screen.getByTestId('snippet-day-closed-2026-11-24')).toHaveTextContent('Ordering Closed');
+
+    // Add a flexible Friday 4 PM cutoff rule
+    await user.click(screen.getByTestId('add-cutoff-preset-fri'));
+    expect(screen.getByTestId('cutoff-rule-0')).toBeInTheDocument();
+    expect(screen.getByTestId('cutoff-rule-mode-0')).toHaveValue('weekly_day');
+
+    // Switch to Paused / Off-Season and pick "Closed for Season" preset
+    await user.click(screen.getByTestId('snippet-mode-paused'));
+    await user.click(screen.getByTestId('snippet-paused-preset-off_season'));
+    expect(screen.getByTestId('snippet-preview-paused')).toHaveTextContent(
+      'closed for the season'
+    );
+
+    // Configure open-source GitHub repo, switch to Automatic Sync, and Publish Now
+    await user.type(screen.getByTestId('github-repo-input'), 'myfarm/avail');
+    await user.click(screen.getByTestId('github-mode-auto'));
+    expect(screen.getByTestId('github-derived-public-url')).toHaveTextContent(
+      'https://myfarm.github.io/avail/availability.json'
+    );
+
+    await user.click(screen.getByTestId('github-publish-now-btn'));
+
+    await waitFor(() => {
+      expect(settingsSaves.length).toBeGreaterThanOrEqual(1);
+      expect(settingsSaves[0]).toMatchObject({
+        publicSnippetEnabled: false,
+        publicSnippetShowSameDay: false,
+        githubPublishRepo: 'myfarm/avail',
+        githubPublishMode: 'auto',
+      });
+      expect(publishCalls).toHaveLength(1);
+    });
+
+    // Copy Live Embed Code copies the live auto-updating embed snippet
+    await user.click(screen.getByTestId('copy-live-embed-btn'));
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(
+        expect.stringContaining('https://myfarm.github.io/avail/availability.json')
+      );
+    });
+  });
+
+  it('displays inline Morning, Harvest, and End-of-Day expected counts with live adjustments and submits actualEndOfDay', async () => {
+    const ws = makeBaseWorkspace();
+    ws.days[0].byItem[1].expectedStartingBalance = 14;
+    ws.days[0].byItem[1].actualOnHand = null;
+    ws.days[0].byItem[1].startingBalance = 14;
+    ws.days[0].byItem[1].slottedQty = 4;
+    ws.days[0].byItem[1].endingBalance = 10;
+    ws.days[0].byItem[1].expectedProduced = 15;
+    ws.days[0].byItem[1].estProduced = 15;
+    ws.days[0].byItem[1].isManualProducedOverride = false;
+    ws.days[0].byItem[1].expectedNextDayStarting = 25;
+    ws.days[0].byItem[1].nextDayStarting = 25;
+    ws.days[0].byItem[1].actualEndOfDay = null;
+
+    const supplySaves: Array<Record<string, unknown>> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/supply/1/2026-11-23' && init?.method === 'PUT') {
+          supplySaves.push(JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId('day-header-2026-11-23'));
+    expect(await screen.findByTestId('day-detail-drawer')).toBeInTheDocument();
+
+    // Expected counts sit inline next to their adjustment inputs
+    expect(screen.getByTestId('day-morning-expected')).toHaveTextContent('14');
+    expect(screen.getByTestId('day-harvest-expected')).toHaveTextContent('+15');
+    expect(screen.getByTestId('day-eod-expected')).toHaveTextContent('25');
+    expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('25 dozens');
+
+    // Adjusting Morning Count to 16 immediately updates expected End-of-Day to 16 - 4 + 15 = 27
+    await user.type(screen.getByTestId('day-actual-on-hand-input'), '16');
+    expect(screen.getByTestId('day-eod-expected')).toHaveTextContent('27');
+    expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('27 dozens');
+
+    // Adjusting End of Day (After Harvest) to 23 pins tomorrow's starting count to 23
+    await user.type(screen.getByTestId('day-actual-end-of-day-input'), '23');
+    expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('23 dozens');
+    expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('(actual EOD)');
+
+    await user.click(screen.getByTestId('day-save-btn'));
+
+    await waitFor(() => {
+      expect(supplySaves).toHaveLength(1);
+      expect(supplySaves[0]).toMatchObject({
+        actualOnHand: 16,
+        estProduced: null,
+        actualEndOfDay: 23,
+        cascadeForward: false,
+      });
+    });
+  });
+
+  it('shows a non-blocking warning modal when overwriting Morning or End-of-Day count on a non-today date', async () => {
+    const ws = makeBaseWorkspace();
+    const supplySaves: Array<{ url: string; body: Record<string, unknown> }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input.startsWith('./api/supply/') && init?.method === 'PUT') {
+          supplySaves.push({
+            url: input,
+            body: JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>,
+          });
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    // Open Tomorrow (2026-11-24, not today 2026-11-23)
+    await user.click(await screen.findByTestId('day-header-2026-11-24'));
+    expect(await screen.findByTestId('day-detail-drawer')).toBeInTheDocument();
+
+    // Overwrite End-of-Day count on a non-today date -> clicking Save Day pops up the warning modal
+    await user.type(screen.getByTestId('day-actual-end-of-day-input'), '19');
+    await user.click(screen.getByTestId('day-save-btn'));
+
+    const modal = await screen.findByTestId('non-today-override-modal');
+    expect(modal).toBeInTheDocument();
+    expect(modal).toHaveTextContent(/Additional Safety Buffer/i);
+    expect(modal).toHaveTextContent(/Afternoon Harvest/i);
+    expect(supplySaves).toHaveLength(0);
+
+    // Go Back & Adjust dismisses without saving
+    await user.click(screen.getByTestId('cancel-non-today-override-btn'));
+    expect(screen.queryByTestId('non-today-override-modal')).not.toBeInTheDocument();
+    expect(supplySaves).toHaveLength(0);
+
+    // Clicking Save Day again and choosing "Save Override Anyway" proceeds (not a hard stop)
+    await user.click(screen.getByTestId('day-save-btn'));
+    await user.click(await screen.findByTestId('confirm-non-today-override-btn'));
+
+    await waitFor(() => {
+      expect(supplySaves).toHaveLength(1);
+      expect(supplySaves[0].url).toBe('./api/supply/1/2026-11-24');
+      expect(supplySaves[0].body).toMatchObject({ actualEndOfDay: 19 });
+    });
+
+    // Editing only Afternoon Harvest / Extra Buffer on a non-today date saves directly with no warning
+    await user.click(await screen.findByTestId('day-header-2026-11-24'));
+    await user.type(screen.getByTestId('day-extra-buffer-input'), '5');
+    await user.click(screen.getByTestId('day-save-btn'));
+    expect(screen.queryByTestId('non-today-override-modal')).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(supplySaves).toHaveLength(2);
+      expect(supplySaves[1].body).toMatchObject({ extraBuffer: 5 });
+    });
+  });
+
+  it('shows arrival dates prominently on unslotted waitlist cards and supports drag-and-drop reordering', async () => {
+    const ws = makeBaseWorkspace();
+    ws.today = '2026-11-24';
+    ws.orders = [
+      {
+        ...ws.orders[1],
+        id: 201,
+        customerName: 'Zoe Newest',
+        status: 'waitlist',
+        slottedDate: null,
+        odooCreatedAtLocal: '2026-11-22 15:00:00',
+        createdAt: '2026-11-22T20:00:00Z',
+        waitlistSortOrder: null,
+      },
+      {
+        ...ws.orders[1],
+        id: 202,
+        customerName: 'Alice First',
+        status: 'waitlist',
+        slottedDate: null,
+        odooCreatedAtLocal: '2026-11-18 09:00:00',
+        createdAt: '2026-11-18T14:00:00Z',
+        waitlistSortOrder: null,
+      },
+      {
+        ...ws.orders[1],
+        id: 203,
+        customerName: 'Ben Middle',
+        status: 'waitlist',
+        slottedDate: null,
+        odooCreatedAtLocal: null,
+        createdAt: '2026-11-20T16:00:00Z',
+        waitlistSortOrder: null,
+      },
+    ];
+
+    const reorderCalls: Array<Record<string, unknown>> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/waitlist-order' && init?.method === 'PUT') {
+          const body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+          reorderCalls.push(body);
+          if (body.reset === true) {
+            ws.orders = ws.orders.map((o) => ({ ...o, waitlistSortOrder: null }));
+          } else if (Array.isArray(body.orderIds)) {
+            const ids = body.orderIds as number[];
+            ws.orders = ws.orders.map((o) => {
+              const idx = ids.indexOf(o.id);
+              return idx >= 0 ? { ...o, waitlistSortOrder: idx } : o;
+            });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    // Default sort is oldest arrival date first: Alice (Nov 18), Ben (Nov 20), Zoe (Nov 22)
+    expect(await screen.findByTestId('queue-arrived-202')).toHaveTextContent('Arrived Nov 18');
+    expect(screen.getByTestId('queue-arrived-202')).toHaveTextContent('6d ago');
+    expect(screen.getByTestId('queue-arrived-203')).toHaveTextContent('Arrived Nov 20');
+    expect(screen.getByTestId('queue-arrived-201')).toHaveTextContent('Arrived Nov 22');
+
+    const getQueueIds = () =>
+      Array.from(document.querySelectorAll('[data-testid^="queue-order-"]')).map((el) =>
+        Number(el.getAttribute('data-testid')?.replace('queue-order-', ''))
+      );
+    expect(getQueueIds()).toEqual([202, 203, 201]);
+
+    // Drag Zoe (201) onto Alice (202) to move Zoe to the top of the waitlist
+    const dragCard = screen.getByTestId('queue-order-201');
+    const targetCard = screen.getByTestId('queue-order-202');
+    const dataTransfer = {
+      data: {} as Record<string, string>,
+      effectAllowed: 'move',
+      setData(type: string, val: string) {
+        this.data[type] = val;
+      },
+      getData(type: string) {
+        return this.data[type] ?? '';
+      },
+    };
+
+    fireEvent.dragStart(dragCard, { dataTransfer });
+    fireEvent.dragOver(targetCard, { dataTransfer });
+    fireEvent.drop(targetCard, { dataTransfer });
+
+    await waitFor(() => {
+      expect(reorderCalls).toHaveLength(1);
+      expect(reorderCalls[0]).toEqual({ orderIds: [201, 202, 203] });
+      expect(getQueueIds()).toEqual([201, 202, 203]);
+    });
+
+    // Reset to Arrival restores oldest-first order
+    await user.click(await screen.findByTestId('reset-waitlist-order-btn'));
+    await waitFor(() => {
+      expect(reorderCalls).toHaveLength(2);
+      expect(reorderCalls[1]).toEqual({ reset: true });
+      expect(getQueueIds()).toEqual([202, 203, 201]);
+    });
+  });
+
+  it('auto-scrolls the waitlist container and calendar viewport when dragging near edges', async () => {
+    // 1. Pure velocity curve check
+    expect(computeDragAutoScrollStep(300, 100, 500, 88)).toBe(0);
+    expect(computeDragAutoScrollStep(120, 100, 500, 88)).toBeLessThan(0);
+    expect(computeDragAutoScrollStep(102, 100, 500, 88)).toBeLessThan(
+      computeDragAutoScrollStep(160, 100, 500, 88)
+    );
+    expect(computeDragAutoScrollStep(485, 100, 500, 88)).toBeGreaterThan(0);
+    expect(computeDragAutoScrollStep(498, 100, 500, 88)).toBeGreaterThan(
+      computeDragAutoScrollStep(430, 100, 500, 88)
+    );
+
+    const ws = makeBaseWorkspace();
+    ws.orders = [
+      ...ws.orders,
+      {
+        ...ws.orders[1],
+        id: 301,
+        customerName: 'Waitlist Extra',
+        status: 'waitlist',
+        slottedDate: null,
+      },
+    ];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    // Control animation frames deterministically
+    let nextRafId = 1;
+    const rafQueue = new Map<number, FrameRequestCallback>();
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb) => {
+      const id = nextRafId++;
+      rafQueue.set(id, cb);
+      return id;
+    });
+    const cancelRafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => {
+      rafQueue.delete(id);
+    });
+    const scrollBySpy = vi.spyOn(window, 'scrollBy').mockImplementation(() => {});
+
+    const flushRaf = () => {
+      const entries = Array.from(rafQueue.entries());
+      rafQueue.clear();
+      for (const [, cb] of entries) cb(performance.now());
+    };
+
+    try {
+      render(<App />);
+
+      const queueScroll = await screen.findByTestId('unslotted-queue-scroll');
+      const dragCard = screen.getByTestId('queue-order-11');
+
+      // Mock a tall scrollable waitlist container on desktop (x: 900..1220, y: 100..500)
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+      Object.defineProperty(window, 'innerHeight', { configurable: true, value: 800 });
+      Object.defineProperty(queueScroll, 'scrollHeight', { configurable: true, value: 1400 });
+      Object.defineProperty(queueScroll, 'clientHeight', { configurable: true, value: 400 });
+      queueScroll.scrollTop = 200;
+      vi.spyOn(queueScroll, 'getBoundingClientRect').mockReturnValue({
+        top: 100,
+        bottom: 500,
+        left: 900,
+        right: 1220,
+        width: 320,
+        height: 400,
+        x: 900,
+        y: 100,
+        toJSON: () => ({}),
+      });
+
+      const dataTransfer = {
+        data: {} as Record<string, string>,
+        effectAllowed: 'move',
+        setData(type: string, val: string) {
+          this.data[type] = val;
+        },
+        getData(type: string) {
+          return this.data[type] ?? '';
+        },
+      };
+
+      const dispatchDragOver = (clientX: number, clientY: number) => {
+        const ev = new MouseEvent('dragover', {
+          bubbles: true,
+          cancelable: true,
+          clientX,
+          clientY,
+        });
+        window.dispatchEvent(ev);
+      };
+
+      // Start dragging card and hover near bottom edge of waitlist -> waitlist scrollTop increases
+      fireEvent.dragStart(dragCard, { dataTransfer });
+      dispatchDragOver(1050, 490);
+      flushRaf();
+      expect(queueScroll.scrollTop).toBeGreaterThan(200);
+      const afterDown = queueScroll.scrollTop;
+
+      // Move pointer near top edge of waitlist -> waitlist scrollTop decreases
+      dispatchDragOver(1050, 108);
+      flushRaf();
+      expect(queueScroll.scrollTop).toBeLessThan(afterDown);
+
+      // Drag over calendar area near bottom of screen -> window.scrollBy scrolls viewport down
+      scrollBySpy.mockClear();
+      dispatchDragOver(300, 785);
+      flushRaf();
+      expect(scrollBySpy).toHaveBeenCalled();
+      expect(scrollBySpy.mock.calls[0][0]).toBe(0);
+      expect(scrollBySpy.mock.calls[0][1]).toBeGreaterThan(0);
+
+      // End drag -> stops rAF loop and does not scroll further
+      scrollBySpy.mockClear();
+      fireEvent.dragEnd(dragCard);
+      expect(cancelRafSpy).toHaveBeenCalled();
+      flushRaf();
+      expect(scrollBySpy).not.toHaveBeenCalled();
+    } finally {
+      rafSpy.mockRestore();
+      cancelRafSpy.mockRestore();
+      scrollBySpy.mockRestore();
+    }
+  });
+
+  it('live-bumps waitlist cards while dragging and live-previews calendar quantities across dates when hovering before dropping', async () => {
+    const ws = makeBaseWorkspace();
+    ws.today = '2026-11-23';
+    // Day 0 (Nov 23): start=20, slotted=2 (id 10), end=18, buf=4, open=14, prod=10 -> nextStart=28
+    // Day 1 (Nov 24): start=28, slotted=0, end=28, buf=4, open=24, prod=10 -> nextStart=38
+    ws.orders = [
+      ws.orders[0], // id 10, slotted on 2026-11-23, qty 2
+      {
+        ...ws.orders[1],
+        id: 401,
+        customerName: 'First Waitlister',
+        status: 'waitlist',
+        slottedDate: null,
+        odooCreatedAtLocal: '2026-11-18 09:00:00',
+        items: [{ id: 1, trackedItemId: 1, quantity: 3 }],
+      },
+      {
+        ...ws.orders[1],
+        id: 402,
+        customerName: 'Second Waitlister',
+        status: 'waitlist',
+        slottedDate: null,
+        odooCreatedAtLocal: '2026-11-20 09:00:00',
+        items: [{ id: 2, trackedItemId: 1, quantity: 5 }],
+      },
+    ];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    expect(await screen.findByTestId('queue-order-401')).toBeInTheDocument();
+
+    const getQueueIds = () =>
+      Array.from(document.querySelectorAll('[data-testid^="queue-order-"]')).map((el) =>
+        Number(el.getAttribute('data-testid')?.replace('queue-order-', ''))
+      );
+    expect(getQueueIds()).toEqual([401, 402]);
+
+    const dataTransfer = {
+      data: {} as Record<string, string>,
+      effectAllowed: 'move',
+      dropEffect: 'move',
+      setData(type: string, val: string) {
+        this.data[type] = val;
+      },
+      getData(type: string) {
+        return this.data[type] ?? '';
+      },
+    };
+
+    // 1. Live-bump waitlist cards during dragOver BEFORE dropping
+    const secondCard = screen.getByTestId('queue-order-402');
+    const firstCard = screen.getByTestId('queue-order-401');
+    fireEvent.dragStart(secondCard, { dataTransfer });
+    fireEvent.dragOver(firstCard, { dataTransfer });
+
+    // List immediately bumps 402 ahead of 401 BEFORE drop!
+    expect(getQueueIds()).toEqual([402, 401]);
+
+    // 2. Drag the same 5-dozen order over Day 0 (2026-11-23) -> live preview updates Day 0 AND Day 1!
+    // Base fixture: Day 0 start=15, slotted=2, buf=4 -> open=9, harv=+15 -> Day 1 start=28, open=24
+    const day0 = screen.getByTestId('calendar-day-2026-11-23');
+    expect(screen.getByTestId('day-metrics-2026-11-23')).toHaveTextContent('Can Sell9dozens');
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('Can Sell24dozens');
+
+    fireEvent.dragOver(day0, { dataTransfer });
+
+    // Preview chip renders on Day 0
+    expect(screen.getByTestId('drag-preview-chip')).toHaveTextContent('Second Waitlister');
+    // Day 0 drops from 9 -> 4 open (-5), slotted jumps from (-2) -> (-7)
+    expect(screen.getByTestId('day-metrics-2026-11-23')).toHaveTextContent('Can Sell4dozens');
+    expect(screen.getByTestId('day-metrics-2026-11-23')).toHaveTextContent('(-7)');
+    expect(screen.getByTestId('day-preview-delta-2026-11-23')).toHaveTextContent('-5');
+    // Day 1 forward carry-over also drops live from 28 on-hand / 24 open -> 23 on-hand / 19 open (-5)!
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('Can Sell19dozens');
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('On Hand23');
+    expect(screen.getByTestId('day-preview-delta-2026-11-24')).toHaveTextContent('-5');
+
+    // 3. Move hover to Day 1 (2026-11-24) -> Day 0 reverts to 9 open, Day 1 shows 28 (-5) & 19 open
+    const day1 = screen.getByTestId('calendar-day-2026-11-24');
+    fireEvent.dragOver(day1, { dataTransfer });
+    expect(screen.getByTestId('day-metrics-2026-11-23')).toHaveTextContent('Can Sell9dozens');
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('Can Sell19dozens');
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('(-5)');
+
+    // 4. Cancel drag (dragEnd without drop) -> all numbers & waitlist order snap cleanly back to baseline
+    fireEvent.dragEnd(secondCard);
+    expect(screen.queryByTestId('drag-preview-chip')).not.toBeInTheDocument();
+    expect(screen.getByTestId('day-metrics-2026-11-23')).toHaveTextContent('Can Sell9dozens');
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('Can Sell24dozens');
+    expect(getQueueIds()).toEqual([401, 402]);
+  });
+
+  it('never flags recurring standing orders as duplicates and lets users dismiss non-duplicate merge banners', async () => {
+    const ws = makeBaseWorkspace();
+    ws.orders = [
+      // Two weekly recurring standing orders for the same customer
+      {
+        ...ws.orders[0],
+        id: 501,
+        source: 'standing',
+        standingOrderId: 12,
+        standingOccurrenceDate: '2026-11-23',
+        slottedDate: '2026-11-23',
+        customerName: 'Weekly Wanda',
+        customerEmail: 'wanda@example.com',
+        customerPhone: '555-1111',
+        odooQuotationId: null,
+        odooQuotationName: null,
+        odooPartnerId: null,
+        isLocked: true,
+      },
+      {
+        ...ws.orders[0],
+        id: 502,
+        source: 'standing',
+        standingOrderId: 12,
+        standingOccurrenceDate: '2026-11-24',
+        slottedDate: '2026-11-24',
+        customerName: 'Weekly Wanda',
+        customerEmail: 'wanda@example.com',
+        customerPhone: '555-1111',
+        odooQuotationId: null,
+        odooQuotationName: null,
+        odooPartnerId: null,
+        isLocked: true,
+      },
+      // A one-off manual order for Weekly Wanda too — still must NOT flag standing orders as duplicates
+      {
+        ...ws.orders[0],
+        id: 503,
+        source: 'manual',
+        standingOrderId: null,
+        standingOccurrenceDate: null,
+        slottedDate: '2026-11-24',
+        customerName: 'Weekly Wanda',
+        customerEmail: 'wanda@example.com',
+        customerPhone: '555-1111',
+        odooQuotationId: null,
+        odooQuotationName: null,
+        odooPartnerId: null,
+        isLocked: false,
+      },
+      // Two regular non-standing orders for the same customer -> SHOULD show duplicate banner with Dismiss button
+      {
+        ...ws.orders[0],
+        id: 504,
+        source: 'manual',
+        standingOrderId: null,
+        standingOccurrenceDate: null,
+        slottedDate: '2026-11-23',
+        customerName: 'Separate Sam',
+        customerEmail: 'sam@example.com',
+        customerPhone: '555-2222',
+        odooQuotationId: null,
+        odooQuotationName: null,
+        odooPartnerId: null,
+        isLocked: false,
+      },
+      {
+        ...ws.orders[0],
+        id: 505,
+        source: 'manual',
+        standingOrderId: null,
+        standingOccurrenceDate: null,
+        slottedDate: '2026-11-24',
+        customerName: 'Separate Sam',
+        customerEmail: 'sam@example.com',
+        customerPhone: '555-2222',
+        odooQuotationId: null,
+        odooQuotationName: null,
+        odooPartnerId: null,
+        isLocked: false,
+      },
+    ];
+
+    const dismissCalls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/504/dismiss-duplicate' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+          dismissCalls.push({ url: input, body });
+          const otherId = Number(body.otherOrderId);
+          ws.orders = ws.orders.map((o) => {
+            if (o.id === 504) {
+              return { ...o, dismissedDuplicateOrderIds: [...(o.dismissedDuplicateOrderIds ?? []), otherId] };
+            }
+            if (o.id === otherId) {
+              return { ...o, dismissedDuplicateOrderIds: [...(o.dismissedDuplicateOrderIds ?? []), 504] };
+            }
+            return o;
+          });
+          return new Response(JSON.stringify({ ok: true, orderIdA: 504, orderIdB: otherId }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    // 1. Opening a recurring standing order (501) shows NO duplicate banner and NO Merge button
+    await user.click(await screen.findByTestId('order-chip-501'));
+    expect(await screen.findByTestId('order-detail-drawer')).toBeInTheDocument();
+    expect(screen.queryByTestId('possible-duplicate-banner')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('toggle-merge-panel-btn')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('close-order-drawer-btn'));
+
+    // 2. Opening Wanda's one-off manual order (503) also does NOT flag her standing orders (501/502) as duplicates
+    await user.click(screen.getByTestId('order-chip-503'));
+    expect(await screen.findByTestId('order-detail-drawer')).toBeInTheDocument();
+    expect(screen.queryByTestId('possible-duplicate-banner')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('close-order-drawer-btn'));
+
+    // 3. Opening Separate Sam (504) DOES show possible-duplicate-banner for 505, with Not a Duplicate button
+    await user.click(screen.getByTestId('order-chip-504'));
+    const banner = await screen.findByTestId('possible-duplicate-banner');
+    expect(banner).toHaveTextContent('Separate Sam');
+
+    // Click "Not a Duplicate" -> calls API and hides banner
+    await user.click(screen.getByTestId('dismiss-duplicate-btn'));
+    await waitFor(() => {
+      expect(dismissCalls).toHaveLength(1);
+      expect(dismissCalls[0].body).toEqual({ otherOrderId: 505 });
+      expect(screen.queryByTestId('possible-duplicate-banner')).not.toBeInTheDocument();
+    });
+
+    // 4. Opening the other side (505) also does NOT show the dismissed duplicate banner
+    await user.click(screen.getByTestId('close-order-drawer-btn'));
+    await user.click(screen.getByTestId('order-chip-505'));
+    expect(await screen.findByTestId('order-detail-drawer')).toBeInTheDocument();
+    expect(screen.queryByTestId('possible-duplicate-banner')).not.toBeInTheDocument();
+  });
+
+  it('lets users click a potential duplicate to compare its full details and Odoo chatter before merging or dismissing', async () => {
+    const ws = makeBaseWorkspace();
+    ws.orders = [
+      {
+        ...ws.orders[0],
+        id: 601,
+        source: 'odoo',
+        status: 'slotted',
+        slottedDate: '2026-11-23',
+        customerName: 'Clara Barton',
+        customerEmail: 'clara@example.com',
+        customerPhone: '555-3333',
+        odooQuotationId: 901,
+        odooQuotationName: 'S00901',
+        odooPartnerId: 401,
+        notes: 'Original farm pickup order',
+        chatter: [
+          {
+            id: 1,
+            orderId: 601,
+            odooMessageId: 9901,
+            authorName: 'Clara Barton',
+            messageType: 'email',
+            subtypeName: 'Discussions',
+            bodyText: 'Looking forward to Monday pickup!',
+            createdAtUtc: '2026-11-21 15:00:00',
+            createdAtLocal: '2026-11-21 10:00:00',
+          },
+        ],
+      },
+      {
+        ...ws.orders[0],
+        id: 602,
+        source: 'odoo',
+        status: 'waitlist',
+        slottedDate: null,
+        customerName: 'Clara Barton',
+        customerEmail: 'clara@example.com',
+        customerPhone: '555-3333',
+        odooQuotationId: 902,
+        odooQuotationName: 'S00902',
+        odooPartnerId: 401,
+        notes: 'Second order for neighbor gift',
+        odooRawLines: ['3 × Standard Eggs (Dozen)'],
+        items: [{ id: 9, trackedItemId: 1, quantity: 3 }],
+        chatter: [
+          {
+            id: 2,
+            orderId: 602,
+            odooMessageId: 9902,
+            authorName: 'Clara Barton',
+            messageType: 'comment',
+            subtypeName: 'Discussions',
+            bodyText: 'CRITICAL CHATTER: This is a separate order for my sister, please do NOT cancel!',
+            createdAtUtc: '2026-11-22 18:30:00',
+            createdAtLocal: '2026-11-22 13:30:00',
+          },
+        ],
+      },
+    ];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    // Open order 601 -> see possible duplicate banner mentioning chatter count
+    await user.click(await screen.findByTestId('order-chip-601'));
+    const banner = await screen.findByTestId('possible-duplicate-banner');
+    expect(banner).toHaveTextContent('S00902');
+    expect(banner).toHaveTextContent('1 chatter');
+
+    // Click the potential duplicate to expand full details & chatter inline for comparison
+    await user.click(screen.getByTestId('inspect-duplicate-btn'));
+    const compareCard = await screen.findByTestId('duplicate-comparison-card');
+    expect(compareCard).toHaveTextContent('Second order for neighbor gift');
+    expect(compareCard).toHaveTextContent('3 × Standard Eggs (Dozen)');
+    const chatterBox = screen.getByTestId('duplicate-compare-chatter');
+    expect(chatterBox).toHaveTextContent(
+      'CRITICAL CHATTER: This is a separate order for my sister, please do NOT cancel!'
+    );
+
+    // Also verify chatter is visible inside the Merge panel preview before confirming
+    await user.click(screen.getByTestId('open-merge-duplicate-btn'));
+    const mergeDetails = await screen.findByTestId('merge-source-details');
+    expect(mergeDetails).toHaveTextContent(
+      'CRITICAL CHATTER: This is a separate order for my sister, please do NOT cancel!'
+    );
+
+    // Clicking "Open" switches drawer directly to order 602
+    await user.click(screen.getByTestId('merge-open-source-order-btn'));
+    await waitFor(() => {
+      expect(screen.getByTestId('order-detail-drawer')).toHaveTextContent('S00902');
+    });
+  });
+
+  it('copies pre-approval rich HTML without dark-mode background or light text styles on fallback copy', async () => {
+    // Simulate HTTP Ingress environment where navigator.clipboard.write throws
+    const origClipboard = navigator.clipboard;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        write: vi.fn().mockRejectedValue(new Error('NotAllowedError')),
+        writeText: vi.fn().mockResolvedValue(undefined),
+      },
+    });
+
+    const writtenClipboard: Record<string, string> = {};
+    const execCommandSpy = vi.fn(() => {
+      const copyEvent = new Event('copy', { bubbles: true, cancelable: true }) as ClipboardEvent;
+      Object.defineProperty(copyEvent, 'clipboardData', {
+        value: {
+          setData: (type: string, value: string) => {
+            writtenClipboard[type] = value;
+          },
+        },
+      });
+      document.dispatchEvent(copyEvent);
+      return true;
+    });
+    const origExecCommand = document.execCommand;
+    document.execCommand = execCommandSpy;
+
+    try {
+      const ok = await copyRichMessageToClipboard(
+        'Hey Jane, order at <a href="https://eatfromfarms.com/pre">Eat From Farms</a>\nThanks!'
+      );
+      expect(ok).toBe(true);
+      expect(writtenClipboard['text/html']).toBe(
+        '<div>Hey Jane, order at <a href="https://eatfromfarms.com/pre" target="_blank" rel="noopener noreferrer">Eat From Farms</a><br>Thanks!</div>'
+      );
+      expect(writtenClipboard['text/html']).not.toMatch(/background|rgb\(|#0f1419|#e6edf3|color:/i);
+      expect(writtenClipboard['text/plain']).toBe(
+        'Hey Jane, order at Eat From Farms (https://eatfromfarms.com/pre)\nThanks!'
+      );
+    } finally {
+      document.execCommand = origExecCommand;
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: origClipboard,
+      });
+    }
+  });
+
+  it('autocompletes customer names from synced Odoo contacts in Quick Add and auto-fills phone and email', async () => {
+    resetCustomerAutocompleteSessionCache();
+    const ws = makeBaseWorkspace({
+      odooStatus: {
+        configured: true,
+        source: 'env',
+        urlHost: 'farm.odoo.com',
+        database: 'farm_db',
+      },
+      odooCustomersCount: 2,
+    });
+
+    const createdOrders: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input.startsWith('./api/customers')) {
+          return new Response(
+            JSON.stringify({
+              customers: [
+                {
+                  key: 'odoo:1001',
+                  name: 'Elena Vance',
+                  email: 'elena@farm.test',
+                  phone: '555-1001',
+                  odooPartnerId: 1001,
+                  source: 'odoo',
+                },
+                {
+                  key: 'odoo:1002',
+                  name: 'Marcus Reed',
+                  email: 'marcus@farm.test',
+                  phone: '555-1002',
+                  odooPartnerId: 1002,
+                  source: 'odoo',
+                },
+              ],
+              odooCustomersCount: 2,
+              odooConfigured: true,
+            }),
+            { status: 200 }
+          );
+        }
+        if (input === './api/orders' && init?.method === 'POST') {
+          createdOrders.push(JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>);
+          return new Response(JSON.stringify({ ...ws.orders[1], id: 999 }), { status: 201 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByTestId('quick-add-order-btn'));
+    const nameInput = await screen.findByTestId('quick-add-customer-input');
+    await user.type(nameInput, 'Ele');
+
+    // Autocomplete dropdown lists Elena Vance with Odoo badge
+    const option = await screen.findByTestId('customer-option-0');
+    expect(option).toHaveTextContent('Elena Vance');
+    expect(option).toHaveTextContent('Odoo');
+
+    // Selecting Elena auto-fills Name, Phone, and Email
+    fireEvent.mouseDown(option);
+
+    expect(nameInput).toHaveValue('Elena Vance');
+    expect(screen.getByTestId('quick-add-phone-input')).toHaveValue('555-1001');
+    expect(screen.getByTestId('quick-add-email-input')).toHaveValue('elena@farm.test');
+
+    // Submit order verifies auto-filled contact fields are sent
+    await user.click(screen.getByTestId('quick-add-submit-btn'));
+    await waitFor(() => {
+      expect(createdOrders).toHaveLength(1);
+      expect(createdOrders[0]).toMatchObject({
+        customerName: 'Elena Vance',
+        customerPhone: '555-1001',
+        customerEmail: 'elena@farm.test',
+      });
+    });
+  });
+
+  it('displays Requested Pickup Date prominently in the waitlist, allows setting it in Quick Add, and supports editing & 1-tap slotting in OrderDetailDrawer', async () => {
+    const ws = makeBaseWorkspace();
+    ws.orders = [
+      ws.orders[0],
+      {
+        ...ws.orders[1],
+        id: 11,
+        status: 'waitlist',
+        timingType: 'specific_date',
+        requestedDate: '2026-11-28',
+        slottedDate: null,
+        customerName: 'Bob Request',
+      },
+    ];
+
+    const createdPayloads: Array<Record<string, unknown>> = [];
+    const updatedPayloads: Array<Record<string, unknown>> = [];
+    const slotPayloads: Array<Record<string, unknown>> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input.startsWith('./api/customers')) {
+          return new Response(
+            JSON.stringify({ customers: [], odooCustomersCount: 0, odooConfigured: false }),
+            { status: 200 }
+          );
+        }
+        if (input === './api/orders' && init?.method === 'POST') {
+          createdPayloads.push(JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>);
+          return new Response(JSON.stringify({ ...ws.orders[1], id: 901 }), { status: 201 });
+        }
+        if (input === './api/orders/11' && init?.method === 'PUT') {
+          updatedPayloads.push(JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>);
+          return new Response(JSON.stringify(ws.orders[1]), { status: 200 });
+        }
+        if (input === './api/orders/11/slot' && init?.method === 'POST') {
+          slotPayloads.push(JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>);
+          return new Response(JSON.stringify({ ...ws.orders[1], slottedDate: '2026-11-28', status: 'slotted' }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    const user = userEvent.setup();
+    render(<App />);
+
+    // 1. Waitlist card prominently displays the customer's Requested Pickup Date
+    const requestedBadge = await screen.findByTestId('queue-requested-pickup-11');
+    expect(requestedBadge).toHaveTextContent('Requested Pickup: Sat, Nov 28');
+
+    // 2. Quick Add modal lets user set an optional Requested Pickup Date while adding to Waitlist Queue
+    await user.click(screen.getByTestId('quick-add-order-btn'));
+    await user.type(await screen.findByTestId('quick-add-customer-input'), 'Wendy Waitlist');
+    fireEvent.change(screen.getByTestId('quick-add-date-input'), {
+      target: { value: '2026-11-27' },
+    });
+    await user.click(screen.getByTestId('quick-add-submit-btn'));
+
+    await waitFor(() => {
+      expect(createdPayloads).toHaveLength(1);
+      expect(createdPayloads[0]).toMatchObject({
+        customerName: 'Wendy Waitlist',
+        timingType: 'asap',
+        requestedDate: '2026-11-27',
+      });
+    });
+
+    // 3. Opening Bob Request in OrderDetailDrawer shows prominent header pill, editable input, and 1-tap requested date slot button
+    await user.click(screen.getByTestId('queue-order-11'));
+    expect(await screen.findByTestId('order-header-requested-pickup')).toHaveTextContent(
+      'Requested Pickup: Sat, Nov 28'
+    );
+    const reqInput = screen.getByTestId('order-requested-date-input');
+    expect(reqInput).toHaveValue('2026-11-28');
+
+    const slotReqBtn = screen.getByTestId('slot-requested-date-btn');
+    expect(slotReqBtn).toHaveTextContent('Slot on Requested Date · Sat, Nov 28');
+
+    // Edit Requested Pickup Date and save -> sends requestedDate to PUT /api/orders/11
+    fireEvent.change(reqInput, { target: { value: '2026-11-29' } });
+    expect(screen.getByTestId('order-header-requested-pickup')).toHaveTextContent(
+      'Requested Pickup: Sun, Nov 29'
+    );
+    await user.click(screen.getByTestId('order-save-btn'));
+
+    await waitFor(() => {
+      expect(updatedPayloads).toHaveLength(1);
+      expect(updatedPayloads[0]).toMatchObject({ requestedDate: '2026-11-29' });
     });
   });
 });

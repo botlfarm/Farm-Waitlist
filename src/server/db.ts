@@ -1,9 +1,19 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { DEFAULT_PUBLIC_SNIPPET_FOOTER } from '../shared/generators';
+import {
+  DEFAULT_PAUSED_SNIPPET_MESSAGE,
+  DEFAULT_PUBLIC_SNIPPET_FOOTER,
+  normalizeCutoffRules,
+} from '../shared/generators';
 import { DEFAULT_TIMEZONE } from '../shared/timezone';
-import type { AppSettings, BackupInfo, BackupTrigger, PreApprovalTemplate } from '../shared/types';
+import type {
+  AppSettings,
+  BackupInfo,
+  BackupTrigger,
+  GithubPublishInterval,
+  PreApprovalTemplate,
+} from '../shared/types';
 
 export interface Migration {
   version: number;
@@ -109,10 +119,25 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   backupScheduleEnabled: true,
   backupRetentionDays: 14,
   publicSnippetWeeks: 3,
+  publicSnippetEnabled: true,
+  publicSnippetPausedPreset: 'unknown',
+  publicSnippetPausedMessage: DEFAULT_PAUSED_SNIPPET_MESSAGE,
+  publicSnippetShowSameDay: true,
+  publicSnippetCutoffRules: [],
   publicSnippetHeaderTitle: '',
   publicSnippetHeaderText: '',
   publicSnippetFooterText: DEFAULT_PUBLIC_SNIPPET_FOOTER,
   publicSnippetAutoAdvanceToday: true,
+  githubPublishMode: 'manual',
+  githubPublishInterval: '30m',
+  githubPublishRepo: '',
+  githubPublishBranch: 'main',
+  githubPublishPath: 'availability.json',
+  githubPublishPublicUrl: '',
+  githubLastPublishedAt: null,
+  githubLastPublishedHash: null,
+  githubLastPublishStatus: 'never',
+  githubLastPublishError: null,
 };
 
 export const MIGRATIONS: Migration[] = [
@@ -294,6 +319,49 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_merged_odoo_links_target ON merged_odoo_links(target_order_id);
     `,
   },
+  {
+    version: 4,
+    name: 'add_actual_end_of_day',
+    sql: `
+      ALTER TABLE daily_supply_entries ADD COLUMN actual_end_of_day REAL;
+    `,
+  },
+  {
+    version: 5,
+    name: 'add_waitlist_sort_order',
+    sql: `
+      ALTER TABLE orders ADD COLUMN waitlist_sort_order INTEGER;
+    `,
+  },
+  {
+    version: 6,
+    name: 'add_dismissed_duplicate_pairs',
+    sql: `
+      CREATE TABLE IF NOT EXISTS dismissed_duplicate_pairs (
+        order_id_a INTEGER NOT NULL,
+        order_id_b INTEGER NOT NULL,
+        dismissed_at TEXT NOT NULL,
+        PRIMARY KEY (order_id_a, order_id_b),
+        FOREIGN KEY (order_id_a) REFERENCES orders(id) ON DELETE CASCADE,
+        FOREIGN KEY (order_id_b) REFERENCES orders(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_dismissed_dup_b ON dismissed_duplicate_pairs(order_id_b);
+    `,
+  },
+  {
+    version: 7,
+    name: 'add_odoo_customers',
+    sql: `
+      CREATE TABLE IF NOT EXISTS odoo_customers (
+        odoo_partner_id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT,
+        phone TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_odoo_customers_name ON odoo_customers(name COLLATE NOCASE);
+    `,
+  },
 ];
 
 const SQLITE_HEADER_MAGIC = Buffer.from('SQLite format 3\0', 'utf8');
@@ -442,12 +510,83 @@ export class DatabaseManager {
     const defaultTemplate = templates.find((t) => t.isDefault) ?? templates[0];
     merged.preApprovalTemplates = templates;
     merged.preApprovalTemplate = defaultTemplate?.body ?? legacyBody;
+
+    const rawWeeks = Number(merged.publicSnippetWeeks);
+    merged.publicSnippetWeeks = Number.isFinite(rawWeeks)
+      ? Math.max(1, Math.min(8, Math.floor(rawWeeks)))
+      : 3;
+    merged.publicSnippetEnabled = merged.publicSnippetEnabled !== false;
+    merged.publicSnippetPausedPreset =
+      typeof merged.publicSnippetPausedPreset === 'string' && merged.publicSnippetPausedPreset.trim()
+        ? merged.publicSnippetPausedPreset.trim()
+        : 'unknown';
+    merged.publicSnippetPausedMessage =
+      typeof merged.publicSnippetPausedMessage === 'string'
+        ? merged.publicSnippetPausedMessage
+        : DEFAULT_PAUSED_SNIPPET_MESSAGE;
+    merged.publicSnippetShowSameDay = merged.publicSnippetShowSameDay !== false;
+    merged.publicSnippetCutoffRules = normalizeCutoffRules(merged.publicSnippetCutoffRules);
+    merged.githubPublishMode = merged.githubPublishMode === 'auto' ? 'auto' : 'manual';
+    const validIntervals: GithubPublishInterval[] = ['15m', '30m', '1h', '6h'];
+    merged.githubPublishInterval = validIntervals.includes(
+      merged.githubPublishInterval as GithubPublishInterval
+    )
+      ? merged.githubPublishInterval
+      : '30m';
+    merged.githubPublishRepo =
+      typeof merged.githubPublishRepo === 'string' ? merged.githubPublishRepo.trim() : '';
+    merged.githubPublishBranch =
+      typeof merged.githubPublishBranch === 'string' && merged.githubPublishBranch.trim()
+        ? merged.githubPublishBranch.trim()
+        : 'main';
+    merged.githubPublishPath =
+      typeof merged.githubPublishPath === 'string' && merged.githubPublishPath.trim()
+        ? merged.githubPublishPath.trim()
+        : 'availability.json';
+    merged.githubPublishPublicUrl =
+      typeof merged.githubPublishPublicUrl === 'string' ? merged.githubPublishPublicUrl.trim() : '';
+
     return merged as unknown as AppSettings;
   }
 
   public updateSettings(patch: Partial<AppSettings>): AppSettings {
     const current = this.getSettings();
     const next: AppSettings = { ...current, ...patch };
+
+    if (patch.publicSnippetWeeks !== undefined) {
+      const parsed = Number(patch.publicSnippetWeeks);
+      next.publicSnippetWeeks = Number.isFinite(parsed)
+        ? Math.max(1, Math.min(8, Math.floor(parsed)))
+        : current.publicSnippetWeeks;
+    }
+
+    if (patch.publicSnippetCutoffRules !== undefined) {
+      next.publicSnippetCutoffRules = normalizeCutoffRules(patch.publicSnippetCutoffRules);
+    }
+
+    if (patch.githubPublishMode !== undefined) {
+      next.githubPublishMode = patch.githubPublishMode === 'auto' ? 'auto' : 'manual';
+    }
+
+    if (patch.githubPublishInterval !== undefined) {
+      const validIntervals: GithubPublishInterval[] = ['15m', '30m', '1h', '6h'];
+      next.githubPublishInterval = validIntervals.includes(patch.githubPublishInterval)
+        ? patch.githubPublishInterval
+        : current.githubPublishInterval ?? '30m';
+    }
+
+    if (patch.githubPublishRepo !== undefined) {
+      next.githubPublishRepo = String(patch.githubPublishRepo ?? '').trim();
+    }
+    if (patch.githubPublishBranch !== undefined) {
+      next.githubPublishBranch = String(patch.githubPublishBranch ?? '').trim() || 'main';
+    }
+    if (patch.githubPublishPath !== undefined) {
+      next.githubPublishPath = String(patch.githubPublishPath ?? '').trim() || 'availability.json';
+    }
+    if (patch.githubPublishPublicUrl !== undefined) {
+      next.githubPublishPublicUrl = String(patch.githubPublishPublicUrl ?? '').trim();
+    }
 
     if (Array.isArray(patch.preApprovalTemplates)) {
       const normalized = normalizePreApprovalTemplates(

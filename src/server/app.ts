@@ -4,7 +4,6 @@ import multer from 'multer';
 import os from 'os';
 import path from 'path';
 import {
-  generatePublicAvailability,
   renderPreApprovalMessage,
   selectBestPreApprovalTemplate,
 } from '../shared/generators';
@@ -16,6 +15,7 @@ import {
 import {
   DEFAULT_TIMEZONE,
   addDays,
+  compareWaitlistOrders,
   getMondayOfWeek,
   getTodayDateKey,
 } from '../shared/timezone';
@@ -24,6 +24,7 @@ import type {
   OrderItemLine,
   OrderMergeItemStrategy,
   OrderStatus,
+  OrderTimingType,
   StandingCadence,
   WorkspacePayload,
 } from '../shared/types';
@@ -33,21 +34,30 @@ import {
   restoreCheckpointById,
   undoLastCheckpoint,
 } from './checkpointService';
-import { getRedactedOdooStatus, type RuntimeConfig } from './config';
+import {
+  getRedactedGithubPublishStatus,
+  getRedactedOdooStatus,
+  type RuntimeConfig,
+} from './config';
 import type { DatabaseManager } from './db';
+import { testGithubPublishConnection } from './githubPublisher';
 import {
   getLatestSyncLog,
+  syncOdooCustomers,
   syncOdooQuotations,
   testOdooConnection,
   type FetchLike,
 } from './odooService';
 import {
+  countOdooCustomers,
   getOrderById,
   listAllOrders,
+  listCustomerDirectory,
   listDailySupplyEntries,
   listPickupChannels,
   listTrackedItems,
 } from './repository';
+import { buildSnippetForDatabase, publishSnippetSnapshotToGithub } from './snippetService';
 import { listStandingOrders, materializeStandingOrders } from './standingEngine';
 
 export interface CreateAppOptions {
@@ -153,6 +163,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       weeks,
       settings,
       odooStatus: getRedactedOdooStatus(config),
+      odooCustomersCount: countOdooCustomers(db),
+      githubPublishStatus: getRedactedGithubPublishStatus(config, settings),
       lastSync: getLatestSyncLog(db),
       items,
       channels,
@@ -458,6 +470,12 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       body.estProduced === null || body.estProduced === '' || body.estProduced === undefined
         ? null
         : Number(body.estProduced);
+    const actualEndOfDay =
+      body.actualEndOfDay === null ||
+      body.actualEndOfDay === '' ||
+      body.actualEndOfDay === undefined
+        ? null
+        : Number(body.actualEndOfDay);
     const bufferOverride =
       body.bufferOverride === null || body.bufferOverride === '' || body.bufferOverride === undefined
         ? null
@@ -472,6 +490,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     if (
       (actualOnHand !== null && !Number.isFinite(actualOnHand)) ||
       (estProduced !== null && !Number.isFinite(estProduced)) ||
+      (actualEndOfDay !== null && !Number.isFinite(actualEndOfDay)) ||
       (bufferOverride !== null && !Number.isFinite(bufferOverride)) ||
       !Number.isFinite(extraBuffer)
     ) {
@@ -483,11 +502,12 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
 
     db.prepare(
       `INSERT INTO daily_supply_entries (
-         tracked_item_id, date, actual_on_hand, est_produced, is_cascade_anchor, buffer_override, extra_buffer, notes
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         tracked_item_id, date, actual_on_hand, est_produced, actual_end_of_day, is_cascade_anchor, buffer_override, extra_buffer, notes
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id, date) DO UPDATE SET
          actual_on_hand = excluded.actual_on_hand,
          est_produced = excluded.est_produced,
+         actual_end_of_day = excluded.actual_end_of_day,
          is_cascade_anchor = excluded.is_cascade_anchor,
          buffer_override = excluded.buffer_override,
          extra_buffer = excluded.extra_buffer,
@@ -497,6 +517,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       date,
       actualOnHand,
       estProduced,
+      actualEndOfDay,
       cascadeForward && estProduced !== null ? 1 : 0,
       bufferOverride,
       extraBuffer,
@@ -610,6 +631,40 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     res.status(201).json(getOrderById(db, createdId));
   });
 
+  router.put('/orders/waitlist-order', (req: Request, res: Response) => {
+    const db = dbManager.db;
+    const body = req.body ?? {};
+
+    if (body.reset === true) {
+      db.prepare(`UPDATE orders SET waitlist_sort_order = NULL WHERE status = 'waitlist' OR slotted_date IS NULL`).run();
+      res.json({ ok: true });
+      return;
+    }
+
+    if (!Array.isArray(body.orderIds)) {
+      res.status(400).json({ error: 'orderIds array or reset: true is required' });
+      return;
+    }
+
+    const cleanedIds = Array.from(
+      new Set(
+        body.orderIds
+          .map((v: unknown) => Number(v))
+          .filter((n: number) => Number.isInteger(n) && n > 0)
+      )
+    ) as number[];
+
+    const tx = db.transaction(() => {
+      const updateStmt = db.prepare('UPDATE orders SET waitlist_sort_order = ? WHERE id = ?');
+      cleanedIds.forEach((orderId, index) => {
+        updateStmt.run(index, orderId);
+      });
+    });
+    tx();
+
+    res.json({ ok: true });
+  });
+
   router.put('/orders/:id', (req: Request, res: Response) => {
     const id = parsePositiveId(String(req.params.id));
     if (!id) {
@@ -642,6 +697,19 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
         : typeof body.slottedDate === 'string' && VALID_DATE_RE.test(body.slottedDate)
           ? body.slottedDate
           : existing.slottedDate;
+
+    const nextRequestedDate =
+      body.requestedDate === null || body.requestedDate === ''
+        ? null
+        : typeof body.requestedDate === 'string' && VALID_DATE_RE.test(body.requestedDate)
+          ? body.requestedDate
+          : existing.requestedDate;
+    const nextTimingType: OrderTimingType =
+      body.requestedDate !== undefined
+        ? nextRequestedDate
+          ? 'specific_date'
+          : 'asap'
+        : existing.timingType;
 
     const nextChannelId =
       body.pickupChannelId === null || body.pickupChannelId === ''
@@ -691,6 +759,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
            customer_phone = ?,
            pickup_channel_id = ?,
            status = ?,
+           timing_type = ?,
+           requested_date = ?,
            slotted_date = ?,
            is_locked = ?,
            notes = ?,
@@ -705,6 +775,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
         nextPhone,
         nextChannelId,
         nextStatus,
+        nextTimingType,
+        nextRequestedDate,
         nextStatus === 'waitlist' ? null : nextSlottedDate,
         nextLocked ? 1 : 0,
         nextNotes,
@@ -1238,10 +1310,49 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     res.json({ order: getOrderById(db, target.id), mergedOrderId: source.id });
   });
 
+  // Dismiss a suggested possible-duplicate order pair (symmetrical & persisted in SQLite)
+  router.post('/orders/:id/dismiss-duplicate', (req: Request, res: Response) => {
+    const db = dbManager.db;
+    const orderId = Number(req.params.id);
+    const otherOrderId = Number(req.body?.otherOrderId);
+
+    if (
+      !Number.isInteger(orderId) ||
+      orderId <= 0 ||
+      !Number.isInteger(otherOrderId) ||
+      otherOrderId <= 0
+    ) {
+      res.status(400).json({ error: 'Valid order IDs are required.' });
+      return;
+    }
+    if (orderId === otherOrderId) {
+      res.status(400).json({ error: 'Cannot dismiss an order against itself.' });
+      return;
+    }
+
+    const orderA = getOrderById(db, orderId);
+    const orderB = getOrderById(db, otherOrderId);
+    if (!orderA || !orderB) {
+      res.status(404).json({ error: 'Order not found.' });
+      return;
+    }
+
+    const idA = Math.min(orderId, otherOrderId);
+    const idB = Math.max(orderId, otherOrderId);
+    const nowIso = new Date().toISOString();
+
+    db.prepare(
+      `INSERT OR IGNORE INTO dismissed_duplicate_pairs (order_id_a, order_id_b, dismissed_at)
+       VALUES (?, ?, ?)`
+    ).run(idA, idB, nowIso);
+
+    res.json({ ok: true, orderIdA: idA, orderIdB: idB });
+  });
+
   // Auto-Slot ASAP Orders
   router.post('/orders/auto-slot', (req: Request, res: Response) => {
     const db = dbManager.db;
-    const { today, startDate, endDate } = getHorizon(req.body?.weeks);
+    const { today, startDate, endDate, timezone } = getHorizon(req.body?.weeks);
 
     materializeStandingOrders(db, today, endDate);
 
@@ -1250,9 +1361,9 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     const entries = listDailySupplyEntries(db);
     const allOrders = listAllOrders(db).filter((o) => o.status !== 'ignored');
 
-    const asapQueue = allOrders.filter(
-      (o) => o.status === 'waitlist' && o.timingType === 'asap' && o.items.length > 0
-    );
+    const asapQueue = allOrders
+      .filter((o) => o.status === 'waitlist' && o.timingType === 'asap' && o.items.length > 0)
+      .sort((a, b) => compareWaitlistOrders(a, b, timezone));
 
     if (asapQueue.length === 0) {
       res.json({ slottedCount: 0, skippedCount: 0, placements: [] });
@@ -1474,9 +1585,11 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
 
   // --- Settings ---
   router.get('/settings', (_req: Request, res: Response) => {
+    const settings = dbManager.getSettings();
     res.json({
-      settings: dbManager.getSettings(),
+      settings,
       odooStatus: getRedactedOdooStatus(config),
+      githubPublishStatus: getRedactedGithubPublishStatus(config, settings),
     });
   });
 
@@ -1484,7 +1597,11 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     const patch = (req.body ?? {}) as Partial<AppSettings>;
     const updated = dbManager.updateSettings(patch);
     onSettingsUpdated?.(updated);
-    res.json({ settings: updated, odooStatus: getRedactedOdooStatus(config) });
+    res.json({
+      settings: updated,
+      odooStatus: getRedactedOdooStatus(config),
+      githubPublishStatus: getRedactedGithubPublishStatus(config, updated),
+    });
   });
 
   // --- Odoo 19.3 Integration ---
@@ -1519,25 +1636,116 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     }
   });
 
-  // --- Public Website Availability Snippet ---
+  // --- Customer Directory & Odoo Partner Autocomplete ---
+  router.get('/customers', (req: Request, res: Response) => {
+    const db = dbManager.db;
+    const q = typeof req.query.q === 'string' ? req.query.q : '';
+    const limit = req.query.limit !== undefined ? Number(req.query.limit) : 50;
+    const customers = listCustomerDirectory(db, q, limit);
+    res.json({
+      customers,
+      odooCustomersCount: countOdooCustomers(db),
+      odooConfigured: Boolean(config.odoo),
+    });
+  });
+
+  router.post('/odoo/customers/sync', async (_req: Request, res: Response) => {
+    try {
+      const db = dbManager.db;
+      const result = await syncOdooCustomers({
+        db,
+        odoo: config.odoo,
+        fetchFn,
+      });
+      res.json({
+        ...result,
+        odooCustomersCount: countOdooCustomers(db),
+      });
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Failed to sync Odoo customers',
+      });
+    }
+  });
+
+  // --- Public Website Availability Snippet & GitHub Pages Live Sync ---
   router.get('/snippet', (req: Request, res: Response) => {
-    const settings = dbManager.getSettings();
-    const weeks = Number(req.query.weeks) || settings.publicSnippetWeeks || 3;
-    const ws = buildWorkspace(Math.max(6, weeks + 1));
-    const snippet = generatePublicAvailability({
-      items: ws.items,
-      days: ws.days,
-      channels: ws.channels,
-      today: ws.today,
-      weeks,
-      timezone: ws.settings.timezone,
+    const parsedWeeks = req.query.weeks !== undefined ? Number(req.query.weeks) : undefined;
+    const { snippet } = buildSnippetForDatabase({
+      dbManager,
+      config,
+      weeksOverride: parsedWeeks && Number.isFinite(parsedWeeks) ? parsedWeeks : undefined,
       now: getNow(),
-      headerTitle: ws.settings.publicSnippetHeaderTitle,
-      headerText: ws.settings.publicSnippetHeaderText,
-      footerText: ws.settings.publicSnippetFooterText,
-      autoAdvanceToday: ws.settings.publicSnippetAutoAdvanceToday ?? true,
     });
     res.json(snippet);
+  });
+
+  router.post('/snippet/github/test', async (req: Request, res: Response) => {
+    try {
+      const settings = dbManager.getSettings();
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const repo =
+        typeof body.repo === 'string' && body.repo.trim()
+          ? body.repo.trim()
+          : (settings.githubPublishRepo ?? '').trim() ||
+            (config.githubPublish?.defaultRepo ?? '').trim();
+      const branch =
+        typeof body.branch === 'string' && body.branch.trim()
+          ? body.branch.trim()
+          : (settings.githubPublishBranch ?? '').trim() || 'main';
+      const filePath =
+        typeof body.filePath === 'string' && body.filePath.trim()
+          ? body.filePath.trim()
+          : (settings.githubPublishPath ?? '').trim() || 'availability.json';
+      const customPublicUrl =
+        typeof body.publicUrl === 'string'
+          ? body.publicUrl.trim()
+          : (settings.githubPublishPublicUrl ?? '').trim();
+
+      const result = await testGithubPublishConnection({
+        token: config.githubPublish?.token ?? '',
+        repo,
+        branch,
+        filePath,
+        customPublicUrl,
+        fetchFn: fetchFn as typeof fetch | undefined,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({
+        ok: false,
+        message: err instanceof Error ? err.message : 'GitHub connection test failed',
+        publicUrl: null,
+      });
+    }
+  });
+
+  router.post('/snippet/github/publish', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const force = body.force === undefined ? true : Boolean(body.force);
+      const overrides = {
+        repo: typeof body.repo === 'string' ? body.repo : undefined,
+        branch: typeof body.branch === 'string' ? body.branch : undefined,
+        filePath: typeof body.filePath === 'string' ? body.filePath : undefined,
+        customPublicUrl: typeof body.publicUrl === 'string' ? body.publicUrl : undefined,
+      };
+      const result = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force,
+        overrides,
+        now: getNow(),
+        fetchFn: fetchFn as typeof fetch | undefined,
+      });
+      res.json(result);
+    } catch (err) {
+      const settings = dbManager.getSettings();
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Failed to publish availability to GitHub',
+        githubPublishStatus: getRedactedGithubPublishStatus(config, settings),
+      });
+    }
   });
 
   // --- Undo & Checkpoints ---

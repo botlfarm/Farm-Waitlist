@@ -1,5 +1,9 @@
-import { Fragment } from 'react';
-import { parseSafeRichMessageSegments } from '../shared/generators';
+import { Fragment, type ClipboardEvent } from 'react';
+import {
+  parseSafeRichMessageSegments,
+  renderMessageToPlainText,
+  renderMessageToSafeHtml,
+} from '../shared/generators';
 
 interface RichMessagePreviewProps {
   text: string;
@@ -14,9 +18,40 @@ interface RichMessagePreviewProps {
 export function RichMessagePreview({ text, testId }: RichMessagePreviewProps) {
   const segments = parseSafeRichMessageSegments(text);
 
+  const handleCopy = (event: ClipboardEvent<HTMLDivElement>) => {
+    if (!event.clipboardData) return;
+    const selection = typeof window !== 'undefined' ? window.getSelection() : null;
+    const selectedText = selection?.toString() ?? '';
+    if (!selectedText) return;
+
+    event.preventDefault();
+    const fullPlain = renderMessageToPlainText(text).trim();
+    if (selectedText.trim() === fullPlain) {
+      event.clipboardData.setData('text/html', renderMessageToSafeHtml(text));
+      event.clipboardData.setData('text/plain', renderMessageToPlainText(text));
+      return;
+    }
+
+    // For partial selections inside the dark preview box, clone the selection fragment
+    // and strip Tailwind classes / inline styles so pasted text has no dark background.
+    if (selection && selection.rangeCount > 0) {
+      const wrapper = document.createElement('div');
+      wrapper.appendChild(selection.getRangeAt(0).cloneContents());
+      wrapper.querySelectorAll('*').forEach((el) => {
+        el.removeAttribute('class');
+        el.removeAttribute('style');
+      });
+      event.clipboardData.setData('text/html', `<div>${wrapper.innerHTML}</div>`);
+      event.clipboardData.setData('text/plain', selectedText);
+    } else {
+      event.clipboardData.setData('text/plain', selectedText);
+    }
+  };
+
   return (
     <div
       data-testid={testId}
+      onCopy={handleCopy}
       className="rounded-md border border-[#283340] bg-[#0B1117] px-3.5 py-3 text-sm leading-relaxed text-[#E6EDF3]"
     >
       {segments.length === 0 ? (

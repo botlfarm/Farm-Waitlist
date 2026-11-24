@@ -2,10 +2,13 @@ import { Check, Copy, Lock, Search } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { copyTextToClipboard } from '../lib/api';
 import {
+  DEFAULT_TIMEZONE,
   addDays,
+  compareWaitlistOrders,
   formatFullDisplayDate,
   formatShortCalendarDate,
   getMondayOfWeek,
+  getOrderArrivalInfo,
 } from '../shared/timezone';
 import type { OrderRecord, OrderStatus, PickupChannel, TrackedItem } from '../shared/types';
 
@@ -13,6 +16,7 @@ type DateScope = 'upcoming' | 'week' | 'all' | 'unslotted';
 
 interface OrderListViewProps {
   today: string;
+  timezone?: string;
   orders: OrderRecord[];
   items: TrackedItem[];
   channels: PickupChannel[];
@@ -50,6 +54,7 @@ function getStatusClasses(status: OrderStatus): string {
 
 export function OrderListView({
   today,
+  timezone = DEFAULT_TIMEZONE,
   orders,
   items,
   channels,
@@ -134,15 +139,10 @@ export function OrderListView({
       if (a.slottedDate && !b.slottedDate) return -1;
       if (!a.slottedDate && b.slottedDate) return 1;
 
-      // Both unslotted: requestedDate ascending, then ASAP / createdAt
-      if (a.requestedDate && b.requestedDate && a.requestedDate !== b.requestedDate) {
-        return a.requestedDate.localeCompare(b.requestedDate);
-      }
-      if (a.requestedDate && !b.requestedDate) return -1;
-      if (!a.requestedDate && b.requestedDate) return 1;
-      return a.createdAt.localeCompare(b.createdAt);
+      // Both unslotted: follow waitlist priority order & arrival date (oldest first)
+      return compareWaitlistOrders(a, b, timezone);
     });
-  }, [orders, statusFilter, channelFilter, scope, today, weekStart, weekEnd, searchQuery, channelById]);
+  }, [orders, statusFilter, channelFilter, scope, today, timezone, weekStart, weekEnd, searchQuery, channelById]);
 
   const totalsByItem = useMemo(() => {
     const totals = new Map<number, number>();
@@ -431,29 +431,45 @@ export function OrderListView({
                     >
                       <td className="px-4 py-3 whitespace-nowrap align-middle">
                         {order.slottedDate ? (
-                          <div className="flex items-center gap-2">
-                            <span className="font-medium text-[#F0F6FC] tabular-nums">
-                              {formatFullDisplayDate(order.slottedDate)}
-                            </span>
-                            {isToday && (
-                              <span className="rounded bg-[#0EA5E9]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#38BDF8]">
-                                Today
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-medium text-[#F0F6FC] tabular-nums">
+                                {formatFullDisplayDate(order.slottedDate)}
                               </span>
-                            )}
-                            {isOverdue && (
-                              <span className="rounded bg-[#DC2626]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#F87171]">
-                                Overdue
-                              </span>
+                              {isToday && (
+                                <span className="rounded bg-[#0EA5E9]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#38BDF8]">
+                                  Today
+                                </span>
+                              )}
+                              {isOverdue && (
+                                <span className="rounded bg-[#DC2626]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#F87171]">
+                                  Overdue
+                                </span>
+                              )}
+                            </div>
+                            {order.requestedDate && order.requestedDate !== order.slottedDate && (
+                              <div className="mt-0.5 text-[11px] font-medium text-[#FBBF24]">
+                                Requested {formatShortCalendarDate(order.requestedDate)}
+                              </div>
                             )}
                           </div>
                         ) : (
-                          <div className="text-[#8B949E]">
-                            <span className="font-medium text-[#C9D1D9]">Unslotted</span>
-                            <span className="ml-1.5 text-[11px]">
-                              {order.requestedDate
-                                ? `Req ${formatShortCalendarDate(order.requestedDate)}`
-                                : 'ASAP'}
-                            </span>
+                          <div>
+                            <div className="flex items-center gap-1.5 text-[#C9D1D9]">
+                              <span className="font-semibold text-[#F0F6FC]">
+                                Arrived {getOrderArrivalInfo(order, timezone, today).shortLabel}
+                              </span>
+                              {!order.requestedDate && (
+                                <span className="text-[11px] text-[#8B949E]">· ASAP</span>
+                              )}
+                            </div>
+                            {order.requestedDate ? (
+                              <div className="mt-0.5 text-[11px] font-semibold text-[#FBBF24]">
+                                Requested Pickup: {formatShortCalendarDate(order.requestedDate)}
+                              </div>
+                            ) : (
+                              <div className="text-[10px] text-[#8B949E]">Unslotted waitlist</div>
+                            )}
                           </div>
                         )}
                       </td>
@@ -576,9 +592,11 @@ export function OrderListView({
                         <span>
                           {order.slottedDate
                             ? formatFullDisplayDate(order.slottedDate)
-                            : order.requestedDate
-                            ? `Unslotted · Req ${formatShortCalendarDate(order.requestedDate)}`
-                            : 'Unslotted · ASAP'}
+                            : `Arrived ${getOrderArrivalInfo(order, timezone, today).shortLabel} · ${
+                                order.requestedDate
+                                  ? `Req ${formatShortCalendarDate(order.requestedDate)}`
+                                  : 'ASAP'
+                              }`}
                         </span>
                         {isToday && (
                           <span className="rounded bg-[#0EA5E9]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#38BDF8]">
@@ -591,6 +609,11 @@ export function OrderListView({
                           </span>
                         )}
                       </div>
+                      {order.requestedDate && (
+                        <p className="mt-0.5 text-[11px] font-semibold text-[#FBBF24]">
+                          Requested Pickup: {formatShortCalendarDate(order.requestedDate)}
+                        </p>
+                      )}
                       <p className="mt-1 text-sm font-semibold text-[#F0F6FC]">
                         {order.customerName}
                       </p>

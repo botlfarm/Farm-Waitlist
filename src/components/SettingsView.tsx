@@ -1504,50 +1504,31 @@ export function SettingsView({
           {/* Thresholds & Save Bar */}
           <section className="rounded-lg border border-[#283340] bg-[#161D24] p-5">
             <h2 className="font-['Plus_Jakarta_Sans'] text-base font-bold text-[#F0F6FC]">
-              Hold Timer &amp; Public Snippet Defaults
+              Hold Timer Threshold
             </h2>
-            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <label htmlFor="hold-hours" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
-                  Aging Hold Warning Threshold (Hours)
-                </label>
-                <input
-                  id="hold-hours"
-                  data-testid="settings-hold-hours-input"
-                  type="number"
-                  min="1"
-                  max="336"
-                  value={draftSettings.holdThresholdHours}
-                  onChange={(e) =>
-                    setDraftSettings({
-                      ...draftSettings,
-                      holdThresholdHours: Math.max(1, Number(e.target.value) || 48),
-                    })
-                  }
-                  className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 font-mono text-sm tabular-nums text-[#F0F6FC]"
-                />
-              </div>
-
-              <div>
-                <label htmlFor="snippet-weeks" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
-                  Public Availability Snippet Horizon (Weeks)
-                </label>
-                <input
-                  id="snippet-weeks"
-                  data-testid="settings-snippet-weeks-input"
-                  type="number"
-                  min="1"
-                  max="8"
-                  value={draftSettings.publicSnippetWeeks}
-                  onChange={(e) =>
-                    setDraftSettings({
-                      ...draftSettings,
-                      publicSnippetWeeks: Math.max(1, Math.min(8, Number(e.target.value) || 3)),
-                    })
-                  }
-                  className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 font-mono text-sm tabular-nums text-[#F0F6FC]"
-                />
-              </div>
+            <p className="mt-1 text-xs text-[#8B949E]">
+              Public calendar weeks ahead, ordering cutoffs, paused messages, and live GitHub
+              publishing are configured on the <span className="text-[#C9D1D9]">Availability Snippet</span> tab.
+            </p>
+            <div className="mt-4 max-w-sm">
+              <label htmlFor="hold-hours" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
+                Aging Hold Warning Threshold (Hours)
+              </label>
+              <input
+                id="hold-hours"
+                data-testid="settings-hold-hours-input"
+                type="number"
+                min="1"
+                max="336"
+                value={draftSettings.holdThresholdHours}
+                onChange={(e) =>
+                  setDraftSettings({
+                    ...draftSettings,
+                    holdThresholdHours: Math.max(1, Number(e.target.value) || 48),
+                  })
+                }
+                className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 font-mono text-sm tabular-nums text-[#F0F6FC]"
+              />
             </div>
 
             <div className="mt-4 flex justify-end">
