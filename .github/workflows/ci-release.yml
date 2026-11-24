@@ -63,20 +63,23 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Auto-bump version (if already released) & update changelogs
+        run: |
+          node scripts/release-changelog.mjs --auto-bump --notes-out /tmp/release-notes.md
+
       - name: Read add-on version from config.yaml
         id: version
         run: |
           VERSION=$(grep '^version:' farm-waitlist/config.yaml | sed -E 's/version:[[:space:]]*"?([^"]+)"?/\1/')
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Promote UNRELEASED.md into CHANGELOG.md & farm-waitlist/CHANGELOG.md
+      - name: Commit bumped version and changelogs
         run: |
-          node scripts/release-changelog.mjs --notes-out /tmp/release-notes.md
-          if ! git diff --quiet CHANGELOG.md farm-waitlist/CHANGELOG.md UNRELEASED.md package.json; then
+          if ! git diff --quiet farm-waitlist/config.yaml CHANGELOG.md farm-waitlist/CHANGELOG.md UNRELEASED.md package.json; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add CHANGELOG.md farm-waitlist/CHANGELOG.md UNRELEASED.md package.json
-            git commit -m "chore(release): update changelog for v${{ steps.version.outputs.value }} [skip ci]"
+            git add farm-waitlist/config.yaml CHANGELOG.md farm-waitlist/CHANGELOG.md UNRELEASED.md package.json
+            git commit -m "chore(release): v${{ steps.version.outputs.value }} [skip ci]"
             git push
           fi
 

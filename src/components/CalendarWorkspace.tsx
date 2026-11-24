@@ -17,7 +17,15 @@ import {
   Sparkles,
   X,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+} from 'react';
 import { formatQty } from '../shared/generators';
 import {
   channelHasScheduleRestriction,
@@ -110,11 +118,11 @@ export function computeDragAutoScrollStep(
 
   if (pointerY < minEdge + effectiveZone) {
     const ratio = Math.min(1, Math.max(0, (minEdge + effectiveZone - pointerY) / effectiveZone));
-    return -Math.round(4 + ratio * ratio * 18);
+    return -Math.max(1, Math.round(1 + ratio * ratio * 18));
   }
   if (pointerY > maxEdge - effectiveZone) {
     const ratio = Math.min(1, Math.max(0, (pointerY - (maxEdge - effectiveZone)) / effectiveZone));
-    return Math.round(4 + ratio * ratio * 18);
+    return Math.max(1, Math.round(1 + ratio * ratio * 18));
   }
   return 0;
 }
@@ -152,11 +160,21 @@ export function CalendarWorkspace({
   const [draggingQueueOrderId, setDraggingQueueOrderId] = useState<number | null>(null);
   const [dragPreviewQueueIds, setDragPreviewQueueIds] = useState<number[] | null>(null);
   const [optimisticQueueIds, setOptimisticQueueIds] = useState<number[] | null>(null);
+  const [pendingDrop, setPendingDrop] = useState<{ orderId: number; targetDate: string } | null>(
+    null
+  );
   const queueScrollRef = useRef<HTMLDivElement | null>(null);
   const calendarScrollRef = useRef<HTMLDivElement | null>(null);
+  const queueCardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const queueCardAnimsRef = useRef<Map<number, Animation>>(new Map());
+  const queueFlipSnapshotRef = useRef<Map<number, number> | null>(null);
+  const lastQueueSwapRef = useRef<{ targetId: number; at: number } | null>(null);
+  const dragLeaveTimerRef = useRef<number | null>(null);
   const isDraggingRef = useRef(false);
   const dragPointerRef = useRef<{ x: number; y: number } | null>(null);
   const autoScrollRafRef = useRef<number | null>(null);
+  const lastAutoScrollTsRef = useRef<number | null>(null);
+  const autoScrollRemainderRef = useRef<number>(0);
 
   const activeItems = useMemo(
     () => workspace.items.filter((i) => i.isActive),
@@ -176,21 +194,35 @@ export function CalendarWorkspace({
   const ordersByDate = useMemo(() => {
     const map = new Map<string, OrderRecord[]>();
     for (const order of workspace.orders) {
+      if (pendingDrop && order.id === pendingDrop.orderId) {
+        const list = map.get(pendingDrop.targetDate) ?? [];
+        list.push({
+          ...order,
+          slottedDate: pendingDrop.targetDate,
+          status: order.status === 'waitlist' ? 'slotted' : order.status,
+        });
+        map.set(pendingDrop.targetDate, list);
+        continue;
+      }
       if (!order.slottedDate || order.status === 'waitlist') continue;
       const list = map.get(order.slottedDate) ?? [];
       list.push(order);
       map.set(order.slottedDate, list);
     }
     return map;
-  }, [workspace.orders]);
+  }, [workspace.orders, pendingDrop]);
 
   useEffect(() => {
     setOptimisticQueueIds(null);
+    setPendingDrop(null);
   }, [workspace.orders]);
 
   const baseUnslottedOrders = useMemo(() => {
     const base = workspace.orders
-      .filter((o) => o.status === 'waitlist' || !o.slottedDate)
+      .filter((o) => {
+        if (pendingDrop && o.id === pendingDrop.orderId) return false;
+        return o.status === 'waitlist' || !o.slottedDate;
+      })
       .sort((a, b) => compareWaitlistOrders(a, b, workspace.settings.timezone));
 
     if (!optimisticQueueIds) return base;
@@ -201,7 +233,7 @@ export function CalendarWorkspace({
       if (ra !== rb) return ra - rb;
       return compareWaitlistOrders(a, b, workspace.settings.timezone);
     });
-  }, [workspace.orders, workspace.settings.timezone, optimisticQueueIds]);
+  }, [workspace.orders, workspace.settings.timezone, optimisticQueueIds, pendingDrop]);
 
   const unslottedOrders = useMemo(() => {
     if (!dragPreviewQueueIds) return baseUnslottedOrders;
@@ -213,6 +245,83 @@ export function CalendarWorkspace({
       return compareWaitlistOrders(a, b, workspace.settings.timezone);
     });
   }, [baseUnslottedOrders, dragPreviewQueueIds]);
+
+  const snapshotQueueCardPositions = useCallback(() => {
+    const container = queueScrollRef.current;
+    if (!container) return;
+    const containerRect = container.getBoundingClientRect();
+    const positions = new Map<number, number>();
+    for (const [id, el] of queueCardRefs.current.entries()) {
+      const rect = el.getBoundingClientRect();
+      if (rect.height > 0) {
+        positions.set(id, rect.top - containerRect.top + container.scrollTop);
+      }
+    }
+    if (positions.size > 0) {
+      queueFlipSnapshotRef.current = positions;
+    }
+  }, []);
+
+  const unslottedOrderKey = useMemo(
+    () => unslottedOrders.map((o) => o.id).join(','),
+    [unslottedOrders]
+  );
+
+  // FLIP glide animation so waitlist cards smoothly slide past each other on reorder
+  useLayoutEffect(() => {
+    const prevPositions = queueFlipSnapshotRef.current;
+    if (!prevPositions) return;
+    queueFlipSnapshotRef.current = null;
+
+    if (
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    ) {
+      return;
+    }
+
+    const container = queueScrollRef.current;
+    if (!container) return;
+    const containerRect = container.getBoundingClientRect();
+
+    for (const [id, el] of queueCardRefs.current.entries()) {
+      const prevTop = prevPositions.get(id);
+      if (prevTop === undefined) continue;
+
+      const existingAnim = queueCardAnimsRef.current.get(id);
+      if (existingAnim) {
+        existingAnim.cancel();
+        queueCardAnimsRef.current.delete(id);
+      }
+
+      const rect = el.getBoundingClientRect();
+      if (rect.height <= 0) continue;
+      const nextTop = rect.top - containerRect.top + container.scrollTop;
+      const deltaY = prevTop - nextTop;
+
+      if (Math.abs(deltaY) >= 1 && typeof el.animate === 'function') {
+        const anim = el.animate(
+          [
+            { transform: `translate3d(0, ${deltaY}px, 0)` },
+            { transform: 'translate3d(0, 0, 0)' },
+          ],
+          {
+            duration: 240,
+            easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+          }
+        );
+        queueCardAnimsRef.current.set(id, anim);
+        const clearIfCurrent = () => {
+          if (queueCardAnimsRef.current.get(id) === anim) {
+            queueCardAnimsRef.current.delete(id);
+          }
+        };
+        anim.onfinish = clearIfCurrent;
+        anim.oncancel = clearIfCurrent;
+      }
+    }
+  }, [unslottedOrderKey]);
 
   const hasCustomWaitlistOrder = useMemo(
     () =>
@@ -252,20 +361,38 @@ export function CalendarWorkspace({
     [draggingOrderId, workspace.orders]
   );
 
+  const pendingDropOrder = useMemo(
+    () =>
+      pendingDrop !== null
+        ? workspace.orders.find((o) => o.id === pendingDrop.orderId) ?? null
+        : null,
+    [pendingDrop, workspace.orders]
+  );
+
   const baseDaysByDate = useMemo(
     () => new Map(workspace.days.map((d) => [d.date, d])),
     [workspace.days]
   );
 
   const displayDays = useMemo(() => {
-    if (!draggedOrder || !dragOverDate) return workspace.days;
-    return previewOrderMoveProjections(
-      workspace.days,
-      workspace.items,
-      draggedOrder,
-      dragOverDate
-    );
-  }, [workspace.days, workspace.items, draggedOrder, dragOverDate]);
+    if (draggedOrder && dragOverDate) {
+      return previewOrderMoveProjections(
+        workspace.days,
+        workspace.items,
+        draggedOrder,
+        dragOverDate
+      );
+    }
+    if (pendingDropOrder && pendingDrop) {
+      return previewOrderMoveProjections(
+        workspace.days,
+        workspace.items,
+        pendingDropOrder,
+        pendingDrop.targetDate
+      );
+    }
+    return workspace.days;
+  }, [workspace.days, workspace.items, draggedOrder, dragOverDate, pendingDropOrder, pendingDrop]);
 
   // Group displayed days (with live hover preview when dragging over a date) into Mon–Sun week rows
   const weekRows = useMemo(() => {
@@ -297,25 +424,66 @@ export function CalendarWorkspace({
       .join(' · ');
   };
 
+  const clearPendingDragLeave = useCallback(() => {
+    if (dragLeaveTimerRef.current !== null && typeof window !== 'undefined') {
+      window.clearTimeout(dragLeaveTimerRef.current);
+      dragLeaveTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleDragLeaveClear = useCallback(
+    (date: string) => {
+      clearPendingDragLeave();
+      if (typeof window === 'undefined') {
+        setDragOverDate((cur) => (cur === date ? null : cur));
+        return;
+      }
+      // Small debounce prevents 1-frame flicker when crossing cell borders between days
+      dragLeaveTimerRef.current = window.setTimeout(() => {
+        dragLeaveTimerRef.current = null;
+        setDragOverDate((cur) => (cur === date ? null : cur));
+      }, 45);
+    },
+    [clearPendingDragLeave]
+  );
+
   const stopDragAutoScroll = useCallback(() => {
     isDraggingRef.current = false;
     dragPointerRef.current = null;
+    lastAutoScrollTsRef.current = null;
+    autoScrollRemainderRef.current = 0;
     if (autoScrollRafRef.current !== null && typeof window !== 'undefined') {
       window.cancelAnimationFrame(autoScrollRafRef.current);
       autoScrollRafRef.current = null;
     }
   }, []);
 
-  const performAutoScrollTick = useCallback(() => {
+  const performAutoScrollTick = useCallback((now: number) => {
     if (!isDraggingRef.current || typeof window === 'undefined') {
       autoScrollRafRef.current = null;
       return;
     }
 
+    const prevTs = lastAutoScrollTsRef.current ?? now;
+    lastAutoScrollTsRef.current = now;
+    // Normalize scroll step to 60fps so 120Hz/144Hz monitors glide smoothly instead of lurching
+    const frameScale = Math.min(2, Math.max(0.25, (now - prevTs) / 16.667));
+
     const pointer = dragPointerRef.current;
     if (pointer) {
       let scrolledContainer = false;
       let pointerOverQueue = false;
+
+      const scaleStep = (rawStep: number): number => {
+        if (rawStep === 0) {
+          autoScrollRemainderRef.current = 0;
+          return 0;
+        }
+        const scaled = rawStep * frameScale + autoScrollRemainderRef.current;
+        const whole = scaled > 0 ? Math.floor(scaled) : Math.ceil(scaled);
+        autoScrollRemainderRef.current = scaled - whole;
+        return whole;
+      };
 
       // 1. Auto-scroll the Unslotted Waitlist list when dragging near its top/bottom edges
       const queueEl = queueScrollRef.current;
@@ -329,7 +497,8 @@ export function CalendarWorkspace({
         if (withinHorizontal && withinVertical) {
           pointerOverQueue = true;
           if (queueEl.scrollHeight > queueEl.clientHeight + 2) {
-            const step = computeDragAutoScrollStep(pointer.y, rect.top, rect.bottom, 88);
+            const rawStep = computeDragAutoScrollStep(pointer.y, rect.top, rect.bottom, 88);
+            const step = scaleStep(rawStep);
             if (step !== 0) {
               const before = queueEl.scrollTop;
               const maxScroll = Math.max(0, queueEl.scrollHeight - queueEl.clientHeight);
@@ -351,7 +520,8 @@ export function CalendarWorkspace({
           const withinHorizontal =
             rect.width > 0 && pointer.x >= rect.left - 16 && pointer.x <= rect.right + 16;
           if (withinHorizontal && rect.height > 0) {
-            const step = computeDragAutoScrollStep(pointer.y, rect.top, rect.bottom, 96);
+            const rawStep = computeDragAutoScrollStep(pointer.y, rect.top, rect.bottom, 96);
+            const step = scaleStep(rawStep);
             if (step !== 0) {
               const before = calEl.scrollTop;
               const maxScroll = Math.max(0, calEl.scrollHeight - calEl.clientHeight);
@@ -364,7 +534,8 @@ export function CalendarWorkspace({
         }
 
         if (!scrolledContainer && window.innerHeight > 0) {
-          const winStep = computeDragAutoScrollStep(pointer.y, 0, window.innerHeight, 108);
+          const rawWinStep = computeDragAutoScrollStep(pointer.y, 0, window.innerHeight, 108);
+          const winStep = scaleStep(rawWinStep);
           if (winStep !== 0) {
             window.scrollBy(0, winStep);
           }
@@ -378,6 +549,8 @@ export function CalendarWorkspace({
   const startDragAutoScroll = useCallback(
     (initialX?: number, initialY?: number) => {
       isDraggingRef.current = true;
+      lastAutoScrollTsRef.current = null;
+      autoScrollRemainderRef.current = 0;
       if (
         typeof initialX === 'number' &&
         typeof initialY === 'number' &&
@@ -406,6 +579,7 @@ export function CalendarWorkspace({
     };
     const handleWindowDragStop = () => {
       stopDragAutoScroll();
+      clearPendingDragLeave();
     };
     window.addEventListener('dragover', handleWindowDragOver, true);
     window.addEventListener('dragend', handleWindowDragStop, true);
@@ -415,12 +589,15 @@ export function CalendarWorkspace({
       window.removeEventListener('dragend', handleWindowDragStop, true);
       window.removeEventListener('drop', handleWindowDragStop, true);
       stopDragAutoScroll();
+      clearPendingDragLeave();
     };
-  }, [stopDragAutoScroll, updateDragPointer]);
+  }, [stopDragAutoScroll, clearPendingDragLeave, updateDragPointer]);
 
   const handleDragStart = (e: DragEvent, orderId: number, fromQueue = false) => {
     e.dataTransfer.setData('text/plain', String(orderId));
     e.dataTransfer.effectAllowed = 'move';
+    clearPendingDragLeave();
+    lastQueueSwapRef.current = null;
     setDraggingOrderId(orderId);
     if (fromQueue) {
       setDraggingQueueOrderId(orderId);
@@ -431,6 +608,11 @@ export function CalendarWorkspace({
 
   const handleDragEnd = () => {
     stopDragAutoScroll();
+    clearPendingDragLeave();
+    lastQueueSwapRef.current = null;
+    if (dragPreviewQueueIds !== null) {
+      snapshotQueueCardPositions();
+    }
     setDraggingOrderId(null);
     setDraggingQueueOrderId(null);
     setDragPreviewQueueIds(null);
@@ -452,6 +634,7 @@ export function CalendarWorkspace({
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = 'move';
+    clearPendingDragLeave();
     updateDragPointer(e.clientX, e.clientY);
     if (dragOverDate !== null) {
       setDragOverDate(null);
@@ -467,17 +650,38 @@ export function CalendarWorkspace({
       return;
     }
 
-    // Hysteresis deadband prevents flicker when adjacent waitlist cards have different heights
-    const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.height > 0 && e.clientY > 0) {
-      if (fromIdx < toIdx && e.clientY < rect.top + rect.height * 0.35) {
+    // Prevent ping-pong reversal against the exact card currently sliding out of the way
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const lastSwap = lastQueueSwapRef.current;
+    if (lastSwap && lastSwap.targetId === targetOrderId && now - lastSwap.at < 210) {
+      return;
+    }
+
+    // Evaluate deadband against the card's untransformed resting slot so FLIP glides never cause jitter
+    const cardEl = e.currentTarget;
+    const scrollEl = queueScrollRef.current;
+    const rect = cardEl.getBoundingClientRect();
+    let cardTop = rect.top;
+    let cardHeight = rect.height;
+    if (scrollEl && cardEl.offsetHeight > 0) {
+      const containerRect = scrollEl.getBoundingClientRect();
+      if (containerRect.height > 0) {
+        cardTop = containerRect.top + (cardEl.offsetTop - scrollEl.scrollTop);
+        cardHeight = cardEl.offsetHeight;
+      }
+    }
+
+    if (cardHeight > 0 && e.clientY > 0) {
+      if (fromIdx < toIdx && e.clientY < cardTop + cardHeight * 0.35) {
         return;
       }
-      if (fromIdx > toIdx && e.clientY > rect.top + rect.height * 0.65) {
+      if (fromIdx > toIdx && e.clientY > cardTop + cardHeight * 0.65) {
         return;
       }
     }
 
+    snapshotQueueCardPositions();
+    lastQueueSwapRef.current = { targetId: targetOrderId, at: now };
     const nextIds = [...currentIds];
     const [moved] = nextIds.splice(fromIdx, 1);
     nextIds.splice(toIdx, 0, moved);
@@ -488,6 +692,8 @@ export function CalendarWorkspace({
     e.preventDefault();
     e.stopPropagation();
     stopDragAutoScroll();
+    clearPendingDragLeave();
+    lastQueueSwapRef.current = null;
     const rawId = e.dataTransfer?.getData('text/plain');
     const draggedId =
       draggingQueueOrderId ?? (rawId && Number.isInteger(Number(rawId)) ? Number(rawId) : null);
@@ -500,6 +706,7 @@ export function CalendarWorkspace({
       const fromIdx = baselineIds.indexOf(draggedId);
       const toIdx = baselineIds.indexOf(targetOrderId);
       if (fromIdx >= 0 && toIdx >= 0) {
+        snapshotQueueCardPositions();
         const nextIds = [...baselineIds];
         const [moved] = nextIds.splice(fromIdx, 1);
         nextIds.splice(toIdx, 0, moved);
@@ -526,6 +733,7 @@ export function CalendarWorkspace({
     const idx = currentIds.indexOf(orderId);
     const nextIdx = idx + direction;
     if (idx < 0 || nextIdx < 0 || nextIdx >= currentIds.length) return;
+    snapshotQueueCardPositions();
     const nextIds = [...currentIds];
     const [moved] = nextIds.splice(idx, 1);
     nextIds.splice(nextIdx, 0, moved);
@@ -535,14 +743,22 @@ export function CalendarWorkspace({
   const handleDrop = async (e: DragEvent, date: string) => {
     e.preventDefault();
     stopDragAutoScroll();
+    clearPendingDragLeave();
+    lastQueueSwapRef.current = null;
+    const rawId = e.dataTransfer.getData('text/plain');
+    const orderId = Number(rawId);
     setDragOverDate(null);
     setDraggingOrderId(null);
     setDraggingQueueOrderId(null);
     setDragPreviewQueueIds(null);
-    const rawId = e.dataTransfer.getData('text/plain');
-    const orderId = Number(rawId);
     if (Number.isInteger(orderId) && orderId > 0) {
-      await onDropOrderOnDate(orderId, date);
+      // Hold optimistic placement & projected quantities while the slot request settles (zero snap-back)
+      setPendingDrop({ orderId, targetDate: date });
+      try {
+        await onDropOrderOnDate(orderId, date);
+      } finally {
+        setPendingDrop(null);
+      }
     }
   };
 
@@ -986,8 +1202,10 @@ export function CalendarWorkspace({
                           onDragOver={(e) => {
                             e.preventDefault();
                             e.dataTransfer.dropEffect = 'move';
+                            clearPendingDragLeave();
                             updateDragPointer(e.clientX, e.clientY);
                             if (dragPreviewQueueIds !== null) {
+                              snapshotQueueCardPositions();
                               setDragPreviewQueueIds(null);
                             }
                             if (dragOverDate !== day.date) setDragOverDate(day.date);
@@ -997,10 +1215,12 @@ export function CalendarWorkspace({
                             if (nextTarget && e.currentTarget.contains(nextTarget)) {
                               return;
                             }
-                            if (dragOverDate === day.date) setDragOverDate(null);
+                            if (dragOverDate === day.date) {
+                              scheduleDragLeaveClear(day.date);
+                            }
                           }}
                           onDrop={(e) => void handleDrop(e, day.date)}
-                          className={`flex flex-col transition-colors md:min-h-[172px] ${
+                          className={`flex flex-col transition-[background-color,box-shadow,opacity] duration-200 ease-out md:min-h-[172px] ${
                             isDragTarget
                               ? 'bg-[#0EA5E9]/15 ring-1 ring-inset ring-[#38BDF8]'
                               : day.isToday
@@ -1072,7 +1292,7 @@ export function CalendarWorkspace({
                               <div
                                 data-testid={`day-metrics-${day.date}`}
                                 data-preview-impacted={focusedPreviewChanged ? 'true' : undefined}
-                                className={`mt-1.5 rounded-md border px-2 py-1.5 tabular-nums transition-colors ${focusedStyle.bg} ${
+                                className={`mt-1.5 rounded-md border px-2 py-1.5 tabular-nums transition-[background-color,border-color,box-shadow] duration-200 ease-out ${focusedStyle.bg} ${
                                   focusedPreviewChanged
                                     ? 'border-[#38BDF8]/70 ring-1 ring-[#38BDF8]/40'
                                     : 'border-white/5'
@@ -1080,7 +1300,7 @@ export function CalendarWorkspace({
                               >
                                 {/* Primary Hero Metric: Can Sell / Short */}
                                 <div
-                                  className={`flex flex-wrap items-baseline justify-between gap-x-1.5 ${focusedStyle.text}`}
+                                  className={`flex flex-wrap items-baseline justify-between gap-x-1.5 transition-colors duration-200 ease-out ${focusedStyle.text}`}
                                 >
                                   <span className="whitespace-nowrap font-sans text-[10px] font-semibold uppercase tracking-wide opacity-90">
                                     {focusedProj.endingBalance < 0 ? 'Short' : 'Can Sell'}
@@ -1095,7 +1315,7 @@ export function CalendarWorkspace({
                                     {focusedDisplayDelta !== 0 && (
                                       <span
                                         data-testid={`day-preview-delta-${day.date}`}
-                                        className={`ml-1 rounded px-1 py-0.2 font-mono text-[10px] font-semibold ${
+                                        className={`fw-preview-delta ml-1 rounded px-1 py-0.2 font-mono text-[10px] font-semibold ${
                                           focusedDisplayDelta > 0
                                             ? 'bg-[#16A34A]/25 text-[#4ADE80]'
                                             : 'bg-[#0EA5E9]/25 text-[#7DD3FC]'
@@ -1249,7 +1469,7 @@ export function CalendarWorkspace({
                                   return (
                                     <div
                                       key={item.id}
-                                      className={`flex items-center justify-between gap-1 ${
+                                      className={`flex items-center justify-between gap-1 transition-[background-color,box-shadow] duration-200 ease-out ${
                                         itemPreviewChanged
                                           ? '-mx-1 rounded bg-[#0EA5E9]/12 px-1 py-0.5 ring-1 ring-[#38BDF8]/40'
                                           : ''
@@ -1281,30 +1501,34 @@ export function CalendarWorkspace({
                               </p>
                             )}
                             {showPreviewChipHere && draggedOrder && (
-                              <div
-                                data-testid="drag-preview-chip"
-                                className={`pointer-events-none rounded border border-dashed px-2.5 py-2 md:px-2 md:py-1.5 ${
-                                  previewOffSchedule
-                                    ? 'border-[#FBBF24] bg-[#D97706]/15'
-                                    : 'border-[#38BDF8] bg-[#0EA5E9]/15'
-                                }`}
-                              >
-                                <div className="flex items-center justify-between gap-1">
-                                  <span className="truncate text-xs font-semibold text-[#F0F6FC]">
-                                    {draggedOrder.customerName}
-                                  </span>
-                                  <span
-                                    className={`shrink-0 rounded px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${
+                              <div className="fw-drag-preview-slot pointer-events-none">
+                                <div>
+                                  <div
+                                    data-testid="drag-preview-chip"
+                                    className={`rounded border border-dashed px-2.5 py-2 md:px-2 md:py-1.5 ${
                                       previewOffSchedule
-                                        ? 'bg-[#D97706]/30 text-[#FBBF24]'
-                                        : 'bg-[#0EA5E9]/30 text-[#7DD3FC]'
+                                        ? 'border-[#FBBF24] bg-[#D97706]/15'
+                                        : 'border-[#38BDF8] bg-[#0EA5E9]/15'
                                     }`}
                                   >
-                                    {previewOffSchedule ? 'Off-Day' : 'Preview'}
-                                  </span>
-                                </div>
-                                <div className="mt-0.5 truncate font-mono text-[11px] tabular-nums text-[#E6EDF3]">
-                                  {formatCompactItems(draggedOrder)}
+                                    <div className="flex items-center justify-between gap-1">
+                                      <span className="truncate text-xs font-semibold text-[#F0F6FC]">
+                                        {draggedOrder.customerName}
+                                      </span>
+                                      <span
+                                        className={`shrink-0 rounded px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${
+                                          previewOffSchedule
+                                            ? 'bg-[#D97706]/30 text-[#FBBF24]'
+                                            : 'bg-[#0EA5E9]/30 text-[#7DD3FC]'
+                                        }`}
+                                      >
+                                        {previewOffSchedule ? 'Off-Day' : 'Preview'}
+                                      </span>
+                                    </div>
+                                    <div className="mt-0.5 truncate font-mono text-[11px] tabular-nums text-[#E6EDF3]">
+                                      {formatCompactItems(draggedOrder)}
+                                    </div>
+                                  </div>
                                 </div>
                               </div>
                             )}
@@ -1324,6 +1548,7 @@ export function CalendarWorkspace({
                                 draggingOrderId === order.id &&
                                 dragOverDate !== null &&
                                 dragOverDate !== day.date;
+                              const isDraggingThisChip = draggingOrderId === order.id;
 
                               return (
                                 <button
@@ -1334,10 +1559,16 @@ export function CalendarWorkspace({
                                   onDragStart={(e) => handleDragStart(e, order.id)}
                                   onDragEnd={handleDragEnd}
                                   onClick={() => onSelectOrder(order)}
-                                  className={`w-full rounded border px-2.5 py-2 text-left transition-all hover:border-[#38BDF8] hover:bg-[#1E2730] md:px-2 md:py-1.5 ${
+                                  className={`w-full rounded border px-2.5 py-2 text-left transition-[transform,opacity,background-color,border-color,box-shadow] duration-200 ease-out hover:border-[#38BDF8] hover:bg-[#1E2730] md:px-2 md:py-1.5 ${
+                                    order.isLocked
+                                      ? 'cursor-pointer'
+                                      : 'cursor-grab active:cursor-grabbing'
+                                  } ${
                                     isMovingAway
-                                      ? 'border-dashed border-[#38BDF8]/60 bg-[#1A222B]/50 opacity-40'
-                                      : 'border-[#283340] bg-[#1A222B]'
+                                      ? 'scale-[0.98] border-dashed border-[#38BDF8]/60 bg-[#1A222B]/50 opacity-40'
+                                      : isDraggingThisChip
+                                        ? 'scale-[0.985] border-[#38BDF8]/80 bg-[#1E2730]/80 opacity-65'
+                                        : 'border-[#283340] bg-[#1A222B]'
                                   }`}
                                 >
                                   <div className="flex items-center justify-between gap-1">
@@ -1469,6 +1700,7 @@ export function CalendarWorkspace({
                         type="button"
                         data-testid="reset-waitlist-order-btn"
                         onClick={() => {
+                          snapshotQueueCardPositions();
                           setOptimisticQueueIds(null);
                           void onResetWaitlistOrder();
                         }}
@@ -1488,6 +1720,7 @@ export function CalendarWorkspace({
                   if (draggingQueueOrderId !== null) {
                     e.preventDefault();
                     e.dataTransfer.dropEffect = 'move';
+                    clearPendingDragLeave();
                     updateDragPointer(e.clientX, e.clientY);
                     if (dragOverDate !== null) {
                       setDragOverDate(null);
@@ -1499,7 +1732,7 @@ export function CalendarWorkspace({
                     void handleQueueDrop(e);
                   }
                 }}
-                className="flex-1 space-y-2 overflow-y-auto p-3"
+                className="relative flex-1 space-y-2 overflow-y-auto p-3"
               >
                 {showIgnored ? (
                   workspace.ignoredOrders.length === 0 ? (
@@ -1552,10 +1785,18 @@ export function CalendarWorkspace({
                       workspace.today
                     );
                     const isDraggingThis = draggingQueueOrderId === order.id;
+                    const isDraggingToCalendar = isDraggingThis && dragOverDate !== null;
 
                     return (
                       <div
                         key={order.id}
+                        ref={(node) => {
+                          if (node) {
+                            queueCardRefs.current.set(order.id, node);
+                          } else {
+                            queueCardRefs.current.delete(order.id);
+                          }
+                        }}
                         draggable
                         data-testid={`queue-order-${order.id}`}
                         onDragStart={(e) => handleDragStart(e, order.id, true)}
@@ -1576,12 +1817,14 @@ export function CalendarWorkspace({
                             onSelectOrder(order);
                           }
                         }}
-                        className={`relative cursor-grab rounded-md border p-3 transition-all duration-150 active:cursor-grabbing ${
-                          isDraggingThis
-                            ? 'border-dashed border-[#38BDF8] bg-[#0EA5E9]/12 ring-1 ring-[#38BDF8]/50'
-                            : order.status === 'confirmed'
-                              ? 'border-[#283340] border-l-2 border-l-[#22C55E] bg-[#0F1419] hover:border-[#38BDF8]'
-                              : 'border-[#283340] bg-[#0F1419] hover:border-[#38BDF8]'
+                        className={`relative cursor-grab rounded-md border p-3 transition-[background-color,border-color,box-shadow,opacity,transform] duration-200 ease-out will-change-transform active:cursor-grabbing ${
+                          isDraggingToCalendar
+                            ? 'scale-[0.98] border-dashed border-[#38BDF8]/60 bg-[#0EA5E9]/8 opacity-45'
+                            : isDraggingThis
+                              ? 'scale-[0.99] border-dashed border-[#38BDF8] bg-[#0EA5E9]/14 ring-1 ring-[#38BDF8]/50'
+                              : order.status === 'confirmed'
+                                ? 'border-[#283340] border-l-2 border-l-[#22C55E] bg-[#0F1419] hover:border-[#38BDF8]'
+                                : 'border-[#283340] bg-[#0F1419] hover:border-[#38BDF8]'
                         }`}
                       >
                         {/* Prominent Arrival Date & Priority Rank Bar */}

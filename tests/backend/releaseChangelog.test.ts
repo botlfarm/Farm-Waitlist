@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   UNRELEASED_TEMPLATE,
   extractUnreleasedBody,
+  readAddonVersion,
   releaseChangelog,
 } from '../../scripts/release-changelog.mjs';
 
@@ -35,7 +36,7 @@ afterEach(() => {
   }
 });
 
-describe('Release Changelog Promotion (UNRELEASED.md -> CHANGELOG.md & farm-waitlist/CHANGELOG.md)', () => {
+describe('Release Changelog & Auto-Bump Promotion (UNRELEASED.md -> CHANGELOG.md & farm-waitlist/CHANGELOG.md)', () => {
   it('promotes non-empty UNRELEASED.md sections into both changelogs, syncs package.json, writes release notes, and resets UNRELEASED.md', () => {
     const dir = createTempRepo(
       '1.0.1',
@@ -67,39 +68,98 @@ All notable changes to Farm Waitlist are documented in this file.
     );
 
     const notesOutPath = path.join(dir, 'release-notes.md');
-    const result = releaseChangelog({ rootDir: dir, dateYmd: '2026-11-24', notesOutPath });
+    const result = releaseChangelog({
+      rootDir: dir,
+      dateYmd: '2026-11-24',
+      notesOutPath,
+      autoBump: true,
+      hasTag: () => false,
+    });
 
     expect(result.released).toBe(true);
+    expect(result.autoBumped).toBe(false);
     expect(result.version).toBe('1.0.1');
 
     const rootChangelog = fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
     const addonChangelog = fs.readFileSync(path.join(dir, 'farm-waitlist', 'CHANGELOG.md'), 'utf8');
     expect(addonChangelog).toBe(rootChangelog);
 
-    // 1.0.1 must appear above 1.0.0, with only non-empty sections (Added & Fixed, no empty Changed)
     expect(rootChangelog).toContain('## [1.0.1] - 2026-11-24');
     expect(rootChangelog).toContain('### Added\n\n- Requested Pickup Date on waitlist cards');
     expect(rootChangelog).toContain('### Fixed\n\n- Email-safe pre-approval rich copy');
     expect(rootChangelog).not.toContain('### Changed');
     expect(rootChangelog.indexOf('## [1.0.1]')).toBeLessThan(rootChangelog.indexOf('## [1.0.0]'));
 
-    // UNRELEASED.md is cleared back to clean template
     expect(fs.readFileSync(path.join(dir, 'UNRELEASED.md'), 'utf8')).toBe(UNRELEASED_TEMPLATE);
     expect(extractUnreleasedBody(UNRELEASED_TEMPLATE)).toBe('');
 
-    // package.json synced to 1.0.1
     const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as {
       version: string;
     };
     expect(pkg.version).toBe('1.0.1');
 
-    // Release notes file written for gh release create
     const notesOut = fs.readFileSync(notesOutPath, 'utf8');
     expect(notesOut).toContain('- Requested Pickup Date on waitlist cards');
     expect(notesOut).toContain('- Email-safe pre-approval rich copy');
   });
 
-  it('does not overwrite or wipe UNRELEASED.md when the current config.yaml version is already in CHANGELOG.md', () => {
+  it('auto-bumps patch version in config.yaml when current version already exists in git tags or CHANGELOG.md', () => {
+    const dir = createTempRepo(
+      '1.0.1',
+      `# Unreleased Changes\n\n### Added\n\n- Default README for public availability repo\n`,
+      `# Changelog\n\n## [1.0.0] - 2026-11-23\n\n### Features\n\n- Initial release\n`
+    );
+
+    // Simulate v1.0.1 already tagged on GitHub even though CHANGELOG.md hadn't recorded 1.0.1 yet
+    const result = releaseChangelog({
+      rootDir: dir,
+      dateYmd: '2026-11-24',
+      autoBump: true,
+      hasTag: (v: string) => v === '1.0.1',
+    });
+
+    expect(result.released).toBe(true);
+    expect(result.autoBumped).toBe(true);
+    expect(result.version).toBe('1.0.2');
+
+    // farm-waitlist/config.yaml & package.json must both be updated to 1.0.2
+    const configYaml = fs.readFileSync(path.join(dir, 'farm-waitlist', 'config.yaml'), 'utf8');
+    expect(readAddonVersion(configYaml)).toBe('1.0.2');
+    const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as {
+      version: string;
+    };
+    expect(pkg.version).toBe('1.0.2');
+
+    // Both changelogs record 1.0.2 and UNRELEASED.md is cleared
+    const changelog = fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
+    expect(changelog).toContain('## [1.0.2] - 2026-11-24');
+    expect(changelog).toContain('- Default README for public availability repo');
+    expect(fs.readFileSync(path.join(dir, 'farm-waitlist', 'CHANGELOG.md'), 'utf8')).toBe(
+      changelog
+    );
+    expect(fs.readFileSync(path.join(dir, 'UNRELEASED.md'), 'utf8')).toBe(UNRELEASED_TEMPLATE);
+  });
+
+  it('does not double-bump when author manually bumped config.yaml to a new minor/major version', () => {
+    const dir = createTempRepo(
+      '1.1.0',
+      `# Unreleased Changes\n\n### Added\n\n- Major feature\n`,
+      `# Changelog\n\n## [1.0.2] - 2026-11-24\n\n### Added\n\n- Earlier change\n`
+    );
+
+    const result = releaseChangelog({
+      rootDir: dir,
+      dateYmd: '2026-11-25',
+      autoBump: true,
+      hasTag: (v: string) => v === '1.0.2',
+    });
+
+    expect(result.released).toBe(true);
+    expect(result.autoBumped).toBe(false);
+    expect(result.version).toBe('1.1.0');
+  });
+
+  it('leaves UNRELEASED.md untouched when autoBump is false and version already exists in CHANGELOG.md', () => {
     const pendingNotes = `# Unreleased Changes\n\n### Added\n\n- Next feature for 1.0.2\n`;
     const dir = createTempRepo(
       '1.0.1',
@@ -107,12 +167,14 @@ All notable changes to Farm Waitlist are documented in this file.
       `# Changelog\n\n## [1.0.1] - 2026-11-24\n\n### Added\n\n- Something\n`
     );
 
-    const result = releaseChangelog({ rootDir: dir, dateYmd: '2026-11-25' });
+    const result = releaseChangelog({
+      rootDir: dir,
+      dateYmd: '2026-11-25',
+      autoBump: false,
+      hasTag: () => false,
+    });
     expect(result.released).toBe(false);
     expect(fs.readFileSync(path.join(dir, 'UNRELEASED.md'), 'utf8')).toBe(pendingNotes);
-    expect(fs.readFileSync(path.join(dir, 'farm-waitlist', 'CHANGELOG.md'), 'utf8')).toBe(
-      fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8')
-    );
   });
 
   it('falls back cleanly when a version is bumped with an empty UNRELEASED.md', () => {
@@ -125,6 +187,8 @@ All notable changes to Farm Waitlist are documented in this file.
     const result = releaseChangelog({
       rootDir: dir,
       dateYmd: '2026-11-26',
+      autoBump: true,
+      hasTag: () => false,
       fallbackNotes: '### Changes\n\n- Small tweak from git log',
     });
 

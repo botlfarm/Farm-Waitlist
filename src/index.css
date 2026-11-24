@@ -44,3 +44,51 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #3B4958;
 }
+
+/* Smooth drag-and-drop transitions (calendar preview slot & quantity delta feedback) */
+@keyframes fw-slot-open {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes fw-delta-pop {
+  from {
+    opacity: 0;
+    transform: translateY(2px) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.fw-drag-preview-slot {
+  display: grid;
+  animation: fw-slot-open 190ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.fw-drag-preview-slot > * {
+  overflow: hidden;
+  min-height: 0;
+}
+
+.fw-preview-delta {
+  display: inline-block;
+  animation: fw-delta-pop 170ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fw-drag-preview-slot,
+  .fw-preview-delta {
+    animation: none;
+  }
+}
+

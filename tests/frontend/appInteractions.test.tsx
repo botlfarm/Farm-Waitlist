@@ -2131,4 +2131,72 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
       expect(updatedPayloads[0]).toMatchObject({ requestedDate: '2026-11-29' });
     });
   });
+
+  it('prevents hover flicker across calendar cells and keeps dropped orders settled optimistically while saving', async () => {
+    const ws = makeBaseWorkspace();
+    ws.today = '2026-11-23';
+
+    const slotGate: { resolve?: () => void } = {};
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/11/slot') {
+          await new Promise<void>((resolve) => {
+            slotGate.resolve = resolve;
+          });
+          ws.orders = ws.orders.map((o) =>
+            o.id === 11 ? { ...o, status: 'slotted', slottedDate: '2026-11-24' } : o
+          );
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    const queueCard = await screen.findByTestId('queue-order-11');
+    const day0 = screen.getByTestId('calendar-day-2026-11-23');
+    const day1 = screen.getByTestId('calendar-day-2026-11-24');
+
+    const dataTransfer = {
+      data: {} as Record<string, string>,
+      effectAllowed: 'move',
+      dropEffect: 'move',
+      setData(type: string, val: string) {
+        this.data[type] = val;
+      },
+      getData(type: string) {
+        return this.data[type] ?? '';
+      },
+    };
+
+    fireEvent.dragStart(queueCard, { dataTransfer });
+    fireEvent.dragOver(day0, { dataTransfer });
+    expect(screen.getByTestId('drag-preview-chip')).toHaveTextContent('Waitlist Walt');
+
+    // Leaving day0 does not instantaneously flash preview off before entering day1
+    fireEvent.dragLeave(day0, { dataTransfer });
+    expect(screen.getByTestId('drag-preview-chip')).toBeInTheDocument();
+
+    fireEvent.dragOver(day1, { dataTransfer });
+    expect(screen.getByTestId('drag-preview-chip')).toHaveTextContent('Waitlist Walt');
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('Can Sell21dozens');
+
+    // Drop onto day1 while POST /api/orders/11/slot is still in flight -> no snap-back!
+    fireEvent.drop(day1, { dataTransfer });
+    expect(screen.queryByTestId('queue-order-11')).not.toBeInTheDocument();
+    expect(screen.getByTestId('order-chip-11')).toHaveTextContent('Waitlist Walt');
+    expect(screen.getByTestId('day-metrics-2026-11-24')).toHaveTextContent('Can Sell21dozens');
+
+    // Resolve server request and ensure settled state stays clean
+    slotGate.resolve?.();
+    await waitFor(() => {
+      expect(screen.getByTestId('order-chip-11')).toBeInTheDocument();
+    });
+  });
 });
+
