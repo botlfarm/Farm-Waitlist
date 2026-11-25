@@ -661,6 +661,7 @@ export default function App() {
                 bufferOverride: existingBaseBuffer,
                 extraBuffer: existingProj?.extraBuffer ?? 0,
                 selfConsumption: existingProj?.selfConsumption ?? 0,
+                walkUpConsumption: existingProj?.walkUpConsumption ?? 0,
                 notes: existingProj?.notes ?? null,
               });
               await refreshWorkspace();

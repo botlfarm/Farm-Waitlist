@@ -45,6 +45,7 @@ interface DayDetailDrawerProps {
       bufferOverride: number | null;
       extraBuffer: number;
       selfConsumption: number;
+      walkUpConsumption: number;
       notes: string | null;
     }
   ) => Promise<void>;
@@ -77,6 +78,7 @@ export function DayDetailDrawer({
   );
   const [actualOnHand, setActualOnHand] = useState<string>('');
   const [selfConsumption, setSelfConsumption] = useState<string>('');
+  const [walkUpConsumption, setWalkUpConsumption] = useState<string>('');
   const [estProduced, setEstProduced] = useState<string>('');
   const [actualEndOfDay, setActualEndOfDay] = useState<string>('');
   const [extraBuffer, setExtraBuffer] = useState<string>('');
@@ -104,6 +106,9 @@ export function DayDetailDrawer({
     setSelfConsumption(
       proj.selfConsumption && proj.selfConsumption > 0 ? String(proj.selfConsumption) : ''
     );
+    setWalkUpConsumption(
+      proj.walkUpConsumption && proj.walkUpConsumption > 0 ? String(proj.walkUpConsumption) : ''
+    );
     setEstProduced(proj.isManualProducedOverride ? String(proj.estProduced) : '');
     setActualEndOfDay(
       proj.actualEndOfDay !== null && proj.actualEndOfDay !== undefined
@@ -122,6 +127,7 @@ export function DayDetailDrawer({
     currentItem?.id,
     proj?.actualOnHand,
     proj?.selfConsumption,
+    proj?.walkUpConsumption,
     proj?.estProduced,
     proj?.actualEndOfDay,
     proj?.isManualProducedOverride,
@@ -165,7 +171,13 @@ export function DayDetailDrawer({
   const parsedSelfConsumption = parseOptionalNumber(selfConsumption);
   const liveSelfConsumption =
     parsedSelfConsumption !== null ? Math.max(0, parsedSelfConsumption) : 0;
-  const liveEndingBalance = roundQty(liveMorning - slottedQty - liveSelfConsumption);
+  const savedWalkUpConsumption = proj?.walkUpConsumption ?? 0;
+  const parsedWalkUpConsumption = parseOptionalNumber(walkUpConsumption);
+  const liveWalkUpConsumption =
+    parsedWalkUpConsumption !== null ? Math.max(0, parsedWalkUpConsumption) : 0;
+  const liveEndingBalance = roundQty(
+    liveMorning - slottedQty - liveSelfConsumption - liveWalkUpConsumption
+  );
 
   const expectedHarvest = proj ? proj.expectedProduced ?? proj.estProduced : 0;
   const parsedHarvest = parseOptionalNumber(estProduced);
@@ -185,12 +197,18 @@ export function DayDetailDrawer({
       parsedMorning === proj.actualOnHand &&
       parsedEndOfDay === savedEod &&
       liveSelfConsumption === savedSelfConsumption &&
+      liveWalkUpConsumption === savedWalkUpConsumption &&
       previewTotalBuffer === proj.effectiveBuffer
   );
 
   const liveRawSellable = roundQty(liveEndingBalance - previewTotalBuffer);
   const stockDelta = proj
-    ? roundQty(liveMorning - proj.startingBalance - (liveSelfConsumption - savedSelfConsumption))
+    ? roundQty(
+        liveMorning -
+          proj.startingBalance -
+          (liveSelfConsumption - savedSelfConsumption) -
+          (liveWalkUpConsumption - savedWalkUpConsumption)
+      )
     : 0;
   const liveSellableOpen = !proj
     ? 0
@@ -240,6 +258,7 @@ export function DayDetailDrawer({
         bufferOverride: bufferOverride.trim() === '' ? null : Math.max(0, Number(bufferOverride)),
         extraBuffer: extraBuffer.trim() === '' ? 0 : Math.max(0, Number(extraBuffer)),
         selfConsumption: liveSelfConsumption,
+        walkUpConsumption: liveWalkUpConsumption,
         notes: notes.trim() || null,
       });
       setPendingOverrideCascade(null);
@@ -474,6 +493,49 @@ export function DayDetailDrawer({
                           onClick={() => setSelfConsumption('')}
                           title="Clear self consumption"
                           aria-label="Clear self consumption"
+                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-[#283340] bg-[#161D24] text-[#8B949E] hover:border-[#38BDF8] hover:text-[#38BDF8]"
+                        >
+                          <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 py-0.5">
+                    <div className="min-w-0">
+                      <label
+                        htmlFor="day-walk-up-consumption"
+                        className="block font-medium text-[#C9D1D9]"
+                      >
+                        Walk-Up / Market
+                      </label>
+                      <span className="block text-[10px] text-[#8B949E]">
+                        Day-of walk-up &amp; market sales not tracked elsewhere
+                      </span>
+                    </div>
+                    <div className="flex w-[136px] shrink-0 items-center justify-end gap-1">
+                      <span className="font-mono text-xs text-[#8B949E]" aria-hidden="true">
+                        -
+                      </span>
+                      <input
+                        id="day-walk-up-consumption"
+                        data-testid="day-walk-up-consumption-input"
+                        type="number"
+                        min="0"
+                        step="0.5"
+                        value={walkUpConsumption}
+                        onChange={(e) => setWalkUpConsumption(e.target.value)}
+                        placeholder="0"
+                        aria-label="Walk-up market consumption"
+                        className={`min-h-[34px] w-full rounded-md border bg-[#161D24] px-2.5 py-1 text-right font-mono text-xs tabular-nums text-[#F0F6FC] placeholder:text-[#6E7681] focus:border-[#38BDF8] focus:outline-none ${
+                          liveWalkUpConsumption > 0 ? 'border-[#2DD4BF]/70' : 'border-[#283340]'
+                        }`}
+                      />
+                      {walkUpConsumption.trim() !== '' && (
+                        <button
+                          type="button"
+                          onClick={() => setWalkUpConsumption('')}
+                          title="Clear walk-up market consumption"
+                          aria-label="Clear walk-up market consumption"
                           className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-[#283340] bg-[#161D24] text-[#8B949E] hover:border-[#38BDF8] hover:text-[#38BDF8]"
                         >
                           <RotateCcw className="h-3 w-3" aria-hidden="true" />

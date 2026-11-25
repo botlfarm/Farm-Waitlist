@@ -178,12 +178,20 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
             carryEntry.selfConsumption > 0
               ? roundQty(carryEntry.selfConsumption)
               : 0;
+          const walkUpConsumed =
+            carryEntry &&
+            typeof carryEntry.walkUpConsumption === 'number' &&
+            carryEntry.walkUpConsumption > 0
+              ? roundQty(carryEntry.walkUpConsumption)
+              : 0;
           const carryEod =
             carryEntry && carryEntry.actualEndOfDay !== undefined && carryEntry.actualEndOfDay !== null
               ? roundQty(carryEntry.actualEndOfDay)
               : null;
           runningBalance =
-            carryEod !== null ? carryEod : roundQty(startBal - slotted - selfConsumed + prod);
+            carryEod !== null
+              ? carryEod
+              : roundQty(startBal - slotted - selfConsumed - walkUpConsumed + prod);
         }
       }
     } else {
@@ -238,9 +246,15 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
         entry && typeof entry.selfConsumption === 'number' && entry.selfConsumption > 0
           ? roundQty(entry.selfConsumption)
           : 0;
+      const walkUpConsumption =
+        entry && typeof entry.walkUpConsumption === 'number' && entry.walkUpConsumption > 0
+          ? roundQty(entry.walkUpConsumption)
+          : 0;
 
-      // Customer orders and self consumption today draw ONLY from today's starting stock; afternoon harvest becomes available tomorrow
-      const endingBalance = roundQty(startingBalance - slottedQty - selfConsumption);
+      // Customer orders, self consumption, and walk-up market sales today draw ONLY from today's starting stock; afternoon harvest becomes available tomorrow
+      const endingBalance = roundQty(
+        startingBalance - slottedQty - selfConsumption - walkUpConsumption
+      );
       const expectedNextDayStarting = roundQty(endingBalance + estProduced);
       const actualEndOfDay =
         entry && entry.actualEndOfDay !== undefined && entry.actualEndOfDay !== null
@@ -270,6 +284,7 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
         actualEndOfDay,
         slottedQty,
         selfConsumption,
+        walkUpConsumption,
         endingBalance,
         expectedNextDayStarting,
         nextDayStarting,

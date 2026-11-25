@@ -2658,13 +2658,14 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     expect(screen.getByTestId('publish-availability-btn')).not.toBeDisabled();
   });
 
-  it('supports Self Consumption on daily egg numbers with live preview, saving without override warning, and calendar badge', async () => {
+  it('supports Self Consumption and Walk-Up / Market consumption on daily egg numbers with live preview, saving without override warning, and calendar badges', async () => {
     const user = userEvent.setup();
     const ws = makeBaseWorkspace();
     ws.days[1].byItem[1].startingBalance = 20;
     ws.days[1].byItem[1].expectedStartingBalance = 20;
     ws.days[1].byItem[1].slottedQty = 4;
     ws.days[1].byItem[1].selfConsumption = 0;
+    ws.days[1].byItem[1].walkUpConsumption = 0;
     ws.days[1].byItem[1].endingBalance = 16;
     ws.days[1].byItem[1].estProduced = 10;
     ws.days[1].byItem[1].expectedProduced = 10;
@@ -2686,13 +2687,15 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
           const parsed = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
           supplyUpdates.push({ url: input, body: parsed });
           const sc = Number(parsed.selfConsumption ?? 0);
+          const wu = Number(parsed.walkUpConsumption ?? 0);
           ws.days[1].byItem[1] = {
             ...ws.days[1].byItem[1],
             selfConsumption: sc,
-            endingBalance: 20 - 4 - sc,
-            nextDayStarting: 20 - 4 - sc + 10,
-            sellableOpen: 20 - 4 - sc - 4,
-            rawSellableOpen: 20 - 4 - sc - 4,
+            walkUpConsumption: wu,
+            endingBalance: 20 - 4 - sc - wu,
+            nextDayStarting: 20 - 4 - sc - wu + 10,
+            sellableOpen: 20 - 4 - sc - wu - 4,
+            rawSellableOpen: 20 - 4 - sc - wu - 4,
           };
           return new Response(JSON.stringify({ ok: true }), { status: 200 });
         }
@@ -2715,7 +2718,14 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     expect(screen.getByTestId('day-eod-expected')).toHaveTextContent('23');
     expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('23 dozens');
 
-    // Saving Self Consumption on a non-today date should NOT trigger the morning/EOD override confirmation modal
+    // Enter 4 dozens for Walk-Up / Market consumption right below Self Consumption -> live numbers recalculate further
+    const walkUpInput = screen.getByTestId('day-walk-up-consumption-input');
+    await user.type(walkUpInput, '4');
+    expect(screen.getByTestId('day-remaining-before-harvest')).toHaveTextContent('9');
+    expect(screen.getByTestId('day-eod-expected')).toHaveTextContent('19');
+    expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('19 dozens');
+
+    // Saving Self / Walk-Up Consumption on a non-today date should NOT trigger the morning/EOD override confirmation modal
     await user.click(screen.getByTestId('day-save-btn'));
     expect(screen.queryByTestId('non-today-override-modal')).not.toBeInTheDocument();
 
@@ -2723,10 +2733,12 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
       expect(supplyUpdates).toHaveLength(1);
       expect(supplyUpdates[0].url).toBe('./api/supply/1/2026-11-24');
       expect(supplyUpdates[0].body.selfConsumption).toBe(3);
+      expect(supplyUpdates[0].body.walkUpConsumption).toBe(4);
     });
 
-    // Calendar cell now shows the compact Self -3 line
+    // Calendar cell now shows both compact Self -3 and Walk-Up -4 lines
     expect(await screen.findByTestId('day-self-consumption-2026-11-24')).toHaveTextContent('Self-3');
+    expect(await screen.findByTestId('day-walk-up-consumption-2026-11-24')).toHaveTextContent('Walk-Up-4');
   });
 
   it('inserts new name/date template variables with live preview in Settings and shows email, phone copy buttons, and mailto link in PreApprovalModal', async () => {

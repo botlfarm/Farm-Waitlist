@@ -579,6 +579,12 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       body.selfConsumption === undefined
         ? 0
         : Math.max(0, Number(body.selfConsumption));
+    const walkUpConsumption =
+      body.walkUpConsumption === null ||
+      body.walkUpConsumption === '' ||
+      body.walkUpConsumption === undefined
+        ? 0
+        : Math.max(0, Number(body.walkUpConsumption));
     const cascadeForward = Boolean(body.cascadeForward);
     const notes = typeof body.notes === 'string' && body.notes.trim() ? body.notes.trim() : null;
 
@@ -588,7 +594,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       (actualEndOfDay !== null && !Number.isFinite(actualEndOfDay)) ||
       (bufferOverride !== null && !Number.isFinite(bufferOverride)) ||
       !Number.isFinite(extraBuffer) ||
-      !Number.isFinite(selfConsumption)
+      !Number.isFinite(selfConsumption) ||
+      !Number.isFinite(walkUpConsumption)
     ) {
       res.status(400).json({ error: 'Numeric supply values must be finite numbers' });
       return;
@@ -598,8 +605,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
 
     db.prepare(
       `INSERT INTO daily_supply_entries (
-         tracked_item_id, date, actual_on_hand, est_produced, actual_end_of_day, is_cascade_anchor, buffer_override, extra_buffer, self_consumption, notes
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         tracked_item_id, date, actual_on_hand, est_produced, actual_end_of_day, is_cascade_anchor, buffer_override, extra_buffer, self_consumption, walk_up_consumption, notes
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id, date) DO UPDATE SET
          actual_on_hand = excluded.actual_on_hand,
          est_produced = excluded.est_produced,
@@ -608,6 +615,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
          buffer_override = excluded.buffer_override,
          extra_buffer = excluded.extra_buffer,
          self_consumption = excluded.self_consumption,
+         walk_up_consumption = excluded.walk_up_consumption,
          notes = excluded.notes`
     ).run(
       itemId,
@@ -619,6 +627,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       bufferOverride,
       extraBuffer,
       selfConsumption,
+      walkUpConsumption,
       notes
     );
 

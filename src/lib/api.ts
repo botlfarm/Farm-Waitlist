@@ -275,6 +275,7 @@ export const api = {
       bufferOverride: number | null;
       extraBuffer?: number;
       selfConsumption?: number;
+      walkUpConsumption?: number;
       notes?: string | null;
     }
   ) =>

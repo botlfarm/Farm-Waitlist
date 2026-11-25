@@ -380,6 +380,13 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE daily_supply_entries ADD COLUMN self_consumption REAL NOT NULL DEFAULT 0;
     `,
   },
+  {
+    version: 10,
+    name: 'add_daily_walk_up_consumption',
+    sql: `
+      ALTER TABLE daily_supply_entries ADD COLUMN walk_up_consumption REAL NOT NULL DEFAULT 0;
+    `,
+  },
 ];
 
 const SQLITE_HEADER_MAGIC = Buffer.from('SQLite format 3\0', 'utf8');

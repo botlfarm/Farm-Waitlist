@@ -64,7 +64,7 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const mgr = new DatabaseManager(dbPath, backupDir);
     const res = await mgr.init('America/New_York');
 
-    expect(res.appliedVersions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(res.appliedVersions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(res.preMigrateBackup).toBeNull();
     expect(listTrackedItems(mgr.db)).toHaveLength(0);
     expect(listPickupChannels(mgr.db)).toHaveLength(0);
@@ -82,15 +82,15 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const extendedMigrations: Migration[] = [
       ...MIGRATIONS,
       {
-        version: 10,
+        version: 11,
         name: 'add_test_marker_table',
-        sql: 'CREATE TABLE IF NOT EXISTS migration_v10_test (id INTEGER PRIMARY KEY);',
+        sql: 'CREATE TABLE IF NOT EXISTS migration_v11_test (id INTEGER PRIMARY KEY);',
       },
     ];
 
     const mgr2 = new DatabaseManager(dbPath, backupDir, extendedMigrations);
     const res = await mgr2.init('America/New_York');
-    expect(res.appliedVersions).toEqual([10]);
+    expect(res.appliedVersions).toEqual([11]);
     expect(res.preMigrateBackup).toMatch(/^pre-migrate-.*\.db$/);
     expect(fs.existsSync(path.join(backupDir, res.preMigrateBackup!))).toBe(true);
     mgr2.close();
@@ -1556,7 +1556,7 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
     }
   });
 
-  it('deducts daily selfConsumption like a fixed same-day order across carry-over, ATP reservations, PUT /api/supply, and Undo', async () => {
+  it('deducts daily selfConsumption and walkUpConsumption like fixed same-day orders across carry-over, ATP reservations, PUT /api/supply, and Undo', async () => {
     const { createExpressApp } = await import('../../src/server/app');
     const farmEggs: TrackedItem = {
       id: 1,
@@ -1574,9 +1574,9 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
     };
 
     // Unit math:
-    // Nov 22 (before startDate): anchor 10 on hand, selfConsumption 2, harvest +4 -> Nov 23 starts with 12
-    // Nov 23: starts 12, selfConsumption 0, buffer 2 -> raw open 10, harvest +4 -> Nov 24 starts with 16
-    // Nov 24: starts 16, selfConsumption 11, buffer 2 -> endingBalance 5, raw open 3 -> ATP pulls Nov 23 open from 10 down to 3 (Holding 7)!
+    // Nov 22 (before startDate): anchor 12 on hand, selfConsumption 2, walkUpConsumption 2, harvest +4 -> Nov 23 starts with 12
+    // Nov 23: starts 12, selfConsumption 0, walkUpConsumption 0, buffer 2 -> raw open 10, harvest +4 -> Nov 24 starts with 16
+    // Nov 24: starts 16, selfConsumption 5, walkUpConsumption 6 (11 total), buffer 2 -> endingBalance 5, raw open 3 -> ATP pulls Nov 23 open from 10 down to 3 (Holding 7)!
     // Nov 25: starts 5 + 4 = 9, buffer 2 -> open 7
     const days = projectDailySupply({
       items: [farmEggs],
@@ -1585,11 +1585,12 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
           id: 1,
           trackedItemId: 1,
           date: '2026-11-22',
-          actualOnHand: 10,
+          actualOnHand: 12,
           estProduced: null,
           isCascadeAnchor: false,
           bufferOverride: null,
           selfConsumption: 2,
+          walkUpConsumption: 2,
           notes: null,
         },
         {
@@ -1600,8 +1601,9 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
           estProduced: null,
           isCascadeAnchor: false,
           bufferOverride: null,
-          selfConsumption: 11,
-          notes: 'Family baking week',
+          selfConsumption: 5,
+          walkUpConsumption: 6,
+          notes: 'Family baking + farmstand walk-ups',
         },
       ],
       orders: [],
@@ -1612,13 +1614,15 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
 
     expect(days[0].byItem[1].startingBalance).toBe(12);
     expect(days[0].byItem[1].selfConsumption).toBe(0);
+    expect(days[0].byItem[1].walkUpConsumption).toBe(0);
     expect(days[0].byItem[1].rawSellableOpen).toBe(10);
     expect(days[0].byItem[1].sellableOpen).toBe(3);
     expect(days[0].byItem[1].reservedForFuture).toBe(7);
     expect(days[0].byItem[1].constrainedByDate).toBe('2026-11-24');
 
     expect(days[1].byItem[1].startingBalance).toBe(16);
-    expect(days[1].byItem[1].selfConsumption).toBe(11);
+    expect(days[1].byItem[1].selfConsumption).toBe(5);
+    expect(days[1].byItem[1].walkUpConsumption).toBe(6);
     expect(days[1].byItem[1].endingBalance).toBe(5);
     expect(days[1].byItem[1].sellableOpen).toBe(3);
 
@@ -1667,30 +1671,48 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
           bufferOverride: null,
           extraBuffer: 0,
           selfConsumption: 2.5,
-          notes: 'Kitchen eggs',
+          walkUpConsumption: 3.5,
+          notes: 'Kitchen eggs + walk-up table',
         }),
       });
       expect(putRes.status).toBe(200);
 
       const wsRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
       const ws = (await wsRes.json()) as {
-        days: Array<{ date: string; byItem: Record<number, { startingBalance: number; selfConsumption: number; endingBalance: number; sellableOpen: number }> }>;
+        days: Array<{
+          date: string;
+          byItem: Record<
+            number,
+            {
+              startingBalance: number;
+              selfConsumption: number;
+              walkUpConsumption: number;
+              endingBalance: number;
+              sellableOpen: number;
+            }
+          >;
+        }>;
       };
       const mon = ws.days.find((d) => d.date === '2026-11-23')!.byItem[itemId];
       expect(mon.startingBalance).toBe(14);
       expect(mon.selfConsumption).toBe(2.5);
-      expect(mon.endingBalance).toBe(11.5);
-      expect(mon.sellableOpen).toBe(9.5);
+      expect(mon.walkUpConsumption).toBe(3.5);
+      expect(mon.endingBalance).toBe(8);
+      expect(mon.sellableOpen).toBe(6);
 
-      // Undo reverts the self-consumption supply update cleanly
+      // Undo reverts both self-consumption and walk-up consumption cleanly
       const undoRes = await fetch(`http://127.0.0.1:${port}/api/checkpoints/undo`, { method: 'POST' });
       expect(undoRes.status).toBe(200);
 
       const wsAfterUndoRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
       const wsAfterUndo = (await wsAfterUndoRes.json()) as {
-        days: Array<{ date: string; byItem: Record<number, { selfConsumption: number }> }>;
+        days: Array<{
+          date: string;
+          byItem: Record<number, { selfConsumption: number; walkUpConsumption: number }>;
+        }>;
       };
       expect(wsAfterUndo.days.find((d) => d.date === '2026-11-23')!.byItem[itemId].selfConsumption).toBe(0);
+      expect(wsAfterUndo.days.find((d) => d.date === '2026-11-23')!.byItem[itemId].walkUpConsumption).toBe(0);
     } finally {
       server.close();
       mgr.close();

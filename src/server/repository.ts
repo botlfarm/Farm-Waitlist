@@ -95,6 +95,7 @@ export function listDailySupplyEntries(db: Database.Database): DailySupplyEntry[
     buffer_override: number | null;
     extra_buffer?: number | null;
     self_consumption?: number | null;
+    walk_up_consumption?: number | null;
     notes: string | null;
   }>;
 
@@ -110,6 +111,10 @@ export function listDailySupplyEntries(db: Database.Database): DailySupplyEntry[
     extraBuffer: typeof r.extra_buffer === 'number' ? r.extra_buffer : 0,
     selfConsumption:
       typeof r.self_consumption === 'number' && r.self_consumption > 0 ? r.self_consumption : 0,
+    walkUpConsumption:
+      typeof r.walk_up_consumption === 'number' && r.walk_up_consumption > 0
+        ? r.walk_up_consumption
+        : 0,
     notes: r.notes,
   }));
 }

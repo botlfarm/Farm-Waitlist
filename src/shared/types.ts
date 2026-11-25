@@ -115,6 +115,7 @@ export interface DailySupplyEntry {
   bufferOverride: number | null;
   extraBuffer?: number; // Additional single-day safety buffer / walk-up event holdback added on top of base buffer
   selfConsumption?: number; // Personal / farm self-consumption deducted like an order without creating a draggable order
+  walkUpConsumption?: number; // Walk-up / market day-of sales deducted like an order without creating a draggable order
   notes: string | null;
 }
 
@@ -221,6 +222,7 @@ export interface DailyItemProjection {
   actualEndOfDay?: number | null;
   slottedQty: number;
   selfConsumption?: number;
+  walkUpConsumption?: number;
   endingBalance: number;
   expectedNextDayStarting?: number;
   nextDayStarting: number;

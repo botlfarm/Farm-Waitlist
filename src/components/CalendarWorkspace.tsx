@@ -1581,6 +1581,21 @@ export function CalendarWorkspace({
                                     </div>
                                   )}
 
+                                  {(focusedProj.walkUpConsumption ?? 0) > 0 && (
+                                    <div
+                                      data-testid={`day-walk-up-consumption-${day.date}`}
+                                      title={`Walk-up / market sales: ${formatQty(focusedProj.walkUpConsumption!)} ${focusedItem.unitLabel} deducted from daily stock`}
+                                      className="flex items-baseline justify-between gap-2 text-[#2DD4BF]"
+                                    >
+                                      <span className="whitespace-nowrap font-sans text-[10px] font-medium">
+                                        Walk-Up
+                                      </span>
+                                      <span className="whitespace-nowrap font-mono text-[10px] font-medium">
+                                        -{formatQty(focusedProj.walkUpConsumption!)}
+                                      </span>
+                                    </div>
+                                  )}
+
                                   {focusedProj.effectiveBuffer > 0 && (
                                     <div
                                       data-testid={
