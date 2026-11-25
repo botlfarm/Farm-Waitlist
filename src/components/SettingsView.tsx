@@ -2,6 +2,8 @@ import {
   Check,
   Database,
   Download,
+  Eye,
+  FlaskConical,
   Link2,
   Mail,
   MessageSquare,
@@ -15,7 +17,11 @@ import {
 } from 'lucide-react';
 import { useEffect, useState, type ChangeEvent } from 'react';
 import { api } from '../lib/api';
-import { isSafeHttpUrl } from '../shared/generators';
+import {
+  PRE_APPROVAL_TEMPLATE_VARIABLES,
+  isSafeHttpUrl,
+  renderPreApprovalSamplePreview,
+} from '../shared/generators';
 import {
   ISO_WEEKDAY_LABELS,
   formatLocalDateTime,
@@ -24,10 +30,12 @@ import {
 import type {
   AppSettings,
   BackupInfo,
+  BackupPreviewStatus,
   IgnoredDateRange,
   OdooConnectionStatus,
   PickupChannel,
   PreApprovalTemplate,
+  SandboxStatus,
   SupplyMode,
   SyncInterval,
   TemplateFormat,
@@ -43,6 +51,14 @@ interface SettingsViewProps {
   odooStatus: OdooConnectionStatus;
   items: TrackedItem[];
   channels: PickupChannel[];
+  sandboxStatus?: SandboxStatus;
+  sandboxBusy?: boolean;
+  onEnterSandbox?: () => Promise<void>;
+  onExitSandbox?: () => Promise<void>;
+  backupPreviewStatus?: BackupPreviewStatus;
+  backupPreviewBusy?: boolean;
+  onEnterBackupPreview?: (filename: string) => Promise<void>;
+  onExitBackupPreview?: () => Promise<void>;
   onWorkspaceChanged: () => Promise<void>;
   onToast: (message: string, kind?: 'info' | 'error') => void;
 }
@@ -59,9 +75,18 @@ export function SettingsView({
   odooStatus,
   items,
   channels,
+  sandboxStatus,
+  sandboxBusy = false,
+  onEnterSandbox,
+  onExitSandbox,
+  backupPreviewStatus,
+  backupPreviewBusy = false,
+  onEnterBackupPreview,
+  onExitBackupPreview,
   onWorkspaceChanged,
   onToast,
 }: SettingsViewProps) {
+  const isBackupPreviewActive = Boolean(backupPreviewStatus?.active);
   const [section, setSection] = useState<SettingsSection>('items');
 
   // --- Tracked Item form state ---
@@ -214,7 +239,7 @@ export function SettingsView({
     if (section === 'backups') {
       void loadBackups();
     }
-  }, [section]);
+  }, [section, sandboxStatus?.active]);
 
   const handleAddItem = async () => {
     if (!itemName.trim()) {
@@ -496,6 +521,21 @@ export function SettingsView({
         ))}
       </div>
 
+      {isBackupPreviewActive && section !== 'backups' && (
+        <div
+          data-testid="settings-readonly-notice"
+          className="mb-6 flex items-center gap-2 rounded-md border border-[#0284C7]/60 bg-[#0284C7]/15 px-4 py-2.5 text-xs text-[#BAE6FD]"
+        >
+          <Eye className="h-4 w-4 shrink-0 text-[#38BDF8]" aria-hidden="true" />
+          <span>
+            Viewing settings from backup{' '}
+            <strong className="font-mono text-white">{backupPreviewStatus?.filename}</strong> in
+            read-only mode. Exit Backup Preview to make changes.
+          </span>
+        </div>
+      )}
+
+      <fieldset disabled={isBackupPreviewActive} className="contents">
       {/* 1. TRACKED ITEMS */}
       {section === 'items' && (
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-12">
@@ -1530,29 +1570,50 @@ export function SettingsView({
 
                 {/* Template Body + Variable Chips */}
                 <div>
-                  <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+                  <div className="mb-1.5 flex items-center justify-between gap-2">
                     <label
                       htmlFor="tmpl-text"
                       className="text-xs font-medium text-[#C9D1D9]"
                     >
                       Message Body
                     </label>
-                    <div className="flex flex-wrap items-center gap-1">
-                      {['{{name}}', '{{items_summary}}', '{{date}}', '{{channel}}'].map((v) => (
-                        <button
-                          key={v}
-                          type="button"
-                          onClick={() =>
-                            updateActiveTemplate({
-                              body: `${activeTemplate.body}${activeTemplate.body && !activeTemplate.body.endsWith(' ') ? ' ' : ''}${v}`,
-                            })
-                          }
-                          className="rounded border border-[#283340] bg-[#0F1419] px-1.5 py-0.5 font-mono text-[10px] text-[#38BDF8] hover:border-[#38BDF8]"
-                        >
-                          +{v}
-                        </button>
-                      ))}
-                    </div>
+                    <span className="text-[11px] text-[#8B949E]">
+                      Click a variable to insert
+                    </span>
+                  </div>
+                  <div className="mb-2 space-y-1.5 rounded-md border border-[#283340] bg-[#0F1419]/60 p-2.5">
+                    {(
+                      [
+                        { group: 'name', title: 'Name' },
+                        { group: 'date', title: 'Date' },
+                        { group: 'order', title: 'Order' },
+                      ] as const
+                    ).map(({ group, title }) => (
+                      <div key={group} className="flex flex-wrap items-center gap-1.5">
+                        <span className="w-11 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-[#8B949E]">
+                          {title}
+                        </span>
+                        {PRE_APPROVAL_TEMPLATE_VARIABLES.filter((v) => v.group === group).map(
+                          (v) => (
+                            <button
+                              key={v.key}
+                              type="button"
+                              data-testid={`template-var-${v.key}`}
+                              title={`${v.label} — e.g. ${v.example}`}
+                              onClick={() =>
+                                updateActiveTemplate({
+                                  body: `${activeTemplate.body}${activeTemplate.body && !activeTemplate.body.endsWith(' ') && !activeTemplate.body.endsWith('\n') ? ' ' : ''}${v.token}`,
+                                })
+                              }
+                              className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#161D24] px-1.5 py-0.5 text-[10px] text-[#38BDF8] transition-colors hover:border-[#38BDF8] hover:bg-[#1E2730]"
+                            >
+                              <span className="font-mono">+{v.token}</span>
+                              <span className="text-[#8B949E]">({v.example})</span>
+                            </button>
+                          )
+                        )}
+                      </div>
+                    ))}
                   </div>
                   <textarea
                     id="tmpl-text"
@@ -1578,11 +1639,10 @@ export function SettingsView({
                   </span>
                   <RichMessagePreview
                     testId="settings-template-preview"
-                    text={activeTemplate.body
-                      .replace(/\{\{\s*name\s*\}\}/gi, 'Alex')
-                      .replace(/\{\{\s*items_summary\s*\}\}/gi, '2 dozens Standard Eggs')
-                      .replace(/\{\{\s*date\s*\}\}/gi, 'Sat, Nov 28, 2026')
-                      .replace(/\{\{\s*channel\s*\}\}/gi, channels[0]?.name ?? 'Farm Store')}
+                    text={renderPreApprovalSamplePreview(
+                      activeTemplate.body,
+                      channels[0]?.name ?? 'Farm Store'
+                    )}
                   />
                 </div>
               </div>
@@ -1638,10 +1698,81 @@ export function SettingsView({
           </section>
         </div>
       )}
+      </fieldset>
 
       {/* 5. BACKUP & RESTORE */}
       {section === 'backups' && (
         <div className="space-y-6">
+          {/* Sandbox Mode Card */}
+          <section
+            data-testid="sandbox-mode-card"
+            className={`rounded-lg border p-5 ${
+              sandboxStatus?.active
+                ? 'border-[#D97706]/80 bg-[#D97706]/10'
+                : 'border-[#283340] bg-[#161D24]'
+            }`}
+          >
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div className="max-w-2xl">
+                <div className="flex items-center gap-2">
+                  <FlaskConical
+                    className={`h-4 w-4 ${sandboxStatus?.active ? 'text-[#FBBF24]' : 'text-[#38BDF8]'}`}
+                    aria-hidden="true"
+                  />
+                  <h2 className="font-['Plus_Jakarta_Sans'] text-base font-bold text-[#F0F6FC]">
+                    Sandbox Mode (Safe Testing Playground)
+                  </h2>
+                </div>
+                <p className="mt-1.5 text-xs leading-relaxed text-[#C9D1D9]">
+                  Takes an automatic backup snapshot of your live database right now, then opens a
+                  separate duplicate copy so you can experiment freely with scheduling, supply
+                  counts, or settings. While Sandbox Mode is active, live website publishing and
+                  scheduled background tasks are paused. Exiting discards sandbox changes and loads
+                  your untouched live database back.
+                </p>
+                {sandboxStatus?.active && (
+                  <p className="mt-2 font-mono text-[11px] text-[#FBBF24]">
+                    Active sandbox session
+                    {sandboxStatus.snapshotFilename
+                      ? ` • Pre-sandbox backup saved: ${sandboxStatus.snapshotFilename}`
+                      : ''}
+                  </p>
+                )}
+                {isBackupPreviewActive && !sandboxStatus?.active && (
+                  <p className="mt-2 text-xs text-[#7DD3FC]">
+                    Exit Backup Preview before starting a Sandbox session.
+                  </p>
+                )}
+              </div>
+
+              <div className="flex shrink-0 items-center gap-2">
+                {sandboxStatus?.active ? (
+                  <button
+                    type="button"
+                    data-testid="settings-exit-sandbox-btn"
+                    disabled={sandboxBusy || !onExitSandbox}
+                    onClick={() => void onExitSandbox?.().then(() => loadBackups())}
+                    className="inline-flex min-h-[40px] items-center gap-2 rounded-md bg-[#D97706] px-4 py-2 text-xs font-semibold text-[#0B1117] hover:bg-[#F59E0B] disabled:opacity-50"
+                  >
+                    <RotateCcw className="h-4 w-4" aria-hidden="true" />
+                    {sandboxBusy ? 'Returning to Live...' : 'Exit Sandbox & Return to Live'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    data-testid="enter-sandbox-btn"
+                    disabled={sandboxBusy || isBackupPreviewActive || !onEnterSandbox}
+                    onClick={() => void onEnterSandbox?.().then(() => loadBackups())}
+                    className="inline-flex min-h-[40px] items-center gap-2 rounded-md border border-[#F59E0B]/70 bg-[#D97706]/15 px-4 py-2 text-xs font-semibold text-[#FBBF24] hover:bg-[#D97706]/25 disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <FlaskConical className="h-4 w-4" aria-hidden="true" />
+                    {sandboxBusy ? 'Starting Sandbox...' : 'Enter Sandbox Mode'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </section>
+
           <section className="rounded-lg border border-[#283340] bg-[#161D24] p-5">
             <div className="flex flex-wrap items-center justify-between gap-4">
               <div>
@@ -1650,17 +1781,36 @@ export function SettingsView({
                 </h2>
                 <p className="mt-1 text-xs text-[#8B949E]">
                   Stored inside Home Assistant&apos;s persistent /data/backups/ volume using
-                  SQLite&apos;s online backup API.
+                  SQLite&apos;s online backup API. Preview any snapshot in read-only mode before
+                  deciding to restore it.
                 </p>
+                {sandboxStatus?.active && (
+                  <p className="mt-1.5 text-xs text-[#FBBF24]">
+                    Exit Sandbox Mode to create, preview, or restore live database snapshots.
+                  </p>
+                )}
+                {isBackupPreviewActive && (
+                  <p className="mt-1.5 text-xs text-[#7DD3FC]">
+                    Read-only Backup Preview is active. You can preview another snapshot, restore
+                    any snapshot to your live database, or exit preview to create new backups.
+                  </p>
+                )}
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <label className="inline-flex min-h-[40px] cursor-pointer items-center gap-2 rounded-md border border-[#283340] bg-[#0F1419] px-4 py-2 text-xs font-semibold text-[#E6EDF3] hover:border-[#38BDF8]">
+                <label
+                  className={`inline-flex min-h-[40px] items-center gap-2 rounded-md border border-[#283340] bg-[#0F1419] px-4 py-2 text-xs font-semibold text-[#E6EDF3] ${
+                    sandboxStatus?.active || isBackupPreviewActive
+                      ? 'cursor-not-allowed opacity-45'
+                      : 'cursor-pointer hover:border-[#38BDF8]'
+                  }`}
+                >
                   <Upload className="h-4 w-4" />
                   Upload .db to Restore
                   <input
                     type="file"
                     accept=".db,.sqlite,.sqlite3"
                     data-testid="backup-upload-input"
+                    disabled={Boolean(sandboxStatus?.active) || isBackupPreviewActive}
                     onChange={(e) => void handleUploadBackup(e)}
                     className="hidden"
                   />
@@ -1668,8 +1818,9 @@ export function SettingsView({
                 <button
                   type="button"
                   data-testid="create-backup-now-btn"
+                  disabled={Boolean(sandboxStatus?.active) || isBackupPreviewActive}
                   onClick={() => void handleCreateBackup()}
-                  className="inline-flex min-h-[40px] items-center gap-2 rounded-md bg-[#0EA5E9] px-4 py-2 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8]"
+                  className="inline-flex min-h-[40px] items-center gap-2 rounded-md bg-[#0EA5E9] px-4 py-2 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   <Database className="h-4 w-4" />
                   Create Snapshot Now
@@ -1681,13 +1832,14 @@ export function SettingsView({
               <label className="flex items-center gap-2 text-[#C9D1D9]">
                 <input
                   type="checkbox"
+                  disabled={isBackupPreviewActive}
                   checked={draftSettings.backupScheduleEnabled}
                   onChange={(e) => {
                     const enabled = e.target.checked;
                     setDraftSettings({ ...draftSettings, backupScheduleEnabled: enabled });
                     void handleSaveSettings({ backupScheduleEnabled: enabled });
                   }}
-                  className="h-4 w-4 accent-[#0EA5E9]"
+                  className="h-4 w-4 accent-[#0EA5E9] disabled:cursor-not-allowed disabled:opacity-45"
                 />
                 Enable Daily Scheduled Backups
               </label>
@@ -1698,6 +1850,7 @@ export function SettingsView({
                   type="number"
                   min="1"
                   max="90"
+                  disabled={isBackupPreviewActive}
                   value={draftSettings.backupRetentionDays}
                   onChange={(e) =>
                     setDraftSettings({
@@ -1706,7 +1859,7 @@ export function SettingsView({
                     })
                   }
                   onBlur={() => void handleSaveSettings()}
-                  className="w-16 rounded border border-[#283340] bg-[#0F1419] px-2 py-1 font-mono text-xs tabular-nums text-[#F0F6FC]"
+                  className="w-16 rounded border border-[#283340] bg-[#0F1419] px-2 py-1 font-mono text-xs tabular-nums text-[#F0F6FC] disabled:cursor-not-allowed disabled:opacity-45"
                 />
                 <span className="text-[#8B949E]">daily snapshots</span>
               </div>
@@ -1737,52 +1890,102 @@ export function SettingsView({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[#283340]">
-                    {backups.map((b) => (
-                      <tr key={b.filename} data-testid={`backup-row-${b.filename}`}>
-                        <td className="py-2.5 pr-4 font-mono text-[#F0F6FC]">{b.filename}</td>
-                        <td className="px-3 py-2.5 capitalize text-[#C9D1D9]">{b.trigger}</td>
-                        <td className="px-3 py-2.5 font-mono tabular-nums text-[#8B949E]">
-                          {formatBytes(b.sizeBytes)}
-                        </td>
-                        <td className="px-3 py-2.5 font-mono tabular-nums text-[#8B949E]">
-                          {formatLocalDateTime(new Date(b.createdAt), settings.timezone)}
-                        </td>
-                        <td className="py-2.5 pl-3 text-right">
-                          <div className="inline-flex items-center gap-2">
-                            <a
-                              href={api.backupDownloadUrl(b.filename)}
-                              download={b.filename}
-                              data-testid={`backup-download-${b.filename}`}
-                              className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#0F1419] px-2.5 py-1 text-[11px] font-medium text-[#E6EDF3] hover:border-[#38BDF8]"
-                            >
-                              <Download className="h-3 w-3" />
-                              Download
-                            </a>
-                            {confirmRestoreFile === b.filename ? (
-                              <button
-                                type="button"
-                                data-testid={`backup-confirm-restore-${b.filename}`}
-                                onClick={() => void handleRestoreBackup(b.filename)}
-                                className="inline-flex items-center gap-1 rounded bg-[#D97706] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117]"
+                    {backups.map((b) => {
+                      const isCurrentlyPreviewing =
+                        isBackupPreviewActive && backupPreviewStatus?.filename === b.filename;
+                      return (
+                        <tr
+                          key={b.filename}
+                          data-testid={`backup-row-${b.filename}`}
+                          className={isCurrentlyPreviewing ? 'bg-[#0284C7]/10' : undefined}
+                        >
+                          <td className="py-2.5 pr-4 font-mono text-[#F0F6FC]">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span>{b.filename}</span>
+                              {isCurrentlyPreviewing && (
+                                <span
+                                  data-testid={`backup-previewing-badge-${b.filename}`}
+                                  className="inline-flex items-center gap-1 rounded border border-[#38BDF8]/60 bg-[#0284C7]/25 px-1.5 py-0.5 font-sans text-[10px] font-semibold uppercase tracking-wide text-[#BAE6FD]"
+                                >
+                                  <Eye className="h-3 w-3" aria-hidden="true" />
+                                  Previewing
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2.5 capitalize text-[#C9D1D9]">{b.trigger}</td>
+                          <td className="px-3 py-2.5 font-mono tabular-nums text-[#8B949E]">
+                            {formatBytes(b.sizeBytes)}
+                          </td>
+                          <td className="px-3 py-2.5 font-mono tabular-nums text-[#8B949E]">
+                            {formatLocalDateTime(new Date(b.createdAt), settings.timezone)}
+                          </td>
+                          <td className="py-2.5 pl-3 text-right">
+                            <div className="inline-flex flex-wrap items-center justify-end gap-2">
+                              {isCurrentlyPreviewing ? (
+                                <button
+                                  type="button"
+                                  data-testid={`backup-exit-preview-${b.filename}`}
+                                  disabled={backupPreviewBusy || !onExitBackupPreview}
+                                  onClick={() => void onExitBackupPreview?.()}
+                                  className="inline-flex items-center gap-1 rounded border border-[#38BDF8]/70 bg-[#0284C7]/20 px-2.5 py-1 text-[11px] font-semibold text-[#BAE6FD] hover:bg-[#0284C7]/35 disabled:opacity-45"
+                                >
+                                  <RotateCcw className="h-3 w-3" />
+                                  Exit Preview
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  data-testid={`backup-preview-${b.filename}`}
+                                  disabled={
+                                    Boolean(sandboxStatus?.active) ||
+                                    backupPreviewBusy ||
+                                    !onEnterBackupPreview
+                                  }
+                                  onClick={() => void onEnterBackupPreview?.(b.filename)}
+                                  className="inline-flex items-center gap-1 rounded border border-[#38BDF8]/50 bg-[#0F1419] px-2.5 py-1 text-[11px] font-medium text-[#38BDF8] hover:border-[#38BDF8] hover:bg-[#0EA5E9]/10 disabled:cursor-not-allowed disabled:opacity-45"
+                                >
+                                  <Eye className="h-3 w-3" />
+                                  Preview
+                                </button>
+                              )}
+                              <a
+                                href={api.backupDownloadUrl(b.filename)}
+                                download={b.filename}
+                                data-testid={`backup-download-${b.filename}`}
+                                className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#0F1419] px-2.5 py-1 text-[11px] font-medium text-[#E6EDF3] hover:border-[#38BDF8]"
                               >
-                                <Check className="h-3 w-3" />
-                                Confirm Restore
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                data-testid={`backup-restore-${b.filename}`}
-                                onClick={() => setConfirmRestoreFile(b.filename)}
-                                className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#0F1419] px-2.5 py-1 text-[11px] font-medium text-[#FBBF24] hover:border-[#FBBF24]"
-                              >
-                                <RotateCcw className="h-3 w-3" />
-                                Restore
-                              </button>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                                <Download className="h-3 w-3" />
+                                Download
+                              </a>
+                              {confirmRestoreFile === b.filename ? (
+                                <button
+                                  type="button"
+                                  data-testid={`backup-confirm-restore-${b.filename}`}
+                                  disabled={Boolean(sandboxStatus?.active)}
+                                  onClick={() => void handleRestoreBackup(b.filename)}
+                                  className="inline-flex items-center gap-1 rounded bg-[#D97706] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] disabled:opacity-45"
+                                >
+                                  <Check className="h-3 w-3" />
+                                  Confirm Restore
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  data-testid={`backup-restore-${b.filename}`}
+                                  disabled={Boolean(sandboxStatus?.active)}
+                                  onClick={() => setConfirmRestoreFile(b.filename)}
+                                  className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#0F1419] px-2.5 py-1 text-[11px] font-medium text-[#FBBF24] hover:border-[#FBBF24] disabled:cursor-not-allowed disabled:opacity-45"
+                                >
+                                  <RotateCcw className="h-3 w-3" />
+                                  Restore
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

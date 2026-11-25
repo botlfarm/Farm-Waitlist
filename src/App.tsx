@@ -1,3 +1,4 @@
+import { Check, Eye, FlaskConical, RotateCcw } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { AvailabilitySnippetView } from './components/AvailabilitySnippetView';
 import { CalendarWorkspace } from './components/CalendarWorkspace';
@@ -49,6 +50,9 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [publishingAvailability, setPublishingAvailability] = useState(false);
   const [autoSlotting, setAutoSlotting] = useState(false);
+  const [sandboxBusy, setSandboxBusy] = useState(false);
+  const [backupPreviewBusy, setBackupPreviewBusy] = useState(false);
+  const [confirmRestorePreview, setConfirmRestorePreview] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
 
   const showToast = useCallback((message: string, kind: 'info' | 'error' = 'info') => {
@@ -108,6 +112,10 @@ export default function App() {
     date: string,
     forceWeekday = false
   ): Promise<boolean> => {
+    if (workspace?.backupPreviewStatus?.active) {
+      showToast('Read-only Backup Preview is active. Exit Backup Preview to make changes.', 'error');
+      return false;
+    }
     try {
       await api.slotOrder(orderId, { date, forceWeekday });
       setWeekdayPrompt(null);
@@ -129,6 +137,7 @@ export default function App() {
   };
 
   const handleSyncNow = async () => {
+    if (workspace?.backupPreviewStatus?.active) return;
     setSyncing(true);
     try {
       const res = await api.syncOdoo();
@@ -153,6 +162,20 @@ export default function App() {
   };
 
   const handlePublishAvailability = async () => {
+    if (workspace?.backupPreviewStatus?.active) {
+      showToast(
+        'Publishing to your website is disabled while previewing a backup. Exit Backup Preview first.',
+        'error'
+      );
+      return;
+    }
+    if (workspace?.sandboxStatus?.active) {
+      showToast(
+        'Live website publishing is disabled while in Sandbox Mode. Exit Sandbox Mode first.',
+        'error'
+      );
+      return;
+    }
     setPublishingAvailability(true);
     try {
       const res = await api.publishSnippetToGithub({ force: true });
@@ -175,7 +198,92 @@ export default function App() {
     }
   };
 
+  const handleEnterSandbox = async () => {
+    setSandboxBusy(true);
+    try {
+      const { backup } = await api.enterSandbox();
+      setSelectedDayDate(null);
+      setSelectedOrderId(null);
+      await refreshWorkspace();
+      showToast(
+        `Sandbox Mode active — snapshot ${backup.filename} saved. Changes here will not affect live data.`
+      );
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to start Sandbox Mode', 'error');
+    } finally {
+      setSandboxBusy(false);
+    }
+  };
+
+  const handleExitSandbox = async () => {
+    setSandboxBusy(true);
+    try {
+      await api.exitSandbox();
+      setSelectedDayDate(null);
+      setSelectedOrderId(null);
+      await refreshWorkspace();
+      showToast('Exited Sandbox Mode — live database restored');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to exit Sandbox Mode', 'error');
+    } finally {
+      setSandboxBusy(false);
+    }
+  };
+
+  const handleEnterBackupPreview = async (filename: string) => {
+    setBackupPreviewBusy(true);
+    setConfirmRestorePreview(false);
+    try {
+      await api.enterBackupPreview(filename);
+      setSelectedDayDate(null);
+      setSelectedOrderId(null);
+      setQuickAddOpen(false);
+      await refreshWorkspace();
+      setActiveTab('calendar');
+      showToast(`Previewing ${filename} in read-only mode — no changes can be made.`);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to preview backup', 'error');
+    } finally {
+      setBackupPreviewBusy(false);
+    }
+  };
+
+  const handleExitBackupPreview = async () => {
+    setBackupPreviewBusy(true);
+    setConfirmRestorePreview(false);
+    try {
+      await api.exitBackupPreview();
+      setSelectedDayDate(null);
+      setSelectedOrderId(null);
+      await refreshWorkspace();
+      showToast('Exited Backup Preview — returned to live database');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to exit Backup Preview', 'error');
+    } finally {
+      setBackupPreviewBusy(false);
+    }
+  };
+
+  const handleRestorePreviewedBackup = async () => {
+    setBackupPreviewBusy(true);
+    try {
+      const res = await api.restorePreviewedBackup();
+      setConfirmRestorePreview(false);
+      setSelectedDayDate(null);
+      setSelectedOrderId(null);
+      await refreshWorkspace();
+      showToast(
+        `Restored ${res.restoredFrom} to live database (safety snapshot: ${res.safetySnapshot.filename})`
+      );
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to restore backup', 'error');
+    } finally {
+      setBackupPreviewBusy(false);
+    }
+  };
+
   const handleAutoSlotAsap = async () => {
+    if (workspace?.backupPreviewStatus?.active) return;
     setAutoSlotting(true);
     try {
       const res = await api.autoSlotAsap(weeks);
@@ -193,6 +301,7 @@ export default function App() {
   };
 
   const handlePreApprove = async (orderId: number) => {
+    if (workspace?.backupPreviewStatus?.active) return;
     try {
       const { order, message, selectedTemplateId } = await api.preApproveOrder(orderId);
       await refreshWorkspace();
@@ -209,6 +318,7 @@ export default function App() {
   };
 
   const handleUndo = async () => {
+    if (workspace?.backupPreviewStatus?.active) return;
     try {
       const { restoredLabel } = await api.undoLastAction();
       await refreshWorkspace();
@@ -218,13 +328,122 @@ export default function App() {
     }
   };
 
+  const isSandboxActive = Boolean(workspace?.sandboxStatus?.active);
+  const isBackupPreviewActive = Boolean(workspace?.backupPreviewStatus?.active);
+
   return (
     <div className="min-h-screen bg-[#0F1419] text-[#E6EDF3]">
-      <TopBar
-        activeTab={activeTab}
-        onSelectTab={setActiveTab}
-        onQuickAdd={() => setQuickAddOpen(true)}
-      />
+      <div className="sticky top-0 z-30">
+        {isSandboxActive && (
+          <div
+            data-testid="sandbox-mode-banner"
+            role="alert"
+            className="border-b border-[#B45309] bg-[#D97706] px-4 py-2 text-[#0B1117] md:px-6"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-medium md:text-sm">
+                <FlaskConical className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span className="font-['Plus_Jakarta_Sans'] font-bold uppercase tracking-wide">
+                  Sandbox Mode
+                </span>
+                <span className="hidden text-[#0B1117]/70 sm:inline">—</span>
+                <span>
+                  Working on a temporary copy of your database. Changes are not permanent and will
+                  not affect live data or your website.
+                </span>
+              </div>
+              <button
+                type="button"
+                data-testid="exit-sandbox-btn"
+                disabled={sandboxBusy}
+                onClick={() => void handleExitSandbox()}
+                className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#0B1117] px-3 py-1 text-xs font-semibold text-[#FEF3C7] transition-colors hover:bg-[#161D24] disabled:opacity-50"
+              >
+                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                {sandboxBusy ? 'Returning to Live...' : 'Exit Sandbox & Return to Live'}
+              </button>
+            </div>
+          </div>
+        )}
+        {isBackupPreviewActive && (
+          <div
+            data-testid="backup-preview-banner"
+            role="alert"
+            className="border-b border-[#0369A1] bg-[#0284C7] px-4 py-2 text-[#F0F9FF] md:px-6"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs font-medium md:text-sm">
+                <Eye className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span className="font-['Plus_Jakarta_Sans'] font-bold uppercase tracking-wide">
+                  Read-Only Backup Preview
+                </span>
+                <span className="hidden text-[#E0F2FE]/80 sm:inline">—</span>
+                <span>
+                  Viewing{' '}
+                  <strong className="font-mono font-semibold text-white">
+                    {workspace?.backupPreviewStatus?.filename}
+                  </strong>
+                  . No changes can be made while previewing.
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {confirmRestorePreview ? (
+                  <>
+                    <button
+                      type="button"
+                      data-testid="preview-confirm-restore-btn"
+                      disabled={backupPreviewBusy}
+                      onClick={() => void handleRestorePreviewedBackup()}
+                      className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#FBBF24] px-3 py-1 text-xs font-semibold text-[#0B1117] transition-colors hover:bg-[#FCD34D] disabled:opacity-50"
+                    >
+                      <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                      {backupPreviewBusy ? 'Restoring...' : 'Confirm Restore to Live'}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="preview-cancel-restore-btn"
+                      disabled={backupPreviewBusy}
+                      onClick={() => setConfirmRestorePreview(false)}
+                      className="inline-flex min-h-[32px] shrink-0 items-center rounded-md border border-[#BAE6FD]/60 bg-[#0369A1] px-2.5 py-1 text-xs font-medium text-[#F0F9FF] transition-colors hover:bg-[#075985] disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    data-testid="preview-restore-backup-btn"
+                    disabled={backupPreviewBusy}
+                    onClick={() => setConfirmRestorePreview(true)}
+                    className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md border border-[#BAE6FD]/60 bg-[#0369A1] px-3 py-1 text-xs font-semibold text-[#F0F9FF] transition-colors hover:bg-[#075985] disabled:opacity-50"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                    Restore This Backup
+                  </button>
+                )}
+                <button
+                  type="button"
+                  data-testid="exit-backup-preview-btn"
+                  disabled={backupPreviewBusy}
+                  onClick={() => void handleExitBackupPreview()}
+                  className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#0B1117] px-3 py-1 text-xs font-semibold text-[#E0F2FE] transition-colors hover:bg-[#161D24] disabled:opacity-50"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                  {backupPreviewBusy ? 'Returning to Live...' : 'Exit Preview & Return to Live'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        <TopBar
+          activeTab={activeTab}
+          onSelectTab={setActiveTab}
+          onQuickAdd={() => {
+            if (!isBackupPreviewActive) setQuickAddOpen(true);
+          }}
+          readOnly={isBackupPreviewActive}
+        />
+      </div>
 
       {loading && !workspace ? (
         <div className="flex items-center justify-center py-24 text-sm text-[#8B949E]">
@@ -249,6 +468,7 @@ export default function App() {
           {activeTab === 'calendar' && (
             <CalendarWorkspace
               workspace={workspace}
+              readOnly={isBackupPreviewActive}
               focusedItemId={focusedItemId}
               onChangeFocusedItem={(id) => {
                 setHasChosenFocus(true);
@@ -353,6 +573,7 @@ export default function App() {
               channels={workspace.channels}
               standingOrders={workspace.standingOrders}
               odooConfigured={workspace.odooStatus.configured}
+              readOnly={isBackupPreviewActive}
               onCreate={async (payload) => {
                 await api.createStandingOrder(payload);
                 await refreshWorkspace();
@@ -376,6 +597,8 @@ export default function App() {
               defaultWeeks={workspace.settings.publicSnippetWeeks}
               settings={workspace.settings}
               githubPublishStatus={workspace.githubPublishStatus}
+              isSandboxMode={isSandboxActive}
+              readOnly={isBackupPreviewActive}
               onSettingsSaved={() => refreshWorkspace()}
               onToast={showToast}
             />
@@ -388,6 +611,14 @@ export default function App() {
               odooStatus={workspace.odooStatus}
               items={workspace.items}
               channels={workspace.channels}
+              sandboxStatus={workspace.sandboxStatus}
+              sandboxBusy={sandboxBusy}
+              onEnterSandbox={handleEnterSandbox}
+              onExitSandbox={handleExitSandbox}
+              backupPreviewStatus={workspace.backupPreviewStatus}
+              backupPreviewBusy={backupPreviewBusy}
+              onEnterBackupPreview={handleEnterBackupPreview}
+              onExitBackupPreview={handleExitBackupPreview}
               onWorkspaceChanged={() => refreshWorkspace()}
               onToast={showToast}
             />
@@ -401,6 +632,7 @@ export default function App() {
             items={workspace.items}
             channels={workspace.channels}
             initialFocusedItemId={focusedItemId}
+            readOnly={isBackupPreviewActive}
             onClose={() => setSelectedDayDate(null)}
             onSaveSupply={async (itemId, date, payload) => {
               await api.updateDailySupply(itemId, date, payload);
@@ -428,6 +660,7 @@ export default function App() {
                 cascadeForward: Boolean(existingProj?.isCascadeAnchor),
                 bufferOverride: existingBaseBuffer,
                 extraBuffer: existingProj?.extraBuffer ?? 0,
+                selfConsumption: existingProj?.selfConsumption ?? 0,
                 notes: existingProj?.notes ?? null,
               });
               await refreshWorkspace();
@@ -459,6 +692,7 @@ export default function App() {
             weeks={workspace.weeks}
             holdThresholdHours={workspace.settings.holdThresholdHours}
             odooConfigured={workspace.odooStatus.configured}
+            readOnly={isBackupPreviewActive}
             onClose={() => setSelectedOrderId(null)}
             onSelectOrder={(orderId) => setSelectedOrderId(orderId)}
             onSaveOrder={async (orderId, patch) => {

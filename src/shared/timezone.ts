@@ -258,6 +258,55 @@ export function formatFullDisplayDate(ymd: string): string {
   }).format(dt);
 }
 
+/** e.g. "Sat, Nov 28" (drops the year) */
+export function formatDateNoYear(ymd: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return ymd;
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC',
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  }).format(dt);
+}
+
+/** e.g. "Saturday, November 28" (drops the year) */
+export function formatDateLongNoYear(ymd: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return ymd;
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC',
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+  }).format(dt);
+}
+
+/** e.g. "11/28" (drops the year) */
+export function formatDateNumeric(ymd: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return ymd;
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC',
+    month: 'numeric',
+    day: 'numeric',
+  }).format(dt);
+}
+
+/** e.g. "Saturday" */
+export function formatWeekdayLong(ymd: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ymd)) return ymd;
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'UTC',
+    weekday: 'long',
+  }).format(dt);
+}
+
 export function getAgingHoldHours(preApprovedAtIso: string | null, now: Date = new Date()): number | null {
   if (!preApprovedAtIso) return null;
   const dt = new Date(preApprovedAtIso);

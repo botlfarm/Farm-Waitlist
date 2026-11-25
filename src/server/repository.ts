@@ -94,6 +94,7 @@ export function listDailySupplyEntries(db: Database.Database): DailySupplyEntry[
     is_cascade_anchor: number;
     buffer_override: number | null;
     extra_buffer?: number | null;
+    self_consumption?: number | null;
     notes: string | null;
   }>;
 
@@ -107,6 +108,8 @@ export function listDailySupplyEntries(db: Database.Database): DailySupplyEntry[
     isCascadeAnchor: Boolean(r.is_cascade_anchor),
     bufferOverride: r.buffer_override,
     extraBuffer: typeof r.extra_buffer === 'number' ? r.extra_buffer : 0,
+    selfConsumption:
+      typeof r.self_consumption === 'number' && r.self_consumption > 0 ? r.self_consumption : 0,
     notes: r.notes,
   }));
 }

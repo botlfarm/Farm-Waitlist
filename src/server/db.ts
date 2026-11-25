@@ -10,9 +10,11 @@ import { DEFAULT_TIMEZONE } from '../shared/timezone';
 import type {
   AppSettings,
   BackupInfo,
+  BackupPreviewStatus,
   BackupTrigger,
   GithubPublishInterval,
   PreApprovalTemplate,
+  SandboxStatus,
 } from '../shared/types';
 
 export interface Migration {
@@ -371,6 +373,13 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE orders ADD COLUMN odoo_missing_dismissed INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    version: 9,
+    name: 'add_daily_self_consumption',
+    sql: `
+      ALTER TABLE daily_supply_entries ADD COLUMN self_consumption REAL NOT NULL DEFAULT 0;
+    `,
+  },
 ];
 
 const SQLITE_HEADER_MAGIC = Buffer.from('SQLite format 3\0', 'utf8');
@@ -384,31 +393,113 @@ function formatBackupStamp(date: Date = new Date()): string {
 function parseTriggerFromFilename(filename: string): BackupTrigger {
   if (filename.startsWith('pre-migrate-')) return 'pre-migrate';
   if (filename.startsWith('pre-restore-')) return 'pre-restore';
+  if (filename.startsWith('pre-sandbox-')) return 'pre-sandbox';
   if (filename.startsWith('scheduled-')) return 'scheduled';
   return 'manual';
 }
 
 export class DatabaseManager {
   public readonly dbPath: string;
+  public readonly sandboxDbPath: string;
+  public readonly previewDbPath: string;
   public readonly backupDir: string;
   private _db!: Database.Database;
   private migrations: Migration[];
+  private _sandboxActive = false;
+  private _sandboxStartedAt: string | null = null;
+  private _sandboxSnapshotFilename: string | null = null;
+  private _backupPreviewActive = false;
+  private _backupPreviewFilename: string | null = null;
+  private _backupPreviewStartedAt: string | null = null;
+  private _backupPreviewCreatedAt: string | null = null;
 
   constructor(dbPath: string, backupDir: string, migrations: Migration[] = MIGRATIONS) {
     this.dbPath = path.resolve(dbPath);
+    const parsedDb = path.parse(this.dbPath);
+    this.sandboxDbPath = path.join(parsedDb.dir, `${parsedDb.name}.sandbox${parsedDb.ext || '.db'}`);
+    this.previewDbPath = path.join(parsedDb.dir, `${parsedDb.name}.preview${parsedDb.ext || '.db'}`);
     this.backupDir = path.resolve(backupDir);
     this.migrations = [...migrations].sort((a, b) => a.version - b.version);
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     fs.mkdirSync(this.backupDir, { recursive: true });
-    this.openConnection();
+    // Always discard any leftover sandbox or preview files from an interrupted run and boot into the live DB
+    this.cleanupSandboxFiles();
+    this.cleanupPreviewFiles();
+    this.openConnection(this.dbPath);
   }
 
   get db(): Database.Database {
     return this._db;
   }
 
-  private openConnection(): void {
-    this._db = new Database(this.dbPath);
+  public isSandboxActive(): boolean {
+    return this._sandboxActive;
+  }
+
+  public isBackupPreviewActive(): boolean {
+    return this._backupPreviewActive;
+  }
+
+  public isNonLiveMode(): boolean {
+    return this._sandboxActive || this._backupPreviewActive;
+  }
+
+  public getSandboxStatus(): SandboxStatus {
+    return {
+      active: this._sandboxActive,
+      startedAt: this._sandboxStartedAt,
+      snapshotFilename: this._sandboxSnapshotFilename,
+    };
+  }
+
+  public getBackupPreviewStatus(): BackupPreviewStatus {
+    return {
+      active: this._backupPreviewActive,
+      filename: this._backupPreviewFilename,
+      startedAt: this._backupPreviewStartedAt,
+      backupCreatedAt: this._backupPreviewCreatedAt,
+    };
+  }
+
+  private cleanupSandboxFiles(): void {
+    for (const candidate of [
+      this.sandboxDbPath,
+      `${this.sandboxDbPath}-wal`,
+      `${this.sandboxDbPath}-shm`,
+    ]) {
+      if (fs.existsSync(candidate)) {
+        try {
+          fs.unlinkSync(candidate);
+        } catch {
+          // Ignore transient cleanup failure if file was already removed
+        }
+      }
+    }
+  }
+
+  private cleanupPreviewFiles(): void {
+    for (const candidate of [
+      this.previewDbPath,
+      `${this.previewDbPath}-wal`,
+      `${this.previewDbPath}-shm`,
+    ]) {
+      if (fs.existsSync(candidate)) {
+        try {
+          fs.unlinkSync(candidate);
+        } catch {
+          // Ignore transient cleanup failure if file was already removed
+        }
+      }
+    }
+  }
+
+  private openConnection(targetPath: string = this.dbPath, readonly = false): void {
+    if (readonly) {
+      this._db = new Database(targetPath, { readonly: true, fileMustExist: true });
+      this._db.pragma('busy_timeout = 5000');
+      return;
+    }
+    this._db = new Database(targetPath);
     this._db.pragma('journal_mode = WAL');
     this._db.pragma('foreign_keys = ON');
     this._db.pragma('busy_timeout = 5000');
@@ -418,6 +509,193 @@ export class DatabaseManager {
     if (this._db && this._db.open) {
       this._db.close();
     }
+    if (this._sandboxActive) {
+      this.cleanupSandboxFiles();
+      this._sandboxActive = false;
+      this._sandboxStartedAt = null;
+      this._sandboxSnapshotFilename = null;
+    }
+    if (this._backupPreviewActive) {
+      this.cleanupPreviewFiles();
+      this._backupPreviewActive = false;
+      this._backupPreviewFilename = null;
+      this._backupPreviewStartedAt = null;
+      this._backupPreviewCreatedAt = null;
+    }
+  }
+
+  /**
+   * Starts Sandbox Mode safely:
+   * 1. Creates a full safety backup snapshot of the live database in BACKUP_DIR (`pre-sandbox-*.db`).
+   * 2. Duplicates the live database into a separate temporary sandbox SQLite file.
+   * 3. Switches the active SQLite connection to the sandbox duplicate while leaving the live file untouched.
+   */
+  public async enterSandbox(): Promise<{ sandboxStatus: SandboxStatus; backup: BackupInfo }> {
+    if (this._sandboxActive) {
+      throw new Error('Sandbox Mode is already active');
+    }
+    if (this._backupPreviewActive) {
+      throw new Error('Exit Backup Preview before entering Sandbox Mode');
+    }
+
+    const backup = await this.createBackup('pre-sandbox');
+    this.cleanupSandboxFiles();
+
+    try {
+      await this._db.backup(this.sandboxDbPath);
+      if (this._db && this._db.open) {
+        this._db.close();
+      }
+      this.openConnection(this.sandboxDbPath);
+      this._sandboxActive = true;
+      this._sandboxStartedAt = new Date().toISOString();
+      this._sandboxSnapshotFilename = backup.filename;
+      return {
+        sandboxStatus: this.getSandboxStatus(),
+        backup,
+      };
+    } catch (err) {
+      this.cleanupSandboxFiles();
+      this._sandboxActive = false;
+      this._sandboxStartedAt = null;
+      this._sandboxSnapshotFilename = null;
+      if (!this._db || !this._db.open) {
+        this.openConnection(this.dbPath);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Exits Sandbox Mode, discards the temporary sandbox database, and reconnects to the untouched live database.
+   */
+  public exitSandbox(): { sandboxStatus: SandboxStatus } {
+    if (!this._sandboxActive) {
+      return { sandboxStatus: this.getSandboxStatus() };
+    }
+
+    if (this._db && this._db.open) {
+      this._db.close();
+    }
+    this.cleanupSandboxFiles();
+    this._sandboxActive = false;
+    this._sandboxStartedAt = null;
+    this._sandboxSnapshotFilename = null;
+    this.openConnection(this.dbPath);
+    return { sandboxStatus: this.getSandboxStatus() };
+  }
+
+  /**
+   * Opens a stored backup snapshot in strict Read-Only Preview Mode:
+   * 1. Validates the filename & SQLite integrity without touching the original backup file.
+   * 2. Copies it to a temporary preview file and applies any missing read-compatibility migrations
+   *    (so older backups can still be inspected without errors or modifying BACKUP_DIR).
+   * 3. Reopens the temporary copy with `{ readonly: true }` so zero writes can occur.
+   */
+  public enterBackupPreview(
+    filename: string,
+    defaultTimezone: string = DEFAULT_TIMEZONE
+  ): { backupPreviewStatus: BackupPreviewStatus } {
+    if (this._sandboxActive) {
+      throw new Error('Exit Sandbox Mode before previewing a backup');
+    }
+
+    const safePath = this.resolveSafeBackupPath(filename);
+    this.validateSqliteFile(safePath);
+    const stat = fs.statSync(safePath);
+
+    try {
+      if (this._db && this._db.open) {
+        this._db.close();
+      }
+      this.cleanupPreviewFiles();
+      fs.copyFileSync(safePath, this.previewDbPath);
+
+      // Bring older backup copies up to current read schema in-place on the temp copy only,
+      // switching journal_mode back to DELETE so the readonly connection needs no -wal/-shm files.
+      const prepDb = new Database(this.previewDbPath);
+      try {
+        prepDb.pragma('journal_mode = DELETE');
+        prepDb.pragma('foreign_keys = ON');
+        prepDb.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+          );
+        `);
+        const appliedRows = prepDb
+          .prepare('SELECT version FROM schema_migrations ORDER BY version ASC')
+          .all() as Array<{ version: number }>;
+        const appliedSet = new Set(appliedRows.map((r) => r.version));
+        const pending = this.migrations.filter((m) => !appliedSet.has(m.version));
+        for (const migration of pending) {
+          const runMigration = prepDb.transaction(() => {
+            prepDb.exec(migration.sql);
+            prepDb
+              .prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)')
+              .run(migration.version, migration.name, new Date().toISOString());
+          });
+          runMigration();
+        }
+        // Ensure default settings rows exist in temp copy if previewing a very early backup
+        const defaults: AppSettings = {
+          ...DEFAULT_APP_SETTINGS,
+          timezone: defaultTimezone || DEFAULT_TIMEZONE,
+        };
+        const now = new Date().toISOString();
+        const stmt = prepDb.prepare(
+          'INSERT OR IGNORE INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?)'
+        );
+        const seedTx = prepDb.transaction(() => {
+          for (const [key, value] of Object.entries(defaults)) {
+            stmt.run(key, JSON.stringify(value), now);
+          }
+        });
+        seedTx();
+      } finally {
+        if (prepDb.open) prepDb.close();
+      }
+
+      this.openConnection(this.previewDbPath, true);
+      this._backupPreviewActive = true;
+      this._backupPreviewFilename = filename;
+      this._backupPreviewStartedAt = new Date().toISOString();
+      this._backupPreviewCreatedAt = stat.mtime.toISOString();
+
+      return { backupPreviewStatus: this.getBackupPreviewStatus() };
+    } catch (err) {
+      if (this._db && this._db.open) {
+        this._db.close();
+      }
+      this.cleanupPreviewFiles();
+      this._backupPreviewActive = false;
+      this._backupPreviewFilename = null;
+      this._backupPreviewStartedAt = null;
+      this._backupPreviewCreatedAt = null;
+      this.openConnection(this.dbPath);
+      throw err;
+    }
+  }
+
+  /**
+   * Exits Read-Only Backup Preview Mode, deletes the temporary preview file, and reconnects to the live database.
+   */
+  public exitBackupPreview(): { backupPreviewStatus: BackupPreviewStatus } {
+    if (!this._backupPreviewActive) {
+      return { backupPreviewStatus: this.getBackupPreviewStatus() };
+    }
+
+    if (this._db && this._db.open) {
+      this._db.close();
+    }
+    this.cleanupPreviewFiles();
+    this._backupPreviewActive = false;
+    this._backupPreviewFilename = null;
+    this._backupPreviewStartedAt = null;
+    this._backupPreviewCreatedAt = null;
+    this.openConnection(this.dbPath);
+    return { backupPreviewStatus: this.getBackupPreviewStatus() };
   }
 
   /**
@@ -660,6 +938,9 @@ export class DatabaseManager {
    */
   public markAvailabilityEdited(now: Date = new Date()): string {
     const iso = now.toISOString();
+    if (this._backupPreviewActive) {
+      return iso;
+    }
     this._db
       .prepare(
         `INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?)
@@ -670,6 +951,12 @@ export class DatabaseManager {
   }
 
   public async createBackup(trigger: BackupTrigger): Promise<BackupInfo> {
+    if (this._sandboxActive) {
+      throw new Error('Exit Sandbox Mode before creating live database backups');
+    }
+    if (this._backupPreviewActive) {
+      throw new Error('Exit Backup Preview before creating live database backups');
+    }
     fs.mkdirSync(this.backupDir, { recursive: true });
     const stamp = formatBackupStamp();
     const filename = `${trigger}-${stamp}.db`;
@@ -754,9 +1041,17 @@ export class DatabaseManager {
     sourcePath: string,
     defaultTimezone: string = DEFAULT_TIMEZONE
   ): Promise<{ safetySnapshot: BackupInfo; appliedVersions: number[] }> {
+    if (this._sandboxActive) {
+      throw new Error('Exit Sandbox Mode before restoring a live database backup');
+    }
     this.validateSqliteFile(sourcePath);
 
-    // Automatically save a safety snapshot of the active database before overwriting
+    // If currently previewing a backup, exit preview first so the pre-restore snapshot captures the LIVE database
+    if (this._backupPreviewActive) {
+      this.exitBackupPreview();
+    }
+
+    // Automatically save a safety snapshot of the active live database before overwriting
     const safetySnapshot = await this.createBackup('pre-restore');
 
     // Copy to temp path first in case sourcePath is inside backupDir or tmp upload

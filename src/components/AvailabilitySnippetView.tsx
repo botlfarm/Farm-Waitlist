@@ -43,6 +43,8 @@ interface AvailabilitySnippetViewProps {
   defaultWeeks: number;
   settings?: AppSettings;
   githubPublishStatus?: GithubPublishStatus;
+  isSandboxMode?: boolean;
+  readOnly?: boolean;
   onSettingsSaved?: () => Promise<void>;
   onToast?: (message: string, kind?: 'info' | 'error') => void;
 }
@@ -153,6 +155,8 @@ export function AvailabilitySnippetView({
   defaultWeeks,
   settings,
   githubPublishStatus,
+  isSandboxMode = false,
+  readOnly = false,
   onSettingsSaved,
   onToast,
 }: AvailabilitySnippetViewProps) {
@@ -370,7 +374,7 @@ export function AvailabilitySnippetView({
 
   const handleCopyStaticHtml = async () => {
     let targetData = data;
-    if (isDirty) {
+    if (isDirty && !readOnly) {
       const updated = await saveAllSettings(undefined, true);
       if (updated) targetData = updated;
     }
@@ -400,7 +404,7 @@ export function AvailabilitySnippetView({
 
   const handleCopyLiveEmbed = async () => {
     let embed = liveEmbedCode;
-    if (isDirty) {
+    if (isDirty && !readOnly) {
       const updated = await saveAllSettings(undefined, true);
       if (updated?.liveEmbedHtml) {
         embed = updated.liveEmbedHtml;
@@ -645,9 +649,10 @@ export function AvailabilitySnippetView({
           <button
             type="button"
             data-testid="snippet-save-settings-btn"
-            disabled={saving || !isDirty}
+            disabled={readOnly || saving || !isDirty}
+            title={readOnly ? 'Exit Backup Preview to save snippet settings' : undefined}
             onClick={() => void saveAllSettings()}
-            className="inline-flex min-h-[40px] items-center gap-2 rounded-md bg-[#0EA5E9] px-4 py-2 text-xs font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-45"
+            className="inline-flex min-h-[40px] items-center gap-2 rounded-md bg-[#0EA5E9] px-4 py-2 text-xs font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
           >
             <Save className="h-4 w-4" />
             {saving ? 'Saving...' : isDirty ? 'Save Settings' : 'Saved'}
@@ -656,6 +661,7 @@ export function AvailabilitySnippetView({
       </div>
 
       {/* SECTION 1: Snippet Status (Active vs Paused), Horizon & Flexible Ordering Cutoffs */}
+      <fieldset disabled={readOnly} className="contents">
       <section
         data-testid="snippet-rules-panel"
         className="mb-6 rounded-lg border border-[#283340] bg-[#161D24] p-4 sm:p-5"
@@ -1044,9 +1050,9 @@ export function AvailabilitySnippetView({
           <button
             type="button"
             data-testid="snippet-reset-settings-btn"
-            disabled={saving}
+            disabled={readOnly || saving}
             onClick={() => void handleResetTextDefaults()}
-            className="inline-flex min-h-[34px] items-center gap-1.5 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#38BDF8] disabled:opacity-45"
+            className="inline-flex min-h-[34px] items-center gap-1.5 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
           >
             <RotateCcw className="h-3.5 w-3.5" />
             Reset Text Defaults
@@ -1134,12 +1140,14 @@ export function AvailabilitySnippetView({
           </div>
         </div>
       </section>
+      </fieldset>
 
       {/* SECTION 3: Open-Source Live Website Sync via GitHub Pages */}
       <section
         data-testid="snippet-github-panel"
         className="mb-6 rounded-lg border border-[#283340] bg-[#161D24] p-4 sm:p-5"
       >
+        <fieldset disabled={readOnly} className="contents">
         <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#283340] pb-4">
           <div>
             <h2 className="font-['Plus_Jakarta_Sans'] text-sm font-bold text-[#F0F6FC]">
@@ -1371,6 +1379,8 @@ export function AvailabilitySnippetView({
           </div>
         )}
 
+        </fieldset>
+
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[#283340] pt-4">
           <button
             type="button"
@@ -1389,9 +1399,9 @@ export function AvailabilitySnippetView({
             <button
               type="button"
               data-testid="github-test-btn"
-              disabled={testingGithub || !githubRepo.trim()}
+              disabled={readOnly || testingGithub || !githubRepo.trim()}
               onClick={() => void handleTestGithub()}
-              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-[#283340] bg-[#0F1419] px-3.5 py-2 text-xs font-medium text-[#E6EDF3] hover:border-[#38BDF8] disabled:opacity-45"
+              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-[#283340] bg-[#0F1419] px-3.5 py-2 text-xs font-medium text-[#E6EDF3] hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
             >
               <Wifi className="h-3.5 w-3.5" />
               {testingGithub ? 'Testing...' : 'Test Connection'}
@@ -1400,9 +1410,16 @@ export function AvailabilitySnippetView({
             <button
               type="button"
               data-testid="github-publish-now-btn"
-              disabled={publishingGithub || saving || !githubRepo.trim()}
+              disabled={readOnly || publishingGithub || saving || !githubRepo.trim() || isSandboxMode}
+              title={
+                readOnly
+                  ? 'Publishing to your live website is disabled while previewing a backup'
+                  : isSandboxMode
+                    ? 'Publishing to your live website is disabled while in Sandbox Mode'
+                    : undefined
+              }
               onClick={() => void handlePublishNow()}
-              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-[#38BDF8]/60 bg-[#0EA5E9]/15 px-4 py-2 text-xs font-semibold text-[#38BDF8] hover:bg-[#0EA5E9]/25 disabled:opacity-45"
+              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-[#38BDF8]/60 bg-[#0EA5E9]/15 px-4 py-2 text-xs font-semibold text-[#38BDF8] hover:bg-[#0EA5E9]/25 disabled:cursor-not-allowed disabled:opacity-45"
             >
               <CloudUpload className="h-4 w-4" />
               {publishingGithub ? 'Publishing...' : 'Publish to Website'}

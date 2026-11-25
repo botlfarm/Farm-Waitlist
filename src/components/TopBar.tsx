@@ -7,6 +7,7 @@ interface TopBarProps {
   activeTab: ActiveTab;
   onSelectTab: (tab: ActiveTab) => void;
   onQuickAdd: () => void;
+  readOnly?: boolean;
 }
 
 const NAV_ITEMS: Array<{ id: ActiveTab; label: string; testId: string }> = [
@@ -17,7 +18,7 @@ const NAV_ITEMS: Array<{ id: ActiveTab; label: string; testId: string }> = [
   { id: 'settings', label: 'Settings', testId: 'nav-settings' },
 ];
 
-export function TopBar({ activeTab, onSelectTab, onQuickAdd }: TopBarProps) {
+export function TopBar({ activeTab, onSelectTab, onQuickAdd, readOnly = false }: TopBarProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const handleSelect = (tab: ActiveTab) => {
@@ -26,7 +27,7 @@ export function TopBar({ activeTab, onSelectTab, onQuickAdd }: TopBarProps) {
   };
 
   return (
-    <header className="sticky top-0 z-30 border-b border-[#283340] bg-[#0F1419]">
+    <header className="border-b border-[#283340] bg-[#0F1419]">
       <div className="flex items-center justify-between gap-3 px-4 py-2.5 md:gap-8 md:px-6 md:py-3.5">
         <button
           type="button"
@@ -63,8 +64,10 @@ export function TopBar({ activeTab, onSelectTab, onQuickAdd }: TopBarProps) {
           <button
             type="button"
             data-testid="quick-add-order-btn"
+            disabled={readOnly}
+            title={readOnly ? 'Exit Backup Preview to add orders' : undefined}
             onClick={onQuickAdd}
-            className="inline-flex min-h-[38px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md bg-[#0EA5E9] px-3 py-1.5 text-xs font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#38BDF8] md:min-h-[40px] md:gap-2 md:px-4 md:py-2 md:text-sm"
+            className="inline-flex min-h-[38px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md bg-[#0EA5E9] px-3 py-1.5 text-xs font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45 md:min-h-[40px] md:gap-2 md:px-4 md:py-2 md:text-sm"
           >
             <Plus className="h-4 w-4" aria-hidden="true" />
             <span className="hidden sm:inline">Quick Add Order</span>

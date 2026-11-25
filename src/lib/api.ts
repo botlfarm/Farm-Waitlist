@@ -6,6 +6,7 @@ import {
 import type {
   AppSettings,
   BackupInfo,
+  BackupPreviewStatus,
   CheckpointSummary,
   CustomerSuggestion,
   GithubPublishStatus,
@@ -16,6 +17,7 @@ import type {
   OrderTimingType,
   PickupChannel,
   PublicAvailabilityResult,
+  SandboxStatus,
   StandingCadence,
   StandingOrder,
   SupplyMode,
@@ -272,6 +274,7 @@ export const api = {
       cascadeForward: boolean;
       bufferOverride: number | null;
       extraBuffer?: number;
+      selfConsumption?: number;
       notes?: string | null;
     }
   ) =>
@@ -542,4 +545,42 @@ export const api = {
 
   backupDownloadUrl: (filename: string) =>
     `./api/backups/${encodeURIComponent(filename)}/download`,
+
+  // Backup Preview (Read-Only Mode)
+  getBackupPreviewStatus: () => requestJson<BackupPreviewStatus>('./api/backups/preview'),
+
+  enterBackupPreview: (filename: string) =>
+    requestJson<{ backupPreviewStatus: BackupPreviewStatus }>('./api/backups/preview/enter', {
+      method: 'POST',
+      body: JSON.stringify({ filename }),
+    }),
+
+  exitBackupPreview: () =>
+    requestJson<{ backupPreviewStatus: BackupPreviewStatus }>('./api/backups/preview/exit', {
+      method: 'POST',
+    }),
+
+  restorePreviewedBackup: () =>
+    requestJson<{
+      restored: boolean;
+      filename: string;
+      restoredFrom: string;
+      safetySnapshot: BackupInfo;
+      backupPreviewStatus: BackupPreviewStatus;
+    }>('./api/backups/preview/restore', {
+      method: 'POST',
+    }),
+
+  // Sandbox Mode
+  getSandboxStatus: () => requestJson<SandboxStatus>('./api/sandbox'),
+
+  enterSandbox: () =>
+    requestJson<{ sandboxStatus: SandboxStatus; backup: BackupInfo }>('./api/sandbox/enter', {
+      method: 'POST',
+    }),
+
+  exitSandbox: () =>
+    requestJson<{ sandboxStatus: SandboxStatus }>('./api/sandbox/exit', {
+      method: 'POST',
+    }),
 };

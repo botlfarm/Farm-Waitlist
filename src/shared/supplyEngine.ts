@@ -172,11 +172,18 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
           }
 
           const slotted = roundQty(itemSlotted.get(carryDate) ?? 0);
+          const selfConsumed =
+            carryEntry &&
+            typeof carryEntry.selfConsumption === 'number' &&
+            carryEntry.selfConsumption > 0
+              ? roundQty(carryEntry.selfConsumption)
+              : 0;
           const carryEod =
             carryEntry && carryEntry.actualEndOfDay !== undefined && carryEntry.actualEndOfDay !== null
               ? roundQty(carryEntry.actualEndOfDay)
               : null;
-          runningBalance = carryEod !== null ? carryEod : roundQty(startBal - slotted + prod);
+          runningBalance =
+            carryEod !== null ? carryEod : roundQty(startBal - slotted - selfConsumed + prod);
         }
       }
     } else {
@@ -227,9 +234,13 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
         item.supplyMode === 'continuous' ? roundQty(activeCascadeRate) : 0;
 
       const slottedQty = roundQty(itemSlotted.get(date) ?? 0);
+      const selfConsumption =
+        entry && typeof entry.selfConsumption === 'number' && entry.selfConsumption > 0
+          ? roundQty(entry.selfConsumption)
+          : 0;
 
-      // Orders today draw ONLY from today's starting stock; afternoon harvest becomes available tomorrow
-      const endingBalance = roundQty(startingBalance - slottedQty);
+      // Customer orders and self consumption today draw ONLY from today's starting stock; afternoon harvest becomes available tomorrow
+      const endingBalance = roundQty(startingBalance - slottedQty - selfConsumption);
       const expectedNextDayStarting = roundQty(endingBalance + estProduced);
       const actualEndOfDay =
         entry && entry.actualEndOfDay !== undefined && entry.actualEndOfDay !== null
@@ -258,6 +269,7 @@ export function projectDailySupply(input: ProjectSupplyInput): CalendarDayProjec
         actualOnHand: entry?.actualOnHand ?? null,
         actualEndOfDay,
         slottedQty,
+        selfConsumption,
         endingBalance,
         expectedNextDayStarting,
         nextDayStarting,

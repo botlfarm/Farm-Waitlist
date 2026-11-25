@@ -140,6 +140,31 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
   const { dbManager, config, fetchFn, getNow = () => new Date(), onSettingsUpdated } = options;
   const router = express.Router();
 
+  // Strict server-side read-only guard while previewing a backup snapshot:
+  // Blocks every POST/PUT/PATCH/DELETE except exiting preview, switching previewed backup, or explicitly restoring a backup.
+  router.use((req, res, next) => {
+    if (
+      dbManager.isBackupPreviewActive() &&
+      req.method !== 'GET' &&
+      req.method !== 'HEAD' &&
+      req.method !== 'OPTIONS'
+    ) {
+      const allowedPreviewWrite =
+        req.path === '/backups/preview/exit' ||
+        req.path === '/backups/preview/enter' ||
+        req.path === '/backups/preview/restore' ||
+        /^\/backups\/[^/]+\/restore$/.test(req.path);
+      if (!allowedPreviewWrite) {
+        res.status(409).json({
+          error: 'Read-only Backup Preview is active. Exit Backup Preview to make changes.',
+          readOnlyPreview: true,
+        });
+        return;
+      }
+    }
+    next();
+  });
+
   // Stamp availabilityLastEditedAt synchronously before responding to real user mutations
   // (midnight rollovers, cutoff clock ticks, and background Odoo syncs intentionally do NOT set this)
   router.use((req, res, next) => {
@@ -149,7 +174,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     if (matchesAvailabilityMutation) {
       const origJson = res.json.bind(res);
       res.json = ((body: unknown) => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
+        if (res.statusCode >= 200 && res.statusCode < 300 && !dbManager.isBackupPreviewActive()) {
           dbManager.markAvailabilityEdited(getNow());
         }
         return origJson(body);
@@ -185,8 +210,10 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     const db = dbManager.db;
     const { today, startDate, endDate, weeks } = getHorizon(weeksParam);
 
-    // Always ensure standing orders are materialized across the active horizon
-    materializeStandingOrders(db, today, endDate);
+    // Ensure standing orders are materialized across the active horizon (skipped in read-only backup preview!)
+    if (!dbManager.isBackupPreviewActive()) {
+      materializeStandingOrders(db, today, endDate);
+    }
 
     const settings = dbManager.getSettings();
     const items = listTrackedItems(db);
@@ -235,6 +262,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       ignoredOrders,
       standingOrders: listStandingOrders(db),
       checkpoints: listCheckpoints(db),
+      sandboxStatus: dbManager.getSandboxStatus(),
+      backupPreviewStatus: dbManager.getBackupPreviewStatus(),
     };
   }
 
@@ -544,6 +573,12 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       body.extraBuffer === null || body.extraBuffer === '' || body.extraBuffer === undefined
         ? 0
         : Math.max(0, Number(body.extraBuffer));
+    const selfConsumption =
+      body.selfConsumption === null ||
+      body.selfConsumption === '' ||
+      body.selfConsumption === undefined
+        ? 0
+        : Math.max(0, Number(body.selfConsumption));
     const cascadeForward = Boolean(body.cascadeForward);
     const notes = typeof body.notes === 'string' && body.notes.trim() ? body.notes.trim() : null;
 
@@ -552,7 +587,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       (estProduced !== null && !Number.isFinite(estProduced)) ||
       (actualEndOfDay !== null && !Number.isFinite(actualEndOfDay)) ||
       (bufferOverride !== null && !Number.isFinite(bufferOverride)) ||
-      !Number.isFinite(extraBuffer)
+      !Number.isFinite(extraBuffer) ||
+      !Number.isFinite(selfConsumption)
     ) {
       res.status(400).json({ error: 'Numeric supply values must be finite numbers' });
       return;
@@ -562,8 +598,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
 
     db.prepare(
       `INSERT INTO daily_supply_entries (
-         tracked_item_id, date, actual_on_hand, est_produced, actual_end_of_day, is_cascade_anchor, buffer_override, extra_buffer, notes
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         tracked_item_id, date, actual_on_hand, est_produced, actual_end_of_day, is_cascade_anchor, buffer_override, extra_buffer, self_consumption, notes
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tracked_item_id, date) DO UPDATE SET
          actual_on_hand = excluded.actual_on_hand,
          est_produced = excluded.est_produced,
@@ -571,6 +607,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
          is_cascade_anchor = excluded.is_cascade_anchor,
          buffer_override = excluded.buffer_override,
          extra_buffer = excluded.extra_buffer,
+         self_consumption = excluded.self_consumption,
          notes = excluded.notes`
     ).run(
       itemId,
@@ -581,6 +618,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       cascadeForward && estProduced !== null ? 1 : 0,
       bufferOverride,
       extraBuffer,
+      selfConsumption,
       notes
     );
 
@@ -1880,6 +1918,12 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
   });
 
   router.post('/snippet/github/publish', async (req: Request, res: Response) => {
+    if (dbManager.isSandboxActive()) {
+      res.status(409).json({
+        error: 'Live website publishing is disabled while in Sandbox Mode. Exit Sandbox Mode first.',
+      });
+      return;
+    }
     try {
       const body = (req.body ?? {}) as Record<string, unknown>;
       const force = body.force === undefined ? true : Boolean(body.force);
@@ -1950,6 +1994,12 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
   });
 
   router.post('/backups', async (_req: Request, res: Response) => {
+    if (dbManager.isSandboxActive()) {
+      res.status(409).json({
+        error: 'Exit Sandbox Mode before creating live database backups.',
+      });
+      return;
+    }
     try {
       const info = await dbManager.createBackup('manual');
       res.status(201).json(info);
@@ -1972,7 +2022,79 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     }
   });
 
+  // --- Read-Only Backup Preview ---
+  router.get('/backups/preview', (_req: Request, res: Response) => {
+    res.json(dbManager.getBackupPreviewStatus());
+  });
+
+  router.post('/backups/preview/enter', (req: Request, res: Response) => {
+    if (dbManager.isSandboxActive()) {
+      res.status(409).json({
+        error: 'Exit Sandbox Mode before previewing a backup.',
+      });
+      return;
+    }
+    const filename = typeof req.body?.filename === 'string' ? req.body.filename.trim() : '';
+    if (!filename) {
+      res.status(400).json({ error: 'Backup filename is required.' });
+      return;
+    }
+    try {
+      const result = dbManager.enterBackupPreview(filename, config.timezone);
+      onSettingsUpdated?.(dbManager.getSettings());
+      res.status(200).json(result);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to open backup preview',
+      });
+    }
+  });
+
+  router.post('/backups/preview/exit', (_req: Request, res: Response) => {
+    try {
+      const result = dbManager.exitBackupPreview();
+      onSettingsUpdated?.(dbManager.getSettings());
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to exit backup preview',
+      });
+    }
+  });
+
+  router.post('/backups/preview/restore', async (_req: Request, res: Response) => {
+    const preview = dbManager.getBackupPreviewStatus();
+    if (!preview.active || !preview.filename) {
+      res.status(409).json({ error: 'No backup preview is currently active.' });
+      return;
+    }
+    try {
+      const safePath = dbManager.resolveSafeBackupPath(preview.filename);
+      if (!fs.existsSync(safePath)) {
+        res.status(404).json({ error: 'Previewed backup file no longer exists.' });
+        return;
+      }
+      const result = await dbManager.restoreFromFile(safePath, config.timezone);
+      onSettingsUpdated?.(dbManager.getSettings());
+      res.json({
+        restored: true,
+        filename: preview.filename,
+        restoredFrom: preview.filename,
+        ...result,
+        backupPreviewStatus: dbManager.getBackupPreviewStatus(),
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Restore failed' });
+    }
+  });
+
   router.post('/backups/:filename/restore', async (req: Request, res: Response) => {
+    if (dbManager.isSandboxActive()) {
+      res.status(409).json({
+        error: 'Exit Sandbox Mode before restoring a live database backup.',
+      });
+      return;
+    }
     try {
       const filename = String(req.params.filename);
       const safePath = dbManager.resolveSafeBackupPath(filename);
@@ -1981,6 +2103,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
         return;
       }
       const result = await dbManager.restoreFromFile(safePath, config.timezone);
+      onSettingsUpdated?.(dbManager.getSettings());
       res.json({ restored: true, ...result });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Restore failed' });
@@ -1993,8 +2116,18 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       res.status(400).json({ error: 'No .db file uploaded' });
       return;
     }
+    if (dbManager.isSandboxActive()) {
+      if (fs.existsSync(file.path)) {
+        fs.unlinkSync(file.path);
+      }
+      res.status(409).json({
+        error: 'Exit Sandbox Mode before restoring a live database backup.',
+      });
+      return;
+    }
     try {
       const result = await dbManager.restoreFromFile(file.path, config.timezone);
+      onSettingsUpdated?.(dbManager.getSettings());
       res.json({ restored: true, ...result });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Uploaded file invalid' });
@@ -2002,6 +2135,42 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       if (fs.existsSync(file.path)) {
         fs.unlinkSync(file.path);
       }
+    }
+  });
+
+  // --- Sandbox Mode ---
+  router.get('/sandbox', (_req: Request, res: Response) => {
+    res.json(dbManager.getSandboxStatus());
+  });
+
+  router.post('/sandbox/enter', async (_req: Request, res: Response) => {
+    if (dbManager.isSandboxActive()) {
+      res.status(409).json({
+        error: 'Sandbox Mode is already active.',
+        sandboxStatus: dbManager.getSandboxStatus(),
+      });
+      return;
+    }
+    try {
+      const result = await dbManager.enterSandbox();
+      onSettingsUpdated?.(dbManager.getSettings());
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to start Sandbox Mode',
+      });
+    }
+  });
+
+  router.post('/sandbox/exit', (_req: Request, res: Response) => {
+    try {
+      const result = dbManager.exitSandbox();
+      onSettingsUpdated?.(dbManager.getSettings());
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to exit Sandbox Mode',
+      });
     }
   });
 

@@ -17,6 +17,7 @@ interface StandingOrdersViewProps {
   channels: PickupChannel[];
   standingOrders: StandingOrder[];
   odooConfigured?: boolean;
+  readOnly?: boolean;
   onCreate: (payload: {
     customerName: string;
     customerContact?: string;
@@ -38,6 +39,7 @@ export function StandingOrdersView({
   channels,
   standingOrders,
   odooConfigured = false,
+  readOnly = false,
   onCreate,
   onToggleActive,
   onDelete,
@@ -128,6 +130,7 @@ export function StandingOrdersView({
             </div>
           )}
 
+          <fieldset disabled={readOnly} className="contents">
           <div className="mt-4 space-y-4">
             <CustomerAutocompleteInput
               id="so-name"
@@ -302,14 +305,15 @@ export function StandingOrdersView({
 
             <button
               type="button"
-              disabled={saving || activeItems.length === 0}
+              disabled={readOnly || saving || activeItems.length === 0}
               data-testid="standing-submit-btn"
               onClick={() => void handleSubmit()}
-              className="min-h-[40px] w-full rounded-md bg-[#0EA5E9] px-4 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-45"
+              className="min-h-[40px] w-full rounded-md bg-[#0EA5E9] px-4 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
             >
               {saving ? 'Creating...' : 'Create Standing Order'}
             </button>
           </div>
+          </fieldset>
         </section>
 
         {/* Standing Orders Table */}
@@ -364,9 +368,10 @@ export function StandingOrdersView({
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
+                        disabled={readOnly}
                         data-testid={`standing-toggle-${rule.id}`}
                         onClick={() => void onToggleActive(rule)}
-                        className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#E6EDF3] hover:border-[#38BDF8]"
+                        className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#E6EDF3] hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                       >
                         {rule.isActive ? (
                           <>
@@ -382,9 +387,10 @@ export function StandingOrdersView({
                       </button>
                       <button
                         type="button"
+                        disabled={readOnly}
                         data-testid={`standing-delete-${rule.id}`}
                         onClick={() => void onDelete(rule.id)}
-                        className="flex h-9 w-9 items-center justify-center rounded-md border border-[#283340] bg-[#0F1419] text-[#8B949E] hover:border-[#F87171] hover:text-[#F87171]"
+                        className="flex h-9 w-9 items-center justify-center rounded-md border border-[#283340] bg-[#0F1419] text-[#8B949E] hover:border-[#F87171] hover:text-[#F87171] disabled:cursor-not-allowed disabled:opacity-45"
                         aria-label={`Delete standing order for ${rule.customerName}`}
                       >
                         <Trash2 className="h-4 w-4" />

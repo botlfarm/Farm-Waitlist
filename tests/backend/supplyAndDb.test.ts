@@ -15,12 +15,16 @@ import {
   materializeStandingOrders,
 } from '../../src/server/standingEngine';
 import {
+  buildPreApprovalMailtoHref,
   generatePublicAvailability,
   messageHasLinks,
   parseSafeRichMessageSegments,
   renderMessageToPlainText,
   renderMessageToSafeHtml,
+  renderPreApprovalMessage,
+  renderPreApprovalSamplePreview,
   selectBestPreApprovalTemplate,
+  splitCustomerName,
 } from '../../src/shared/generators';
 import {
   evaluateCandidateSlotDates,
@@ -60,7 +64,7 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const mgr = new DatabaseManager(dbPath, backupDir);
     const res = await mgr.init('America/New_York');
 
-    expect(res.appliedVersions).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(res.appliedVersions).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(res.preMigrateBackup).toBeNull();
     expect(listTrackedItems(mgr.db)).toHaveLength(0);
     expect(listPickupChannels(mgr.db)).toHaveLength(0);
@@ -78,15 +82,15 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const extendedMigrations: Migration[] = [
       ...MIGRATIONS,
       {
-        version: 9,
+        version: 10,
         name: 'add_test_marker_table',
-        sql: 'CREATE TABLE IF NOT EXISTS migration_v9_test (id INTEGER PRIMARY KEY);',
+        sql: 'CREATE TABLE IF NOT EXISTS migration_v10_test (id INTEGER PRIMARY KEY);',
       },
     ];
 
     const mgr2 = new DatabaseManager(dbPath, backupDir, extendedMigrations);
     const res = await mgr2.init('America/New_York');
-    expect(res.appliedVersions).toEqual([9]);
+    expect(res.appliedVersions).toEqual([10]);
     expect(res.preMigrateBackup).toMatch(/^pre-migrate-.*\.db$/);
     expect(fs.existsSync(path.join(backupDir, res.preMigrateBackup!))).toBe(true);
     mgr2.close();
@@ -1410,6 +1414,584 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
     } finally {
       server.close();
       mgr.close();
+    }
+  });
+
+  it('supports Sandbox Mode: creates pre-sandbox snapshot, isolates changes in a duplicate DB, blocks live publish/backups, and restores live DB on exit or restart', async () => {
+    const { createExpressApp } = await import('../../src/server/app');
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const now = new Date().toISOString();
+    const liveItemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 12, 2, 1, 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+    const liveOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, customer_name, created_at, updated_at)
+           VALUES ('manual', 'waitlist', 'asap', 'Live Customer', ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+    mgr.db
+      .prepare('INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, ?)')
+      .run(liveOrderId, liveItemId, 3);
+
+    let settingsCallbackCount = 0;
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+        githubPublish: { token: 'ghp_test', defaultRepo: 'farm/avail', source: 'env' },
+      },
+      onSettingsUpdated: () => {
+        settingsCallbackCount += 1;
+      },
+    });
+    const server = app.listen(0);
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    try {
+      // 1. Enter Sandbox Mode
+      const enterRes = await fetch(`http://127.0.0.1:${port}/api/sandbox/enter`, { method: 'POST' });
+      expect(enterRes.status).toBe(201);
+      const enterBody = (await enterRes.json()) as {
+        sandboxStatus: { active: boolean; startedAt: string | null; snapshotFilename: string | null };
+        backup: { filename: string; trigger: string };
+      };
+      expect(enterBody.sandboxStatus.active).toBe(true);
+      expect(enterBody.backup.trigger).toBe('pre-sandbox');
+      expect(enterBody.backup.filename).toMatch(/^pre-sandbox-.*\.db$/);
+      expect(enterBody.sandboxStatus.snapshotFilename).toBe(enterBody.backup.filename);
+      expect(fs.existsSync(mgr.sandboxDbPath)).toBe(true);
+      expect(settingsCallbackCount).toBe(1);
+
+      // Workspace reflects active sandbox status & copied live order
+      const wsSandboxRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
+      const wsSandbox = (await wsSandboxRes.json()) as {
+        sandboxStatus: { active: boolean; snapshotFilename: string | null };
+        orders: Array<{ id: number; customerName: string }>;
+      };
+      expect(wsSandbox.sandboxStatus.active).toBe(true);
+      expect(wsSandbox.orders.map((o) => o.customerName)).toEqual(['Live Customer']);
+
+      // 2. Make destructive changes inside Sandbox (delete live copy & add sandbox-only order)
+      const delRes = await fetch(`http://127.0.0.1:${port}/api/orders/${liveOrderId}`, {
+        method: 'DELETE',
+      });
+      expect(delRes.status).toBe(200);
+
+      const addSandboxRes = await fetch(`http://127.0.0.1:${port}/api/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customerName: 'Sandbox Experiment',
+          timingType: 'asap',
+          items: [{ trackedItemId: liveItemId, quantity: 9 }],
+        }),
+      });
+      expect(addSandboxRes.status).toBe(201);
+      expect(listAllOrders(mgr.db).map((o) => o.customerName)).toEqual(['Sandbox Experiment']);
+
+      // 3. Live GitHub publish & live backup mutations are blocked with 409 while in Sandbox Mode
+      const publishBlocked = await fetch(`http://127.0.0.1:${port}/api/snippet/github/publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: true }),
+      });
+      expect(publishBlocked.status).toBe(409);
+
+      const backupBlocked = await fetch(`http://127.0.0.1:${port}/api/backups`, {
+        method: 'POST',
+      });
+      expect(backupBlocked.status).toBe(409);
+
+      // 4. Exit Sandbox Mode -> temporary sandbox file deleted, live DB untouched!
+      const exitRes = await fetch(`http://127.0.0.1:${port}/api/sandbox/exit`, { method: 'POST' });
+      expect(exitRes.status).toBe(200);
+      const exitBody = (await exitRes.json()) as {
+        sandboxStatus: { active: boolean; startedAt: string | null; snapshotFilename: string | null };
+      };
+      expect(exitBody.sandboxStatus).toEqual({
+        active: false,
+        startedAt: null,
+        snapshotFilename: null,
+      });
+      expect(fs.existsSync(mgr.sandboxDbPath)).toBe(false);
+      expect(settingsCallbackCount).toBe(2);
+
+      // Live database still has exact original order and none of the sandbox mutations
+      expect(listAllOrders(mgr.db).map((o) => o.customerName)).toEqual(['Live Customer']);
+
+      // Pre-sandbox backup snapshot remains preserved in backup history
+      const backups = mgr.listBackups();
+      expect(backups.some((b) => b.filename === enterBody.backup.filename && b.trigger === 'pre-sandbox')).toBe(true);
+    } finally {
+      server.close();
+      mgr.close();
+    }
+
+    // 5. Simulated crash recovery: leftover sandbox file is cleaned up on startup & live DB opens cleanly
+    fs.writeFileSync(mgr.sandboxDbPath, 'stale-sandbox-data');
+    const restarted = new DatabaseManager(dbPath, backupDir);
+    try {
+      expect(restarted.isSandboxActive()).toBe(false);
+      expect(fs.existsSync(restarted.sandboxDbPath)).toBe(false);
+      expect(listAllOrders(restarted.db).map((o) => o.customerName)).toEqual(['Live Customer']);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it('deducts daily selfConsumption like a fixed same-day order across carry-over, ATP reservations, PUT /api/supply, and Undo', async () => {
+    const { createExpressApp } = await import('../../src/server/app');
+    const farmEggs: TrackedItem = {
+      id: 1,
+      name: 'Standard Eggs',
+      unitLabel: 'dozens',
+      isActive: true,
+      supplyMode: 'continuous',
+      defaultDailyProduction: 4,
+      globalSafetyBuffer: 2,
+      includeInPublicSnippet: true,
+      keywordRules: ['standard'],
+      sortOrder: 0,
+      createdAt: '2026-11-01T00:00:00Z',
+      updatedAt: '2026-11-01T00:00:00Z',
+    };
+
+    // Unit math:
+    // Nov 22 (before startDate): anchor 10 on hand, selfConsumption 2, harvest +4 -> Nov 23 starts with 12
+    // Nov 23: starts 12, selfConsumption 0, buffer 2 -> raw open 10, harvest +4 -> Nov 24 starts with 16
+    // Nov 24: starts 16, selfConsumption 11, buffer 2 -> endingBalance 5, raw open 3 -> ATP pulls Nov 23 open from 10 down to 3 (Holding 7)!
+    // Nov 25: starts 5 + 4 = 9, buffer 2 -> open 7
+    const days = projectDailySupply({
+      items: [farmEggs],
+      entries: [
+        {
+          id: 1,
+          trackedItemId: 1,
+          date: '2026-11-22',
+          actualOnHand: 10,
+          estProduced: null,
+          isCascadeAnchor: false,
+          bufferOverride: null,
+          selfConsumption: 2,
+          notes: null,
+        },
+        {
+          id: 2,
+          trackedItemId: 1,
+          date: '2026-11-24',
+          actualOnHand: null,
+          estProduced: null,
+          isCascadeAnchor: false,
+          bufferOverride: null,
+          selfConsumption: 11,
+          notes: 'Family baking week',
+        },
+      ],
+      orders: [],
+      startDate: '2026-11-23',
+      endDate: '2026-11-25',
+      today: '2026-11-23',
+    });
+
+    expect(days[0].byItem[1].startingBalance).toBe(12);
+    expect(days[0].byItem[1].selfConsumption).toBe(0);
+    expect(days[0].byItem[1].rawSellableOpen).toBe(10);
+    expect(days[0].byItem[1].sellableOpen).toBe(3);
+    expect(days[0].byItem[1].reservedForFuture).toBe(7);
+    expect(days[0].byItem[1].constrainedByDate).toBe('2026-11-24');
+
+    expect(days[1].byItem[1].startingBalance).toBe(16);
+    expect(days[1].byItem[1].selfConsumption).toBe(11);
+    expect(days[1].byItem[1].endingBalance).toBe(5);
+    expect(days[1].byItem[1].sellableOpen).toBe(3);
+
+    expect(days[2].byItem[1].startingBalance).toBe(9);
+    expect(days[2].byItem[1].sellableOpen).toBe(7);
+
+    // End-to-end persistence via PUT /api/supply/:itemId/:date + Undo checkpoint
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+    const now = new Date().toISOString();
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 10, 2, 1, 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+      },
+      getNow: () => new Date('2026-11-23T15:00:00Z'),
+    });
+    const server = app.listen(0);
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    try {
+      const putRes = await fetch(`http://127.0.0.1:${port}/api/supply/${itemId}/2026-11-23`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          actualOnHand: 14,
+          estProduced: null,
+          actualEndOfDay: null,
+          cascadeForward: false,
+          bufferOverride: null,
+          extraBuffer: 0,
+          selfConsumption: 2.5,
+          notes: 'Kitchen eggs',
+        }),
+      });
+      expect(putRes.status).toBe(200);
+
+      const wsRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
+      const ws = (await wsRes.json()) as {
+        days: Array<{ date: string; byItem: Record<number, { startingBalance: number; selfConsumption: number; endingBalance: number; sellableOpen: number }> }>;
+      };
+      const mon = ws.days.find((d) => d.date === '2026-11-23')!.byItem[itemId];
+      expect(mon.startingBalance).toBe(14);
+      expect(mon.selfConsumption).toBe(2.5);
+      expect(mon.endingBalance).toBe(11.5);
+      expect(mon.sellableOpen).toBe(9.5);
+
+      // Undo reverts the self-consumption supply update cleanly
+      const undoRes = await fetch(`http://127.0.0.1:${port}/api/checkpoints/undo`, { method: 'POST' });
+      expect(undoRes.status).toBe(200);
+
+      const wsAfterUndoRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
+      const wsAfterUndo = (await wsAfterUndoRes.json()) as {
+        days: Array<{ date: string; byItem: Record<number, { selfConsumption: number }> }>;
+      };
+      expect(wsAfterUndo.days.find((d) => d.date === '2026-11-23')!.byItem[itemId].selfConsumption).toBe(0);
+    } finally {
+      server.close();
+      mgr.close();
+    }
+  });
+
+  it('renders expanded template variables (first/last name split, date formats without year, order_ref) and builds safe mailto links', () => {
+    expect(splitCustomerName('Alex Rivera')).toEqual({
+      fullName: 'Alex Rivera',
+      firstName: 'Alex',
+      lastName: 'Rivera',
+    });
+    expect(splitCustomerName('  Mary   Jane Smith ')).toEqual({
+      fullName: 'Mary   Jane Smith',
+      firstName: 'Mary',
+      lastName: 'Jane Smith',
+    });
+    expect(splitCustomerName('Madonna')).toEqual({
+      fullName: 'Madonna',
+      firstName: 'Madonna',
+      lastName: '',
+    });
+    expect(splitCustomerName('   ')).toEqual({
+      fullName: 'there',
+      firstName: 'there',
+      lastName: '',
+    });
+
+    const items: TrackedItem[] = [
+      {
+        id: 5,
+        name: 'Standard Eggs',
+        unitLabel: 'dozens',
+        isActive: true,
+        supplyMode: 'continuous',
+        defaultDailyProduction: 10,
+        globalSafetyBuffer: 2,
+        includeInPublicSnippet: true,
+        keywordRules: ['standard'],
+        sortOrder: 0,
+        createdAt: '',
+        updatedAt: '',
+      },
+    ];
+    const channels: PickupChannel[] = [
+      {
+        id: 2,
+        name: 'Saturday Market',
+        allowedWeekdays: [6],
+        colorToken: 'sky',
+        isActive: true,
+        sortOrder: 0,
+      },
+    ];
+
+    const multiWordOrder: OrderRecord = {
+      ...baseOrder,
+      customerName: 'Clara Oswald',
+      slottedDate: '2026-11-28',
+      odooQuotationName: 'S00412',
+    };
+
+    const rendered = renderPreApprovalMessage({
+      template:
+        'Hi {{first_name}} ({{last_name}} / {{name}})! Ref {{order_ref}}: {{items_summary}} on {{date_short}} | {{date_long}} | {{date_md}} | {{date_numeric}} | {{weekday}} | {{date}} via {{channel}}.',
+      order: multiWordOrder,
+      items,
+      channels,
+    });
+
+    expect(rendered).toBe(
+      'Hi Clara (Oswald / Clara Oswald)! Ref S00412: 3 dozens Standard Eggs on Sat, Nov 28 | Saturday, November 28 | Nov 28 | 11/28 | Saturday | Sat, Nov 28, 2026 via Saturday Market.'
+    );
+
+    // Single-word name cleanly leaves {{last_name}} empty
+    const singleWordRendered = renderPreApprovalMessage({
+      template: 'Hi {{first_name}}{{last_name}} for {{date_short}}',
+      order: { ...baseOrder, customerName: 'Clara', slottedDate: '2026-11-28' },
+      items,
+      channels,
+    });
+    expect(singleWordRendered).toBe('Hi Clara for Sat, Nov 28');
+
+    // Sample preview helper renders all new variables
+    const preview = renderPreApprovalSamplePreview(
+      'Hi {{first_name}} {{last_name}}, pickup {{date_short}} ({{weekday}}) ref {{order_ref}}',
+      'Farm Store'
+    );
+    expect(preview).toBe('Hi Alex Rivera, pickup Sat, Nov 28 (Saturday) ref S00105');
+
+    // Mailto builder includes recipient, formatted subject without year, and plain-text body
+    const href = buildPreApprovalMailtoHref({
+      email: 'clara@example.com',
+      order: multiWordOrder,
+      message: 'Hi Clara, order at <a href="https://farm.example.com/shop">Farm Store</a>!',
+    });
+    expect(href).toBeTruthy();
+    expect(href!.startsWith('mailto:clara@example.com?subject=')).toBe(true);
+    const decoded = decodeURIComponent(href!);
+    expect(decoded).toContain('Order Pre-Approved — Sat, Nov 28 (S00412)');
+    expect(decoded).toContain('Farm Store (https://farm.example.com/shop)');
+  });
+
+  it('supports Read-Only Backup Preview Mode: opens snapshot read-only, rejects all writes with 409, restores live DB on exit, supports restoring previewed backup, and cleans up on restart', async () => {
+    const { createExpressApp } = await import('../../src/server/app');
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const now = new Date().toISOString();
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 12, 2, 1, 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+    const snapshotOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, customer_name, created_at, updated_at)
+           VALUES ('manual', 'waitlist', 'asap', 'Snapshot Alice', ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+    mgr.db
+      .prepare('INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, ?)')
+      .run(snapshotOrderId, itemId, 2);
+
+    // Take backup snapshot containing ONLY Snapshot Alice
+    const snapshot = await mgr.createBackup('manual');
+
+    // Add a later live-only order after the backup was taken
+    const liveOnlyOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, customer_name, created_at, updated_at)
+           VALUES ('manual', 'waitlist', 'asap', 'Live-Only Bob', ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+    mgr.db
+      .prepare('INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, ?)')
+      .run(liveOnlyOrderId, itemId, 4);
+
+    let settingsCallbackCount = 0;
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+        githubPublish: { token: 'ghp_test', defaultRepo: 'farm/avail', source: 'env' },
+      },
+      onSettingsUpdated: () => {
+        settingsCallbackCount += 1;
+      },
+    });
+    const server = app.listen(0);
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    try {
+      // 1. Enter Read-Only Backup Preview for the earlier snapshot
+      const enterRes = await fetch(`http://127.0.0.1:${port}/api/backups/preview/enter`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: snapshot.filename }),
+      });
+      expect(enterRes.status).toBe(200);
+      const enterBody = (await enterRes.json()) as {
+        backupPreviewStatus: {
+          active: boolean;
+          filename: string | null;
+          startedAt: string | null;
+          backupCreatedAt: string | null;
+        };
+      };
+      expect(enterBody.backupPreviewStatus.active).toBe(true);
+      expect(enterBody.backupPreviewStatus.filename).toBe(snapshot.filename);
+      expect(fs.existsSync(mgr.previewDbPath)).toBe(true);
+      expect(settingsCallbackCount).toBe(1);
+
+      // 2. GET /api/workspace shows ONLY Snapshot Alice & active backupPreviewStatus
+      const wsPreviewRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
+      expect(wsPreviewRes.status).toBe(200);
+      const wsPreview = (await wsPreviewRes.json()) as {
+        backupPreviewStatus: { active: boolean; filename: string | null };
+        orders: Array<{ id: number; customerName: string }>;
+      };
+      expect(wsPreview.backupPreviewStatus.active).toBe(true);
+      expect(wsPreview.backupPreviewStatus.filename).toBe(snapshot.filename);
+      expect(wsPreview.orders.map((o) => o.customerName)).toEqual(['Snapshot Alice']);
+
+      // 3. Every write endpoint is strictly rejected with 409 { readOnlyPreview: true }
+      const writeChecks = [
+        fetch(`http://127.0.0.1:${port}/api/orders`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            customerName: 'Blocked Order',
+            timingType: 'asap',
+            items: [{ trackedItemId: itemId, quantity: 1 }],
+          }),
+        }),
+        fetch(`http://127.0.0.1:${port}/api/supply/${itemId}/2026-11-23`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ actualOnHand: 20 }),
+        }),
+        fetch(`http://127.0.0.1:${port}/api/settings`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ holdThresholdHours: 72 }),
+        }),
+        fetch(`http://127.0.0.1:${port}/api/sandbox/enter`, { method: 'POST' }),
+        fetch(`http://127.0.0.1:${port}/api/backups`, { method: 'POST' }),
+        fetch(`http://127.0.0.1:${port}/api/snippet/github/publish`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force: true }),
+        }),
+      ];
+      for (const req of writeChecks) {
+        const res = await req;
+        expect(res.status).toBe(409);
+        const body = (await res.json()) as { readOnlyPreview?: boolean };
+        expect(body.readOnlyPreview).toBe(true);
+      }
+
+      // 4. Exit Backup Preview -> cleans up temp preview DB & returns to untouched live DB (both orders intact)
+      const exitRes = await fetch(`http://127.0.0.1:${port}/api/backups/preview/exit`, {
+        method: 'POST',
+      });
+      expect(exitRes.status).toBe(200);
+      const exitBody = (await exitRes.json()) as {
+        backupPreviewStatus: { active: boolean; filename: string | null };
+      };
+      expect(exitBody.backupPreviewStatus.active).toBe(false);
+      expect(exitBody.backupPreviewStatus.filename).toBeNull();
+      expect(fs.existsSync(mgr.previewDbPath)).toBe(false);
+      expect(listAllOrders(mgr.db).map((o) => o.customerName)).toEqual([
+        'Snapshot Alice',
+        'Live-Only Bob',
+      ]);
+
+      // 5. Re-enter preview and restore directly via POST /api/backups/preview/restore
+      const reEnterRes = await fetch(`http://127.0.0.1:${port}/api/backups/preview/enter`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: snapshot.filename }),
+      });
+      expect(reEnterRes.status).toBe(200);
+
+      const restoreRes = await fetch(`http://127.0.0.1:${port}/api/backups/preview/restore`, {
+        method: 'POST',
+      });
+      expect(restoreRes.status).toBe(200);
+      const restoreBody = (await restoreRes.json()) as {
+        restoredFrom: string;
+        safetySnapshot: { filename: string; trigger: string };
+        backupPreviewStatus: { active: boolean };
+      };
+      expect(restoreBody.restoredFrom).toBe(snapshot.filename);
+      expect(restoreBody.safetySnapshot.trigger).toBe('pre-restore');
+      expect(restoreBody.backupPreviewStatus.active).toBe(false);
+      expect(fs.existsSync(mgr.previewDbPath)).toBe(false);
+
+      // Live DB is now restored to Snapshot Alice only
+      expect(listAllOrders(mgr.db).map((o) => o.customerName)).toEqual(['Snapshot Alice']);
+
+      // And the pre-restore safety snapshot captured Live-Only Bob before overwriting!
+      const verifySafetyRes = await fetch(`http://127.0.0.1:${port}/api/backups/preview/enter`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: restoreBody.safetySnapshot.filename }),
+      });
+      expect(verifySafetyRes.status).toBe(200);
+      expect(listAllOrders(mgr.db).map((o) => o.customerName)).toEqual([
+        'Snapshot Alice',
+        'Live-Only Bob',
+      ]);
+      await fetch(`http://127.0.0.1:${port}/api/backups/preview/exit`, { method: 'POST' });
+    } finally {
+      server.close();
+      mgr.close();
+    }
+
+    // 6. Startup crash recovery cleans up any orphaned .preview.db file and boots into live DB
+    fs.writeFileSync(mgr.previewDbPath, 'stale-preview-data');
+    const restarted = new DatabaseManager(dbPath, backupDir);
+    try {
+      expect(restarted.isBackupPreviewActive()).toBe(false);
+      expect(fs.existsSync(restarted.previewDbPath)).toBe(false);
+      expect(listAllOrders(restarted.db).map((o) => o.customerName)).toEqual(['Snapshot Alice']);
+    } finally {
+      restarted.close();
     }
   });
 });

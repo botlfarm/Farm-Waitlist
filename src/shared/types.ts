@@ -5,7 +5,7 @@ export type OrderTimingType = 'asap' | 'specific_date';
 export type StandingCadence = 'weekly' | 'biweekly' | 'monthly';
 export type AvailabilityTier = 'green' | 'amber' | 'red';
 export type SyncInterval = '15m' | '30m' | '1h' | '6h' | 'manual';
-export type BackupTrigger = 'manual' | 'scheduled' | 'pre-migrate' | 'pre-restore';
+export type BackupTrigger = 'manual' | 'scheduled' | 'pre-migrate' | 'pre-restore' | 'pre-sandbox';
 export type OrderMergeItemStrategy = 'keep_target' | 'use_source' | 'combine';
 export type TemplateFormat = 'html' | 'plain';
 export type SnippetCutoffMode = 'days_before' | 'weekly_day';
@@ -114,6 +114,7 @@ export interface DailySupplyEntry {
   isCascadeAnchor: boolean;
   bufferOverride: number | null;
   extraBuffer?: number; // Additional single-day safety buffer / walk-up event holdback added on top of base buffer
+  selfConsumption?: number; // Personal / farm self-consumption deducted like an order without creating a draggable order
   notes: string | null;
 }
 
@@ -219,6 +220,7 @@ export interface DailyItemProjection {
   actualOnHand: number | null;
   actualEndOfDay?: number | null;
   slottedQty: number;
+  selfConsumption?: number;
   endingBalance: number;
   expectedNextDayStarting?: number;
   nextDayStarting: number;
@@ -295,6 +297,19 @@ export interface BackupInfo {
   createdAt: string;
 }
 
+export interface SandboxStatus {
+  active: boolean;
+  startedAt: string | null;
+  snapshotFilename: string | null;
+}
+
+export interface BackupPreviewStatus {
+  active: boolean;
+  filename: string | null;
+  startedAt: string | null;
+  backupCreatedAt: string | null;
+}
+
 export interface CustomerSuggestion {
   key: string;
   name: string;
@@ -323,6 +338,8 @@ export interface WorkspacePayload {
   ignoredOrders: OrderRecord[];
   standingOrders: StandingOrder[];
   checkpoints: CheckpointSummary[];
+  sandboxStatus?: SandboxStatus;
+  backupPreviewStatus?: BackupPreviewStatus;
 }
 
 export interface PublicAvailabilityDay {

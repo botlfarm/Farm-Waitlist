@@ -55,6 +55,7 @@ import type {
 
 interface CalendarWorkspaceProps {
   workspace: WorkspacePayload;
+  readOnly?: boolean;
   focusedItemId: number | 'all';
   onChangeFocusedItem: (id: number | 'all') => void;
   onSelectDay: (day: CalendarDayProjection) => void;
@@ -139,6 +140,7 @@ export function computeDragAutoScrollStep(
 
 export function CalendarWorkspace({
   workspace,
+  readOnly = false,
   focusedItemId,
   onChangeFocusedItem,
   onSelectDay,
@@ -611,6 +613,10 @@ export function CalendarWorkspace({
   }, [stopDragAutoScroll, clearPendingDragLeave, updateDragPointer]);
 
   const handleDragStart = (e: DragEvent, orderId: number, fromQueue = false) => {
+    if (readOnly) {
+      e.preventDefault();
+      return;
+    }
     e.dataTransfer.setData('text/plain', String(orderId));
     e.dataTransfer.effectAllowed = 'move';
     clearPendingDragLeave();
@@ -711,6 +717,7 @@ export function CalendarWorkspace({
     stopDragAutoScroll();
     clearPendingDragLeave();
     lastQueueSwapRef.current = null;
+    if (readOnly) return;
     const rawId = e.dataTransfer?.getData('text/plain');
     const draggedId =
       draggingQueueOrderId ?? (rawId && Number.isInteger(Number(rawId)) ? Number(rawId) : null);
@@ -746,6 +753,7 @@ export function CalendarWorkspace({
   };
 
   const handleMoveQueueOrder = async (orderId: number, direction: -1 | 1) => {
+    if (readOnly) return;
     const currentIds = baseUnslottedOrders.map((o) => o.id);
     const idx = currentIds.indexOf(orderId);
     const nextIdx = idx + direction;
@@ -762,6 +770,7 @@ export function CalendarWorkspace({
     stopDragAutoScroll();
     clearPendingDragLeave();
     lastQueueSwapRef.current = null;
+    if (readOnly) return;
     const rawId = e.dataTransfer.getData('text/plain');
     const orderId = Number(rawId);
     setDragOverDate(null);
@@ -903,14 +912,16 @@ export function CalendarWorkspace({
           <button
             type="button"
             data-testid="sync-now-btn"
-            disabled={syncing || !workspace.odooStatus.configured}
+            disabled={readOnly || syncing || !workspace.odooStatus.configured}
             onClick={() => void onSyncNow()}
             title={
-              workspace.odooStatus.configured
-                ? 'Pull draft quotations, chatter & customer updates from Odoo 19.3 (does not publish to your website)'
-                : 'Configure Odoo credentials in HA add-on options or .env'
+              readOnly
+                ? 'Exit Backup Preview to sync with Odoo'
+                : workspace.odooStatus.configured
+                  ? 'Pull draft quotations, chatter & customer updates from Odoo 19.3 (does not publish to your website)'
+                  : 'Configure Odoo credentials in HA add-on options or .env'
             }
-            className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#E6EDF3] transition-colors hover:border-[#38BDF8] disabled:opacity-45"
+            className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#E6EDF3] transition-colors hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
             {syncing ? 'Pulling Odoo...' : 'Pull from Odoo'}
@@ -918,25 +929,32 @@ export function CalendarWorkspace({
 
           {onPublishAvailability && (() => {
             const ghStatus = workspace.githubPublishStatus;
+            const inSandbox = Boolean(workspace.sandboxStatus?.active);
             const canPublishWebsite = Boolean(ghStatus?.tokenConfigured && ghStatus?.repo);
-            const hasPendingEdits = Boolean(canPublishWebsite && ghStatus?.hasUnpublishedEdits);
+            const hasPendingEdits = Boolean(
+              !readOnly && !inSandbox && canPublishWebsite && ghStatus?.hasUnpublishedEdits
+            );
             return (
               <button
                 type="button"
                 data-testid="publish-availability-btn"
                 data-pending-edits={hasPendingEdits ? 'true' : undefined}
-                disabled={publishingAvailability || !canPublishWebsite}
+                disabled={readOnly || publishingAvailability || !canPublishWebsite || inSandbox}
                 onClick={() => void onPublishAvailability()}
                 title={
-                  !canPublishWebsite
-                    ? 'Configure your GitHub Pages repository and token in Availability Snippet to publish'
-                    : hasPendingEdits
-                      ? 'Unpublished edits pending — push updated availability calendar to your public website now'
-                      : ghStatus?.lastPublishedAt
-                        ? `Push current availability calendar to your public website (last published ${formatLocalDateTime(new Date(ghStatus.lastPublishedAt), workspace.settings.timezone)})`
-                        : 'Push current availability calendar to your public website'
+                  readOnly
+                    ? 'Publishing to your live website is disabled while previewing a backup'
+                    : inSandbox
+                      ? 'Publishing to your live website is disabled while in Sandbox Mode'
+                      : !canPublishWebsite
+                        ? 'Configure your GitHub Pages repository and token in Availability Snippet to publish'
+                        : hasPendingEdits
+                          ? 'Unpublished edits pending — push updated availability calendar to your public website now'
+                          : ghStatus?.lastPublishedAt
+                            ? `Push current availability calendar to your public website (last published ${formatLocalDateTime(new Date(ghStatus.lastPublishedAt), workspace.settings.timezone)})`
+                            : 'Push current availability calendar to your public website'
                 }
-                className={`inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border bg-[#0F1419] px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-45 ${
+                className={`inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border bg-[#0F1419] px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
                   hasPendingEdits
                     ? 'border-[#FBBF24]/70 text-[#FBBF24] hover:border-[#FBBF24] hover:bg-[#D97706]/10'
                     : 'border-[#283340] text-[#E6EDF3] hover:border-[#38BDF8]'
@@ -959,9 +977,10 @@ export function CalendarWorkspace({
           <button
             type="button"
             data-testid="auto-slot-asap-btn"
-            disabled={autoSlotting || unslottedOrders.length === 0}
+            disabled={readOnly || autoSlotting || unslottedOrders.length === 0}
+            title={readOnly ? 'Exit Backup Preview to schedule orders' : undefined}
             onClick={() => void onAutoSlotAsap()}
-            className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#38BDF8]/60 bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#38BDF8] transition-colors hover:bg-[#1E2730] disabled:opacity-45"
+            className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#38BDF8]/60 bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#38BDF8] transition-colors hover:bg-[#1E2730] disabled:cursor-not-allowed disabled:opacity-45"
           >
             <Sparkles className="h-3.5 w-3.5" />
             {autoSlotting ? 'Slotting...' : 'Auto-Slot ASAP'}
@@ -970,9 +989,10 @@ export function CalendarWorkspace({
           <button
             type="button"
             data-testid="undo-action-btn"
-            disabled={workspace.checkpoints.length === 0}
+            disabled={readOnly || workspace.checkpoints.length === 0}
+            title={readOnly ? 'Exit Backup Preview to undo actions' : undefined}
             onClick={() => void onUndo()}
-            className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] transition-colors hover:border-[#38BDF8] disabled:opacity-40"
+            className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] transition-colors hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-40"
           >
             <RotateCcw className="h-3.5 w-3.5" />
             Undo
@@ -982,8 +1002,10 @@ export function CalendarWorkspace({
             <button
               type="button"
               data-testid="checkpoint-menu-btn"
+              disabled={readOnly}
+              title={readOnly ? 'Exit Backup Preview to manage checkpoints' : undefined}
               onClick={() => setShowCheckpoints((prev) => !prev)}
-              className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] transition-colors hover:border-[#38BDF8]"
+              className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] transition-colors hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-40"
             >
               <Bookmark className="h-3.5 w-3.5" />
               Checkpoints
@@ -993,7 +1015,7 @@ export function CalendarWorkspace({
       </div>
 
       {/* Viewport-Safe Checkpoints Sheet / Popover (never clips off mobile edges) */}
-      {showCheckpoints && (
+      {showCheckpoints && !readOnly && (
         <div
           className="fixed inset-0 z-50 flex items-start justify-center bg-black/60 p-4 pt-20 sm:justify-end sm:bg-transparent sm:p-6 sm:pt-28"
           onClick={() => setShowCheckpoints(false)}
@@ -1088,9 +1110,10 @@ export function CalendarWorkspace({
                   </button>
                   <button
                     type="button"
+                    disabled={readOnly}
                     data-testid={`overdue-release-${order.id}`}
                     onClick={() => void onReleaseHold(order.id)}
-                    className="text-[11px] font-medium text-[#FBBF24] hover:underline"
+                    className="text-[11px] font-medium text-[#FBBF24] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     Return to Waitlist
                   </button>
@@ -1210,7 +1233,7 @@ export function CalendarWorkspace({
                       {replacementOrder && onReplaceOrder && (
                         <button
                           type="button"
-                          disabled={isReplacing}
+                          disabled={readOnly || isReplacing}
                           data-testid={`reconcile-replace-${order.id}`}
                           onClick={async () => {
                             setReplacingOrderId(order.id);
@@ -1225,7 +1248,7 @@ export function CalendarWorkspace({
                             }
                           }}
                           title={`Combine ${order.odooQuotationName || 'this order'} with ${replacementOrder.odooQuotationName || 'the new quotation'}, keep your scheduled date, and preserve the full order chain`}
-                          className="inline-flex items-center gap-1 rounded bg-[#0EA5E9] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:opacity-50"
+                          className="inline-flex items-center gap-1 rounded bg-[#0EA5E9] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                         >
                           <GitMerge className="h-3 w-3" />
                           {isReplacing
@@ -1236,9 +1259,10 @@ export function CalendarWorkspace({
                       {!replacementOrder && order.odooSuggestedConfirmed && (
                         <button
                           type="button"
+                          disabled={readOnly}
                           data-testid={`reconcile-confirm-${order.id}`}
                           onClick={() => void onReconcile(order.id, 'confirm')}
-                          className="inline-flex items-center gap-1 rounded bg-[#16A34A] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#22C55E]"
+                          className="inline-flex items-center gap-1 rounded bg-[#16A34A] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#22C55E] disabled:cursor-not-allowed disabled:opacity-45"
                         >
                           <Check className="h-3 w-3" />
                           Mark Confirmed
@@ -1246,19 +1270,21 @@ export function CalendarWorkspace({
                       )}
                       <button
                         type="button"
+                        disabled={readOnly}
                         data-testid={`reconcile-keep-${order.id}`}
                         onClick={() => void onReconcile(order.id, 'keep')}
                         title="Keep this order on the schedule and dismiss this alert"
-                        className="rounded border border-[#283340] px-2 py-1 text-[11px] text-[#C9D1D9] hover:border-[#38BDF8] hover:text-white"
+                        className="rounded border border-[#283340] px-2 py-1 text-[11px] text-[#C9D1D9] hover:border-[#38BDF8] hover:text-white disabled:cursor-not-allowed disabled:opacity-45"
                       >
                         Keep
                       </button>
                       <button
                         type="button"
+                        disabled={readOnly}
                         data-testid={`reconcile-remove-${order.id}`}
                         onClick={() => void onReconcile(order.id, 'ignore')}
                         title="Remove this cancelled quotation from the schedule and free up its eggs (Undo available)"
-                        className="text-[11px] text-[#F87171] hover:text-[#FCA5A5] hover:underline"
+                        className="text-[11px] text-[#F87171] hover:text-[#FCA5A5] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
                       >
                         Remove
                       </button>
@@ -1540,6 +1566,21 @@ export function CalendarWorkspace({
                                     </span>
                                   </div>
 
+                                  {(focusedProj.selfConsumption ?? 0) > 0 && (
+                                    <div
+                                      data-testid={`day-self-consumption-${day.date}`}
+                                      title={`Self consumption (personal/farm use): ${formatQty(focusedProj.selfConsumption!)} ${focusedItem.unitLabel} deducted from daily stock`}
+                                      className="flex items-baseline justify-between gap-2 text-[#C084FC]"
+                                    >
+                                      <span className="whitespace-nowrap font-sans text-[10px] font-medium">
+                                        Self
+                                      </span>
+                                      <span className="whitespace-nowrap font-mono text-[10px] font-medium">
+                                        -{formatQty(focusedProj.selfConsumption!)}
+                                      </span>
+                                    </div>
+                                  )}
+
                                   {focusedProj.effectiveBuffer > 0 && (
                                     <div
                                       data-testid={
@@ -1727,13 +1768,13 @@ export function CalendarWorkspace({
                                 <button
                                   key={order.id}
                                   type="button"
-                                  draggable={!order.isLocked}
+                                  draggable={!readOnly && !order.isLocked}
                                   data-testid={`order-chip-${order.id}`}
                                   onDragStart={(e) => handleDragStart(e, order.id)}
                                   onDragEnd={handleDragEnd}
                                   onClick={() => onSelectOrder(order)}
                                   className={`w-full rounded border px-2.5 py-2 text-left transition-[transform,opacity,background-color,border-color,box-shadow] duration-200 ease-out hover:border-[#38BDF8] hover:bg-[#1E2730] md:px-2 md:py-1.5 ${
-                                    order.isLocked
+                                    readOnly || order.isLocked
                                       ? 'cursor-pointer'
                                       : 'cursor-grab active:cursor-grabbing'
                                   } ${
@@ -1871,13 +1912,14 @@ export function CalendarWorkspace({
                     {hasCustomWaitlistOrder && onResetWaitlistOrder && (
                       <button
                         type="button"
+                        disabled={readOnly}
                         data-testid="reset-waitlist-order-btn"
                         onClick={() => {
                           snapshotQueueCardPositions();
                           setOptimisticQueueIds(null);
                           void onResetWaitlistOrder();
                         }}
-                        className="font-medium text-[#38BDF8] hover:underline"
+                        className="font-medium text-[#38BDF8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
                       >
                         Reset to Arrival
                       </button>
@@ -1925,9 +1967,10 @@ export function CalendarWorkspace({
                           </span>
                           <button
                             type="button"
+                            disabled={readOnly}
                             data-testid={`restore-ignored-${order.id}`}
                             onClick={() => void onRestoreIgnored(order.id)}
-                            className="shrink-0 text-xs font-medium text-[#38BDF8] hover:underline"
+                            className="shrink-0 text-xs font-medium text-[#38BDF8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
                           >
                             Restore
                           </button>
@@ -1970,7 +2013,7 @@ export function CalendarWorkspace({
                             queueCardRefs.current.delete(order.id);
                           }
                         }}
-                        draggable
+                        draggable={!readOnly}
                         data-testid={`queue-order-${order.id}`}
                         onDragStart={(e) => handleDragStart(e, order.id, true)}
                         onDragEnd={handleDragEnd}
@@ -1990,7 +2033,9 @@ export function CalendarWorkspace({
                             onSelectOrder(order);
                           }
                         }}
-                        className={`relative cursor-grab rounded-md border p-3 transition-[background-color,border-color,box-shadow,opacity,transform] duration-200 ease-out will-change-transform active:cursor-grabbing ${
+                        className={`relative rounded-md border p-3 transition-[background-color,border-color,box-shadow,opacity,transform] duration-200 ease-out will-change-transform ${
+                          readOnly ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'
+                        } ${
                           isDraggingToCalendar
                             ? 'scale-[0.98] border-dashed border-[#38BDF8]/60 bg-[#0EA5E9]/8 opacity-45'
                             : isDraggingThis
@@ -2041,7 +2086,7 @@ export function CalendarWorkspace({
                             >
                               <button
                                 type="button"
-                                disabled={idx === 0}
+                                disabled={readOnly || idx === 0}
                                 data-testid={`queue-move-up-${order.id}`}
                                 aria-label={`Move ${order.customerName} up in waitlist`}
                                 title="Move up"
@@ -2055,7 +2100,7 @@ export function CalendarWorkspace({
                               </button>
                               <button
                                 type="button"
-                                disabled={idx === unslottedOrders.length - 1}
+                                disabled={readOnly || idx === unslottedOrders.length - 1}
                                 data-testid={`queue-move-down-${order.id}`}
                                 aria-label={`Move ${order.customerName} down in waitlist`}
                                 title="Move down"

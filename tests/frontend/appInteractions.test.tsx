@@ -2542,6 +2542,476 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
       );
     });
   });
+
+  it('starts Sandbox Mode from Settings > Backup & Restore, displays global top banner across tabs, disables live publish/backups, and returns to live DB on exit', async () => {
+    const user = userEvent.setup();
+    const ws = makeBaseWorkspace({
+      githubPublishStatus: {
+        tokenConfigured: true,
+        tokenSource: 'ha_options',
+        repo: 'myfarm/avail',
+        branch: 'main',
+        filePath: 'availability.json',
+        publicUrl: 'https://myfarm.github.io/avail/availability.json',
+        mode: 'manual',
+        interval: '30m',
+        lastPublishedAt: null,
+        lastPublishStatus: 'never',
+        lastPublishError: null,
+        lastPublishedHash: null,
+      },
+      sandboxStatus: {
+        active: false,
+        startedAt: null,
+        snapshotFilename: null,
+      },
+    });
+
+    const backupsList: Array<{
+      filename: string;
+      trigger: 'manual' | 'pre-sandbox';
+      sizeBytes: number;
+      createdAt: string;
+    }> = [
+      {
+        filename: 'manual-20261124-120000-000.db',
+        trigger: 'manual',
+        sizeBytes: 4096,
+        createdAt: '2026-11-24T12:00:00.000Z',
+      },
+    ];
+    let enterCalls = 0;
+    let exitCalls = 0;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/backups' && (!init?.method || init.method === 'GET')) {
+          return new Response(JSON.stringify(backupsList), { status: 200 });
+        }
+        if (input === './api/sandbox/enter' && init?.method === 'POST') {
+          enterCalls += 1;
+          const snapshot = {
+            filename: 'pre-sandbox-20261125-100000-000.db',
+            trigger: 'pre-sandbox' as const,
+            sizeBytes: 4096,
+            createdAt: '2026-11-25T10:00:00.000Z',
+          };
+          backupsList.unshift(snapshot);
+          ws.sandboxStatus = {
+            active: true,
+            startedAt: '2026-11-25T10:00:00.000Z',
+            snapshotFilename: snapshot.filename,
+          };
+          return new Response(
+            JSON.stringify({ sandboxStatus: ws.sandboxStatus, backup: snapshot }),
+            { status: 201 }
+          );
+        }
+        if (input === './api/sandbox/exit' && init?.method === 'POST') {
+          exitCalls += 1;
+          ws.sandboxStatus = {
+            active: false,
+            startedAt: null,
+            snapshotFilename: null,
+          };
+          return new Response(JSON.stringify({ sandboxStatus: ws.sandboxStatus }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    // Initially live — no sandbox banner
+    await screen.findByTestId('nav-settings');
+    expect(screen.queryByTestId('sandbox-mode-banner')).not.toBeInTheDocument();
+
+    // Navigate to Settings -> Backup & Restore and enter Sandbox Mode
+    await user.click(screen.getByTestId('nav-settings'));
+    await user.click(await screen.findByTestId('settings-tab-backups'));
+    expect(await screen.findByTestId('sandbox-mode-card')).toBeInTheDocument();
+
+    await user.click(screen.getByTestId('enter-sandbox-btn'));
+
+    // Global top banner appears immediately & live backup creation is disabled
+    const banner = await screen.findByTestId('sandbox-mode-banner');
+    expect(banner).toHaveTextContent(/sandbox mode/i);
+    expect(banner).toHaveTextContent(/not permanent/i);
+    expect(enterCalls).toBe(1);
+    expect(screen.getByTestId('create-backup-now-btn')).toBeDisabled();
+
+    // Navigating to Calendar keeps the global top banner visible and disables live website publishing
+    await user.click(screen.getByTestId('nav-calendar'));
+    expect(screen.getByTestId('sandbox-mode-banner')).toBeInTheDocument();
+    expect(await screen.findByTestId('publish-availability-btn')).toBeDisabled();
+
+    // Exiting Sandbox Mode via the top banner restores live DB and removes the banner
+    await user.click(screen.getByTestId('exit-sandbox-btn'));
+    await waitFor(() => {
+      expect(exitCalls).toBe(1);
+      expect(screen.queryByTestId('sandbox-mode-banner')).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId('publish-availability-btn')).not.toBeDisabled();
+  });
+
+  it('supports Self Consumption on daily egg numbers with live preview, saving without override warning, and calendar badge', async () => {
+    const user = userEvent.setup();
+    const ws = makeBaseWorkspace();
+    ws.days[1].byItem[1].startingBalance = 20;
+    ws.days[1].byItem[1].expectedStartingBalance = 20;
+    ws.days[1].byItem[1].slottedQty = 4;
+    ws.days[1].byItem[1].selfConsumption = 0;
+    ws.days[1].byItem[1].endingBalance = 16;
+    ws.days[1].byItem[1].estProduced = 10;
+    ws.days[1].byItem[1].expectedProduced = 10;
+    ws.days[1].byItem[1].nextDayStarting = 26;
+    ws.days[1].byItem[1].expectedNextDayStarting = 26;
+    ws.days[1].byItem[1].effectiveBuffer = 4;
+    ws.days[1].byItem[1].rawSellableOpen = 12;
+    ws.days[1].byItem[1].sellableOpen = 12;
+
+    const supplyUpdates: Array<{ url: string; body: Record<string, unknown> }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input.startsWith('./api/supply/') && init?.method === 'PUT') {
+          const parsed = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+          supplyUpdates.push({ url: input, body: parsed });
+          const sc = Number(parsed.selfConsumption ?? 0);
+          ws.days[1].byItem[1] = {
+            ...ws.days[1].byItem[1],
+            selfConsumption: sc,
+            endingBalance: 20 - 4 - sc,
+            nextDayStarting: 20 - 4 - sc + 10,
+            sellableOpen: 20 - 4 - sc - 4,
+            rawSellableOpen: 20 - 4 - sc - 4,
+          };
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    // Open Tuesday (future day, 2026-11-24) DayDetailDrawer
+    await user.click(await screen.findByTestId('day-header-2026-11-24'));
+    expect(await screen.findByTestId('day-detail-drawer')).toBeInTheDocument();
+    expect(screen.getByTestId('day-remaining-before-harvest')).toHaveTextContent('16');
+    expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('26 dozens');
+
+    // Enter 3 dozens for Self Consumption -> live numbers immediately recalculate
+    const selfInput = screen.getByTestId('day-self-consumption-input');
+    await user.type(selfInput, '3');
+    expect(screen.getByTestId('day-remaining-before-harvest')).toHaveTextContent('13');
+    expect(screen.getByTestId('day-eod-expected')).toHaveTextContent('23');
+    expect(screen.getByTestId('day-tomorrow-starting')).toHaveTextContent('23 dozens');
+
+    // Saving Self Consumption on a non-today date should NOT trigger the morning/EOD override confirmation modal
+    await user.click(screen.getByTestId('day-save-btn'));
+    expect(screen.queryByTestId('non-today-override-modal')).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(supplyUpdates).toHaveLength(1);
+      expect(supplyUpdates[0].url).toBe('./api/supply/1/2026-11-24');
+      expect(supplyUpdates[0].body.selfConsumption).toBe(3);
+    });
+
+    // Calendar cell now shows the compact Self -3 line
+    expect(await screen.findByTestId('day-self-consumption-2026-11-24')).toHaveTextContent('Self-3');
+  });
+
+  it('inserts new name/date template variables with live preview in Settings and shows email, phone copy buttons, and mailto link in PreApprovalModal', async () => {
+    const user = userEvent.setup();
+    const ws = makeBaseWorkspace();
+    ws.orders[0] = {
+      ...ws.orders[0],
+      id: 10,
+      customerName: 'Alice Farmhand',
+      customerEmail: 'alice@example.com',
+      customerPhone: '555-867-5309',
+      slottedDate: '2026-11-23',
+      odooQuotationName: 'S00501',
+    };
+    ws.settings.preApprovalTemplates = [
+      {
+        id: 'default-email',
+        name: 'Default Email',
+        format: 'html',
+        body: 'Hi {{first_name}}, your {{items_summary}} is ready for {{date_short}}!',
+        isDefault: true,
+        channelIds: [],
+        itemIds: [],
+      },
+    ];
+
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    const origClipboard = navigator.clipboard;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        write: vi.fn().mockResolvedValue(undefined),
+        writeText: writeTextMock,
+      },
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/10/pre-approve' && init?.method === 'POST') {
+          const updated = { ...ws.orders[0], status: 'pre_approved' as const };
+          ws.orders[0] = updated;
+          return new Response(
+            JSON.stringify({
+              order: updated,
+              selectedTemplateId: 'default-email',
+              message: 'Hi Alice, your 2 dozens Standard Eggs is ready for Mon, Nov 23!',
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    try {
+      render(<App />);
+
+      // 1. Settings -> Templates shows new variable chips & updates live sample preview
+      await user.click(await screen.findByTestId('nav-settings'));
+      await user.click(await screen.findByTestId('settings-tab-templates'));
+
+      const preview = await screen.findByTestId('settings-template-preview');
+      expect(preview).toHaveTextContent('Hi Alex, your 2 dozens Standard Eggs is ready for Sat, Nov 28!');
+
+      await user.click(screen.getByTestId('template-var-last_name'));
+      await user.click(screen.getByTestId('template-var-weekday'));
+      expect(screen.getByTestId('settings-template-textarea')).toHaveValue(
+        'Hi {{first_name}}, your {{items_summary}} is ready for {{date_short}}! {{last_name}} {{weekday}}'
+      );
+      expect(screen.getByTestId('settings-template-preview')).toHaveTextContent('Rivera Saturday');
+
+      // 2. Return to Calendar, open order 10, click Pre-Approve -> verify Email, Phone, Copy buttons & mailto link
+      await user.click(screen.getByTestId('nav-calendar'));
+      await user.click(await screen.findByTestId('order-chip-10'));
+      await user.click(await screen.findByTestId('order-pre-approve-btn'));
+
+      expect(await screen.findByTestId('pre-approval-modal')).toBeInTheDocument();
+      expect(screen.getByTestId('pre-approval-customer-email')).toHaveTextContent('alice@example.com');
+      expect(screen.getByTestId('pre-approval-customer-phone')).toHaveTextContent('555-867-5309');
+
+      // Direct copy buttons copy email & phone cleanly
+      await user.click(screen.getByTestId('pre-approval-copy-email-btn'));
+      expect(writeTextMock).toHaveBeenCalledWith('alice@example.com');
+
+      await user.click(screen.getByTestId('pre-approval-copy-phone-btn'));
+      expect(writeTextMock).toHaveBeenCalledWith('555-867-5309');
+
+      // Mailto link contains recipient, subject with short date/ref, and plain-text message body
+      const mailtoLink = screen.getByTestId('pre-approval-mailto-link');
+      const href = mailtoLink.getAttribute('href') ?? '';
+      expect(href.startsWith('mailto:alice@example.com?subject=')).toBe(true);
+      const decodedHref = decodeURIComponent(href);
+      expect(decodedHref).toContain('Order Pre-Approved — Mon, Nov 23 (S00501)');
+      expect(decodedHref).toContain('Hi Alice, your 2 dozens Standard Eggs is ready for Mon, Nov 23!');
+    } finally {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: origClipboard,
+      });
+    }
+  });
+
+  it('previews a backup in read-only mode with a persistent top banner, disables mutations across views/drawers, and supports Exit Preview & Restore This Backup', async () => {
+    const user = userEvent.setup();
+    const liveWs = makeBaseWorkspace({
+      odooStatus: {
+        configured: true,
+        source: 'env',
+        urlHost: 'farm.odoo.com',
+        database: 'farm_db',
+      },
+      githubPublishStatus: {
+        tokenConfigured: true,
+        tokenSource: 'ha_options',
+        repo: 'myfarm/avail',
+        branch: 'main',
+        filePath: 'availability.json',
+        publicUrl: 'https://myfarm.github.io/avail/availability.json',
+        mode: 'manual',
+        interval: '30m',
+        lastPublishedAt: null,
+        lastPublishStatus: 'never',
+        lastPublishError: null,
+        lastPublishedHash: null,
+      },
+    });
+    liveWs.orders[0] = { ...liveWs.orders[0], id: 10, customerName: 'Live Sally' };
+
+    const backupFile = 'manual-20261124-120000-000.db';
+    const previewWs = makeBaseWorkspace({
+      odooStatus: liveWs.odooStatus,
+      githubPublishStatus: liveWs.githubPublishStatus,
+      backupPreviewStatus: {
+        active: true,
+        filename: backupFile,
+        startedAt: '2026-11-25T10:00:00.000Z',
+        backupCreatedAt: '2026-11-24T12:00:00.000Z',
+      },
+    });
+    previewWs.orders[0] = { ...previewWs.orders[0], id: 10, customerName: 'Backup Betty' };
+
+    const backupsList = [
+      {
+        filename: backupFile,
+        trigger: 'manual' as const,
+        sizeBytes: 4096,
+        createdAt: '2026-11-24T12:00:00.000Z',
+      },
+    ];
+
+    let isPreviewing = false;
+    let enterCount = 0;
+    let exitCount = 0;
+    let restoreCount = 0;
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(isPreviewing ? previewWs : liveWs), { status: 200 });
+        }
+        if (input === './api/backups' && (!init?.method || init.method === 'GET')) {
+          return new Response(JSON.stringify(backupsList), { status: 200 });
+        }
+        if (input === './api/backups/preview/enter' && init?.method === 'POST') {
+          enterCount += 1;
+          isPreviewing = true;
+          return new Response(
+            JSON.stringify({ backupPreviewStatus: previewWs.backupPreviewStatus }),
+            { status: 200 }
+          );
+        }
+        if (input === './api/backups/preview/exit' && init?.method === 'POST') {
+          exitCount += 1;
+          isPreviewing = false;
+          return new Response(
+            JSON.stringify({
+              backupPreviewStatus: {
+                active: false,
+                filename: null,
+                startedAt: null,
+                backupCreatedAt: null,
+              },
+            }),
+            { status: 200 }
+          );
+        }
+        if (input === './api/backups/preview/restore' && init?.method === 'POST') {
+          restoreCount += 1;
+          isPreviewing = false;
+          liveWs.orders[0] = { ...liveWs.orders[0], customerName: 'Backup Betty' };
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              restoredFrom: backupFile,
+              safetySnapshot: {
+                filename: 'pre-restore-20261125-100500-000.db',
+                trigger: 'pre-restore',
+                sizeBytes: 4096,
+                createdAt: '2026-11-25T10:05:00.000Z',
+              },
+              backupPreviewStatus: {
+                active: false,
+                filename: null,
+                startedAt: null,
+                backupCreatedAt: null,
+              },
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    // Live order is shown initially and no preview banner exists
+    expect(await screen.findByTestId('order-chip-10')).toHaveTextContent('Live Sally');
+    expect(screen.queryByTestId('backup-preview-banner')).not.toBeInTheDocument();
+
+    // Navigate to Settings -> Backup & Restore and click Preview on the snapshot
+    await user.click(screen.getByTestId('nav-settings'));
+    await user.click(await screen.findByTestId('settings-tab-backups'));
+    await user.click(await screen.findByTestId(`backup-preview-${backupFile}`));
+
+    // App switches to Calendar showing backup snapshot data & global Read-Only Backup Preview banner
+    const banner = await screen.findByTestId('backup-preview-banner');
+    expect(banner).toHaveTextContent(/read-only backup preview/i);
+    expect(banner).toHaveTextContent(backupFile);
+    expect(banner).toHaveTextContent(/no changes can be made/i);
+    expect(enterCount).toBe(1);
+    expect(await screen.findByTestId('order-chip-10')).toHaveTextContent('Backup Betty');
+
+    // Mutation controls across TopBar & Calendar toolbar are disabled
+    expect(screen.getByTestId('quick-add-order-btn')).toBeDisabled();
+    expect(screen.getByTestId('sync-now-btn')).toBeDisabled();
+    expect(screen.getByTestId('publish-availability-btn')).toBeDisabled();
+    expect(screen.getByTestId('auto-slot-asap-btn')).toBeDisabled();
+    expect(screen.getByTestId('checkpoint-menu-btn')).toBeDisabled();
+
+    // Inspection still works: open DayDetailDrawer & verify Save Day is disabled
+    await user.click(screen.getByTestId('day-header-2026-11-23'));
+    expect(await screen.findByTestId('day-detail-drawer')).toBeInTheDocument();
+    expect(screen.getByTestId('day-save-btn')).toBeDisabled();
+    await user.click(screen.getByTestId('close-day-drawer-btn'));
+
+    // Open OrderDetailDrawer & verify Save Changes is disabled
+    await user.click(screen.getByTestId('order-chip-10'));
+    expect(await screen.findByTestId('order-detail-drawer')).toBeInTheDocument();
+    expect(screen.getByTestId('order-save-btn')).toBeDisabled();
+    await user.click(screen.getByTestId('close-order-drawer-btn'));
+
+    // Checking Settings -> Backup & Restore shows active Previewing badge & disables Sandbox/Create Snapshot
+    await user.click(screen.getByTestId('nav-settings'));
+    await user.click(await screen.findByTestId('settings-tab-backups'));
+    expect(await screen.findByTestId(`backup-previewing-badge-${backupFile}`)).toBeInTheDocument();
+    expect(screen.getByTestId('enter-sandbox-btn')).toBeDisabled();
+    expect(screen.getByTestId('create-backup-now-btn')).toBeDisabled();
+
+    // Exit Preview via the top banner returns to live DB and re-enables actions
+    await user.click(screen.getByTestId('exit-backup-preview-btn'));
+    await waitFor(() => {
+      expect(exitCount).toBe(1);
+      expect(screen.queryByTestId('backup-preview-banner')).not.toBeInTheDocument();
+    });
+    expect(screen.getByTestId('quick-add-order-btn')).not.toBeDisabled();
+
+    // Re-enter preview and restore directly from the top banner (2-step confirmation)
+    await user.click(await screen.findByTestId(`backup-preview-${backupFile}`));
+    expect(await screen.findByTestId('backup-preview-banner')).toBeInTheDocument();
+
+    await user.click(screen.getByTestId('preview-restore-backup-btn'));
+    await user.click(await screen.findByTestId('preview-confirm-restore-btn'));
+
+    await waitFor(() => {
+      expect(restoreCount).toBe(1);
+      expect(screen.queryByTestId('backup-preview-banner')).not.toBeInTheDocument();
+    });
+    expect(await screen.findByTestId('order-chip-10')).toHaveTextContent('Backup Betty');
+  });
 });
 
 

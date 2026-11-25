@@ -2,10 +2,14 @@ import {
   DEFAULT_TIMEZONE,
   ISO_WEEKDAY_LABELS,
   addDays,
+  formatDateLongNoYear,
+  formatDateNoYear,
+  formatDateNumeric,
   formatFullDisplayDate,
   formatLocalDateTime,
   formatLocalTimeHHMM,
   formatShortCalendarDate,
+  formatWeekdayLong,
   getIsoWeekday,
   getMondayOfWeek,
   listDateRange,
@@ -51,6 +55,105 @@ export function formatOrderItemsSummary(
     .join(' + ');
 }
 
+export interface SplitCustomerName {
+  fullName: string;
+  firstName: string;
+  lastName: string;
+}
+
+/**
+ * Splits a full customer name on whitespace into firstName and lastName.
+ * Single-word names return firstName = word and lastName = "".
+ * Empty names fall back to "there" for fullName/firstName and "" for lastName.
+ */
+export function splitCustomerName(rawName: string | null | undefined): SplitCustomerName {
+  const trimmed = (rawName ?? '').trim();
+  if (!trimmed) {
+    return { fullName: 'there', firstName: 'there', lastName: '' };
+  }
+  const parts = trimmed.split(/\s+/);
+  return {
+    fullName: trimmed,
+    firstName: parts[0],
+    lastName: parts.slice(1).join(' '),
+  };
+}
+
+export interface TemplateVariableMeta {
+  key: string;
+  token: string;
+  label: string;
+  example: string;
+  group: 'name' | 'date' | 'order';
+}
+
+export const PRE_APPROVAL_TEMPLATE_VARIABLES: TemplateVariableMeta[] = [
+  { key: 'first_name', token: '{{first_name}}', label: 'First name', example: 'Alex', group: 'name' },
+  { key: 'last_name', token: '{{last_name}}', label: 'Last name', example: 'Rivera', group: 'name' },
+  { key: 'name', token: '{{name}}', label: 'Full name', example: 'Alex Rivera', group: 'name' },
+  { key: 'date_short', token: '{{date_short}}', label: 'Short date (no year)', example: 'Sat, Nov 28', group: 'date' },
+  { key: 'date_long', token: '{{date_long}}', label: 'Long date (no year)', example: 'Saturday, November 28', group: 'date' },
+  { key: 'date_md', token: '{{date_md}}', label: 'Month & day', example: 'Nov 28', group: 'date' },
+  { key: 'date_numeric', token: '{{date_numeric}}', label: 'Numeric date', example: '11/28', group: 'date' },
+  { key: 'weekday', token: '{{weekday}}', label: 'Day of week', example: 'Saturday', group: 'date' },
+  { key: 'date', token: '{{date}}', label: 'Full date (with year)', example: 'Sat, Nov 28, 2026', group: 'date' },
+  { key: 'items_summary', token: '{{items_summary}}', label: 'Items summary', example: '2 dozens Standard Eggs', group: 'order' },
+  { key: 'channel', token: '{{channel}}', label: 'Pickup channel', example: 'Farm Store', group: 'order' },
+  { key: 'order_ref', token: '{{order_ref}}', label: 'Order reference', example: 'S00105', group: 'order' },
+];
+
+interface ResolvedTemplateValues {
+  name: string;
+  firstName: string;
+  lastName: string;
+  date: string;
+  dateShort: string;
+  dateLong: string;
+  dateMd: string;
+  dateNumeric: string;
+  weekday: string;
+  itemsSummary: string;
+  channel: string;
+  orderRef: string;
+}
+
+function applyPreApprovalTemplateValues(template: string, values: ResolvedTemplateValues): string {
+  return template
+    .replace(/\{\{\s*first_name\s*\}\}/gi, values.firstName)
+    .replace(/\{\{\s*last_name\s*\}\}/gi, values.lastName)
+    .replace(/\{\{\s*name\s*\}\}/gi, values.name)
+    .replace(/\{\{\s*date_short\s*\}\}/gi, values.dateShort)
+    .replace(/\{\{\s*date_long\s*\}\}/gi, values.dateLong)
+    .replace(/\{\{\s*date_md\s*\}\}/gi, values.dateMd)
+    .replace(/\{\{\s*date_numeric\s*\}\}/gi, values.dateNumeric)
+    .replace(/\{\{\s*weekday\s*\}\}/gi, values.weekday)
+    .replace(/\{\{\s*date\s*\}\}/gi, values.date)
+    .replace(/\{\{\s*items_summary\s*\}\}/gi, values.itemsSummary)
+    .replace(/\{\{\s*channel\s*\}\}/gi, values.channel)
+    .replace(/\{\{\s*order_ref\s*\}\}/gi, values.orderRef);
+}
+
+function resolveDateFormatValues(effectiveYmd: string | null | undefined) {
+  if (!effectiveYmd) {
+    return {
+      date: 'your scheduled pickup date',
+      dateShort: 'your scheduled pickup date',
+      dateLong: 'your scheduled pickup date',
+      dateMd: 'your scheduled pickup date',
+      dateNumeric: 'your scheduled pickup date',
+      weekday: 'your pickup day',
+    };
+  }
+  return {
+    date: formatFullDisplayDate(effectiveYmd),
+    dateShort: formatDateNoYear(effectiveYmd),
+    dateLong: formatDateLongNoYear(effectiveYmd),
+    dateMd: formatShortCalendarDate(effectiveYmd),
+    dateNumeric: formatDateNumeric(effectiveYmd),
+    weekday: formatWeekdayLong(effectiveYmd),
+  };
+}
+
 export function renderPreApprovalMessage(params: {
   template: string;
   order: OrderRecord;
@@ -63,20 +166,63 @@ export function renderPreApprovalMessage(params: {
     ? channels.find((c) => c.id === order.pickupChannelId)?.name ?? order.freeTextPickup ?? 'Farm Pickup'
     : order.freeTextPickup ?? 'Farm Pickup';
 
-  const dateLabel = order.slottedDate
-    ? formatFullDisplayDate(order.slottedDate)
-    : order.requestedDate
-      ? formatFullDisplayDate(order.requestedDate)
-      : 'your scheduled pickup date';
-
+  const effectiveYmd = order.slottedDate || order.requestedDate || null;
+  const dates = resolveDateFormatValues(effectiveYmd);
+  const nameParts = splitCustomerName(order.customerName);
   const itemsSummary = formatOrderItemsSummary(order, itemsById);
-  const firstName = (order.customerName || 'there').trim();
+  const orderRef = (order.odooQuotationName ?? '').trim();
 
-  return template
-    .replace(/\{\{\s*name\s*\}\}/gi, firstName)
-    .replace(/\{\{\s*items_summary\s*\}\}/gi, itemsSummary)
-    .replace(/\{\{\s*date\s*\}\}/gi, dateLabel)
-    .replace(/\{\{\s*channel\s*\}\}/gi, channel);
+  return applyPreApprovalTemplateValues(template, {
+    name: nameParts.fullName,
+    firstName: nameParts.firstName,
+    lastName: nameParts.lastName,
+    ...dates,
+    itemsSummary,
+    channel,
+    orderRef,
+  });
+}
+
+export function renderPreApprovalSamplePreview(
+  template: string,
+  channelName: string = 'Farm Store'
+): string {
+  const dates = resolveDateFormatValues('2026-11-28');
+  return applyPreApprovalTemplateValues(template, {
+    name: 'Alex Rivera',
+    firstName: 'Alex',
+    lastName: 'Rivera',
+    ...dates,
+    itemsSummary: '2 dozens Standard Eggs',
+    channel: channelName || 'Farm Store',
+    orderRef: 'S00105',
+  });
+}
+
+export function buildPreApprovalMailtoHref(params: {
+  email?: string | null;
+  order?: Pick<OrderRecord, 'slottedDate' | 'requestedDate' | 'odooQuotationName'> | null;
+  message: string;
+  subject?: string;
+}): string | null {
+  const rawEmail = (params.email ?? '').trim();
+  const sanitizedEmail = rawEmail.replace(/[\r\n\s?&#<>]/g, '');
+  const hasValidEmail = /^[^\s@<>?,&]+@[^\s@<>?,&]+$/.test(sanitizedEmail);
+  if (!hasValidEmail && rawEmail.length > 0) {
+    return null;
+  }
+
+  const effectiveYmd = params.order?.slottedDate || params.order?.requestedDate || null;
+  const dateSuffix = effectiveYmd ? ` — ${formatDateNoYear(effectiveYmd)}` : '';
+  const refSuffix = params.order?.odooQuotationName?.trim()
+    ? ` (${params.order.odooQuotationName.trim()})`
+    : '';
+  const resolvedSubject =
+    params.subject?.trim() || `Order Pre-Approved${dateSuffix}${refSuffix}`;
+  const plainBody = renderMessageToPlainText(params.message);
+
+  const recipient = hasValidEmail ? sanitizedEmail : '';
+  return `mailto:${recipient}?subject=${encodeURIComponent(resolvedSubject)}&body=${encodeURIComponent(plainBody)}`;
 }
 
 /**

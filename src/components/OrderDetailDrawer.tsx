@@ -73,6 +73,7 @@ interface OrderDetailDrawerProps {
   weeks: number;
   holdThresholdHours: number;
   odooConfigured?: boolean;
+  readOnly?: boolean;
   onClose: () => void;
   onSelectOrder?: (orderId: number) => void;
   onSaveOrder: (orderId: number, patch: OrderSavePatch) => Promise<void>;
@@ -298,6 +299,7 @@ export function OrderDetailDrawer({
   weeks,
   holdThresholdHours,
   odooConfigured = false,
+  readOnly = false,
   onClose,
   onSelectOrder,
   onSaveOrder,
@@ -557,7 +559,7 @@ export function OrderDetailDrawer({
   };
 
   const handleQuickSlot = async (targetDate: string) => {
-    if (isLocked) return;
+    if (readOnly || isLocked) return;
     setSlottingTarget(targetDate);
     try {
       await onQuickSlotOrder(order.id, targetDate, hasDraftEdits() ? buildDraftPatch() : undefined);
@@ -576,7 +578,7 @@ export function OrderDetailDrawer({
   );
 
   const handleConfirmMerge = async () => {
-    if (!onMergeOrders || !selectedMergeSource || merging) return;
+    if (readOnly || !onMergeOrders || !selectedMergeSource || merging) return;
     setMerging(true);
     try {
       await onMergeOrders(order.id, selectedMergeSource.id, mergeStrategy, resolvedMergeDate);
@@ -697,7 +699,7 @@ export function OrderDetailDrawer({
                   {topReplacement && onMergeOrders && (
                     <button
                       type="button"
-                      disabled={merging}
+                      disabled={readOnly || merging}
                       data-testid="drawer-reconcile-replace-btn"
                       onClick={async () => {
                         setMerging(true);
@@ -712,7 +714,7 @@ export function OrderDetailDrawer({
                           setMerging(false);
                         }
                       }}
-                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#0EA5E9] px-3 py-1.5 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:opacity-50"
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#0EA5E9] px-3 py-1.5 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                     >
                       <GitMerge className="h-3.5 w-3.5" />
                       {merging
@@ -723,6 +725,7 @@ export function OrderDetailDrawer({
                   {onMergeOrders && (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) && (
                     <button
                       type="button"
+                      disabled={readOnly}
                       data-testid="drawer-reconcile-compare-btn"
                       onClick={() => {
                         const pick = topReplacement ?? mergeCandidates.likely[0] ?? mergeCandidates.others[0];
@@ -733,33 +736,36 @@ export function OrderDetailDrawer({
                         }
                         setMergePanelOpen(true);
                       }}
-                      className="min-h-[36px] rounded-md border border-[#38BDF8]/50 bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#7DD3FC] hover:border-[#38BDF8]"
+                      className="min-h-[36px] rounded-md border border-[#38BDF8]/50 bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#7DD3FC] hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                     >
                       Compare / Link Order
                     </button>
                   )}
                   <button
                     type="button"
+                    disabled={readOnly}
                     data-testid="drawer-reconcile-keep-btn"
                     onClick={() => void onReconcile(order.id, 'keep')}
-                    className="min-h-[36px] rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#38BDF8]"
+                    className="min-h-[36px] rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     Keep Order &amp; Clear Flag
                   </button>
                   <button
                     type="button"
+                    disabled={readOnly}
                     data-testid="drawer-reconcile-remove-btn"
                     onClick={() => void onReconcile(order.id, 'ignore')}
-                    className="min-h-[36px] rounded-md border border-[#DC2626]/50 bg-[#DC2626]/10 px-3 py-1.5 text-xs font-medium text-[#FCA5A5] hover:border-[#F87171]"
+                    className="min-h-[36px] rounded-md border border-[#DC2626]/50 bg-[#DC2626]/10 px-3 py-1.5 text-xs font-medium text-[#FCA5A5] hover:border-[#F87171] disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     Remove Cancelled Order
                   </button>
                   {order.odooSuggestedConfirmed && (
                     <button
                       type="button"
+                      disabled={readOnly}
                       data-testid="drawer-reconcile-confirm-btn"
                       onClick={() => void onReconcile(order.id, 'confirm')}
-                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#16A34A] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#22C55E]"
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#16A34A] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#22C55E] disabled:cursor-not-allowed disabled:opacity-45"
                     >
                       <Check className="h-3.5 w-3.5" />
                       Mark Confirmed
@@ -868,7 +874,7 @@ export function OrderDetailDrawer({
                                         ? 'dismiss-duplicate-btn'
                                         : `dismiss-duplicate-btn-${cand.id}`
                                     }
-                                    disabled={dismissingDuplicateId === cand.id}
+                                    disabled={readOnly || dismissingDuplicateId === cand.id}
                                     onClick={async () => {
                                       setDismissingDuplicateId(cand.id);
                                       setLocalDismissedIds((prev) =>
@@ -883,13 +889,14 @@ export function OrderDetailDrawer({
                                         setDismissingDuplicateId(null);
                                       }
                                     }}
-                                    className="inline-flex min-h-[32px] shrink-0 items-center rounded-md border border-[#283340] bg-[#161D24] px-2.5 py-1 text-xs font-medium text-[#C9D1D9] hover:border-[#8B949E] hover:text-[#F0F6FC] disabled:opacity-50"
+                                    className="inline-flex min-h-[32px] shrink-0 items-center rounded-md border border-[#283340] bg-[#161D24] px-2.5 py-1 text-xs font-medium text-[#C9D1D9] hover:border-[#8B949E] hover:text-[#F0F6FC] disabled:cursor-not-allowed disabled:opacity-45"
                                   >
                                     Not a Duplicate
                                   </button>
                                 )}
                                 <button
                                   type="button"
+                                  disabled={readOnly}
                                   data-testid={
                                     idx === 0
                                       ? 'open-merge-duplicate-btn'
@@ -901,7 +908,7 @@ export function OrderDetailDrawer({
                                     setMergePanelOpen(true);
                                     setInspectingDuplicateId(null);
                                   }}
-                                  className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#0EA5E9] px-2.5 py-1 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8]"
+                                  className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#0EA5E9] px-2.5 py-1 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                                 >
                                   <GitMerge className="h-3.5 w-3.5" />
                                   Merge Duplicate
@@ -1341,9 +1348,10 @@ export function OrderDetailDrawer({
               </div>
               <button
                 type="button"
+                disabled={readOnly}
                 data-testid="order-release-hold-btn"
                 onClick={() => void onReleaseHold(order.id)}
-                className="min-h-[34px] shrink-0 whitespace-nowrap rounded-md border border-[#D97706]/70 bg-[#0F1419] px-3 py-1.5 text-xs font-semibold text-[#FBBF24] hover:bg-[#D97706]/20"
+                className="min-h-[34px] shrink-0 whitespace-nowrap rounded-md border border-[#D97706]/70 bg-[#0F1419] px-3 py-1.5 text-xs font-semibold text-[#FBBF24] hover:bg-[#D97706]/20 disabled:cursor-not-allowed disabled:opacity-45"
               >
                 Release Hold / Return to Waitlist
               </button>
@@ -1351,6 +1359,7 @@ export function OrderDetailDrawer({
           )}
 
           {/* 1. Order Items (Top of card for immediate visibility & quick edits) */}
+          <fieldset disabled={readOnly} className="contents">
           <section
             data-testid="order-items-section"
             aria-label="Order Items"
@@ -1430,6 +1439,7 @@ export function OrderDetailDrawer({
               </div>
             )}
           </section>
+          </fieldset>
 
           {/* 2. Pickup & Schedule (Compact fields + Click-to-Expand Inline Availability Picker) */}
           {order.status !== 'ignored' && (
@@ -1453,6 +1463,7 @@ export function OrderDetailDrawer({
               </div>
 
               {/* Compact 2-Column Row: Pickup Date + Pickup Channel */}
+              <fieldset disabled={readOnly} className="contents">
               <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div>
                   <label
@@ -1610,9 +1621,9 @@ export function OrderDetailDrawer({
                 <button
                   type="button"
                   data-testid="schedule-first-available-btn"
-                  disabled={isLocked || slottingTarget !== null}
+                  disabled={readOnly || isLocked || slottingTarget !== null}
                   onClick={() => void handleQuickSlot(firstAvailable.date)}
-                  className="mt-3 flex min-h-[42px] w-full items-center justify-between gap-2 rounded-md bg-[#0EA5E9] px-3.5 py-2 text-left text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
+                  className="mt-3 flex min-h-[42px] w-full items-center justify-between gap-2 rounded-md bg-[#0EA5E9] px-3.5 py-2 text-left text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   <span className="flex min-w-0 items-center gap-2">
                     <Sparkles className="h-4 w-4 shrink-0" aria-hidden="true" />
@@ -1648,6 +1659,7 @@ export function OrderDetailDrawer({
                   </button>
                 </div>
               )}
+              </fieldset>
 
               {/* Click-to-Expand Inline Date Availability Picker (Zero nested scroll) */}
               {candidateDates.length > 0 && (() => {
@@ -1758,9 +1770,9 @@ export function OrderDetailDrawer({
                                     key={cand.date}
                                     type="button"
                                     data-testid={`slot-candidate-${cand.date}`}
-                                    disabled={isLocked || slottingTarget !== null}
+                                    disabled={readOnly || isLocked || slottingTarget !== null}
                                     onClick={() => void handleQuickSlot(cand.date)}
-                                    className={`flex min-h-[46px] w-full flex-col gap-0.5 px-3 py-2 text-left transition-colors disabled:opacity-50 ${
+                                    className={`flex min-h-[46px] w-full flex-col gap-0.5 px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
                                       cand.isCurrentSlot ? 'bg-[#38BDF8]/10' : style.rowHover
                                     }`}
                                   >
@@ -1863,6 +1875,7 @@ export function OrderDetailDrawer({
           )}
 
           {/* 3. Status Pipeline + Pre-Approve Trigger */}
+          <fieldset disabled={readOnly} className="contents">
           <section className="space-y-2.5">
             <div className="flex items-center justify-between">
               <label className="text-xs font-semibold text-[#C9D1D9]">Status</label>
@@ -1980,6 +1993,7 @@ export function OrderDetailDrawer({
               />
             </div>
           </section>
+          </fieldset>
 
           {/* 6. Raw Odoo Quotation Payload & Lines */}
           {(order.odooRawNotes || order.odooRawLines.length > 0) && (
@@ -2047,95 +2061,115 @@ export function OrderDetailDrawer({
 
         {/* Footer Actions */}
         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[#283340] px-4 py-3.5 sm:px-6 sm:py-4">
-          <div className="flex flex-wrap items-center gap-2">
-            {onMergeOrders &&
-              order.status !== 'ignored' &&
-              (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) && (
+          {readOnly ? (
+            <>
+              <span className="text-xs font-medium text-[#7DD3FC]">
+                Read-only backup preview — exit preview to edit this order
+              </span>
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
-                  data-testid="toggle-merge-panel-btn"
-                  onClick={() => {
-                    if (!mergePanelOpen && !mergeSourceId && mergeCandidates.likely.length > 0) {
-                      setMergeSourceId(String(mergeCandidates.likely[0].id));
-                    }
-                    setMergePanelOpen((prev) => !prev);
-                  }}
-                  className="inline-flex min-h-[38px] items-center gap-1.5 whitespace-nowrap rounded-md border border-[#38BDF8]/50 bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#38BDF8] hover:bg-[#25313D]"
+                  disabled
+                  data-testid="order-save-btn"
+                  className="min-h-[40px] whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] disabled:cursor-not-allowed disabled:opacity-45"
                 >
-                  <GitMerge className="h-3.5 w-3.5" />
-                  {mergePanelOpen ? 'Close Merge' : 'Merge...'}
+                  Save Changes
                 </button>
-              )}
-            {order.source === 'odoo' && order.status !== 'ignored' && (
-              <button
-                type="button"
-                data-testid="order-ignore-btn"
-                onClick={() => void onIgnore(order.id)}
-                className="min-h-[38px] whitespace-nowrap rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#F87171] hover:text-[#F87171]"
-              >
-                Dismiss / Ignore
-              </button>
-            )}
-            {order.status === 'ignored' && (
-              <button
-                type="button"
-                data-testid="order-restore-ignored-btn"
-                onClick={() => void onRestoreIgnored(order.id)}
-                className="min-h-[38px] whitespace-nowrap rounded-md border border-[#38BDF8]/60 bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#38BDF8]"
-              >
-                Restore to Waitlist
-              </button>
-            )}
-            {order.source === 'standing' &&
-              order.standingOrderId &&
-              order.standingOccurrenceDate && (
-                <button
-                  type="button"
-                  data-testid="order-skip-standing-btn"
-                  onClick={() =>
-                    void onSkipStandingOccurrence(
-                      order.standingOrderId!,
-                      order.standingOccurrenceDate!
-                    )
-                  }
-                  className="min-h-[38px] whitespace-nowrap rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#FBBF24] hover:border-[#FBBF24]"
-                >
-                  Skip This Week
-                </button>
-              )}
-            {order.source !== 'odoo' && (
-              <button
-                type="button"
-                data-testid="order-delete-btn"
-                onClick={() => void onDeleteOrder(order.id)}
-                className="min-h-[38px] whitespace-nowrap rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#F87171] hover:border-[#F87171]"
-              >
-                Delete
-              </button>
-            )}
-          </div>
-
-          {mergePanelOpen ? (
-            <button
-              type="button"
-              disabled={!selectedMergeSource || merging}
-              data-testid="footer-confirm-merge-btn"
-              onClick={() => void handleConfirmMerge()}
-              className="inline-flex min-h-[40px] items-center gap-1.5 whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
-            >
-              <GitMerge className="h-4 w-4" />
-              {merging ? 'Merging...' : 'Merge Into 1 Order'}
-            </button>
+              </div>
+            </>
           ) : (
-            <button
-              type="button"
-              disabled={saving}
-              data-testid="order-save-btn"
-              onClick={() => void handleSave()}
-              className="min-h-[40px] whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
-            >
-              {saving ? 'Saving...' : 'Save Changes'}
-            </button>
+            <>
+              <div className="flex flex-wrap items-center gap-2">
+                {onMergeOrders &&
+                  order.status !== 'ignored' &&
+                  (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) && (
+                    <button
+                      type="button"
+                      data-testid="toggle-merge-panel-btn"
+                      onClick={() => {
+                        if (!mergePanelOpen && !mergeSourceId && mergeCandidates.likely.length > 0) {
+                          setMergeSourceId(String(mergeCandidates.likely[0].id));
+                        }
+                        setMergePanelOpen((prev) => !prev);
+                      }}
+                      className="inline-flex min-h-[38px] items-center gap-1.5 whitespace-nowrap rounded-md border border-[#38BDF8]/50 bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#38BDF8] hover:bg-[#25313D]"
+                    >
+                      <GitMerge className="h-3.5 w-3.5" />
+                      {mergePanelOpen ? 'Close Merge' : 'Merge...'}
+                    </button>
+                  )}
+                {order.source === 'odoo' && order.status !== 'ignored' && (
+                  <button
+                    type="button"
+                    data-testid="order-ignore-btn"
+                    onClick={() => void onIgnore(order.id)}
+                    className="min-h-[38px] whitespace-nowrap rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#F87171] hover:text-[#F87171]"
+                  >
+                    Dismiss / Ignore
+                  </button>
+                )}
+                {order.status === 'ignored' && (
+                  <button
+                    type="button"
+                    data-testid="order-restore-ignored-btn"
+                    onClick={() => void onRestoreIgnored(order.id)}
+                    className="min-h-[38px] whitespace-nowrap rounded-md border border-[#38BDF8]/60 bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#38BDF8]"
+                  >
+                    Restore to Waitlist
+                  </button>
+                )}
+                {order.source === 'standing' &&
+                  order.standingOrderId &&
+                  order.standingOccurrenceDate && (
+                    <button
+                      type="button"
+                      data-testid="order-skip-standing-btn"
+                      onClick={() =>
+                        void onSkipStandingOccurrence(
+                          order.standingOrderId!,
+                          order.standingOccurrenceDate!
+                        )
+                      }
+                      className="min-h-[38px] whitespace-nowrap rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#FBBF24] hover:border-[#FBBF24]"
+                    >
+                      Skip This Week
+                    </button>
+                  )}
+                {order.source !== 'odoo' && (
+                  <button
+                    type="button"
+                    data-testid="order-delete-btn"
+                    onClick={() => void onDeleteOrder(order.id)}
+                    className="min-h-[38px] whitespace-nowrap rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#F87171] hover:border-[#F87171]"
+                  >
+                    Delete
+                  </button>
+                )}
+              </div>
+
+              {mergePanelOpen ? (
+                <button
+                  type="button"
+                  disabled={!selectedMergeSource || merging}
+                  data-testid="footer-confirm-merge-btn"
+                  onClick={() => void handleConfirmMerge()}
+                  className="inline-flex min-h-[40px] items-center gap-1.5 whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
+                >
+                  <GitMerge className="h-4 w-4" />
+                  {merging ? 'Merging...' : 'Merge Into 1 Order'}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={saving}
+                  data-testid="order-save-btn"
+                  onClick={() => void handleSave()}
+                  className="min-h-[40px] whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
+                >
+                  {saving ? 'Saving...' : 'Save Changes'}
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>

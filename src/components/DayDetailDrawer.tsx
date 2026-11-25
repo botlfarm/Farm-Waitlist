@@ -32,6 +32,7 @@ interface DayDetailDrawerProps {
   items: TrackedItem[];
   channels: PickupChannel[];
   initialFocusedItemId: number | 'all';
+  readOnly?: boolean;
   onClose: () => void;
   onSaveSupply: (
     itemId: number,
@@ -43,6 +44,7 @@ interface DayDetailDrawerProps {
       cascadeForward: boolean;
       bufferOverride: number | null;
       extraBuffer: number;
+      selfConsumption: number;
       notes: string | null;
     }
   ) => Promise<void>;
@@ -61,6 +63,7 @@ export function DayDetailDrawer({
   items,
   channels,
   initialFocusedItemId,
+  readOnly = false,
   onClose,
   onSaveSupply,
   onClearActualOverride,
@@ -73,6 +76,7 @@ export function DayDetailDrawer({
       : activeItems[0]?.id ?? 0
   );
   const [actualOnHand, setActualOnHand] = useState<string>('');
+  const [selfConsumption, setSelfConsumption] = useState<string>('');
   const [estProduced, setEstProduced] = useState<string>('');
   const [actualEndOfDay, setActualEndOfDay] = useState<string>('');
   const [extraBuffer, setExtraBuffer] = useState<string>('');
@@ -97,6 +101,9 @@ export function DayDetailDrawer({
   useEffect(() => {
     if (!proj) return;
     setActualOnHand(proj.actualOnHand !== null ? String(proj.actualOnHand) : '');
+    setSelfConsumption(
+      proj.selfConsumption && proj.selfConsumption > 0 ? String(proj.selfConsumption) : ''
+    );
     setEstProduced(proj.isManualProducedOverride ? String(proj.estProduced) : '');
     setActualEndOfDay(
       proj.actualEndOfDay !== null && proj.actualEndOfDay !== undefined
@@ -114,6 +121,7 @@ export function DayDetailDrawer({
     day?.date,
     currentItem?.id,
     proj?.actualOnHand,
+    proj?.selfConsumption,
     proj?.estProduced,
     proj?.actualEndOfDay,
     proj?.isManualProducedOverride,
@@ -153,7 +161,11 @@ export function DayDetailDrawer({
     parsedMorning !== null ? formatVariance(parsedMorning, expectedMorning) : null;
 
   const slottedQty = proj?.slottedQty ?? 0;
-  const liveEndingBalance = roundQty(liveMorning - slottedQty);
+  const savedSelfConsumption = proj?.selfConsumption ?? 0;
+  const parsedSelfConsumption = parseOptionalNumber(selfConsumption);
+  const liveSelfConsumption =
+    parsedSelfConsumption !== null ? Math.max(0, parsedSelfConsumption) : 0;
+  const liveEndingBalance = roundQty(liveMorning - slottedQty - liveSelfConsumption);
 
   const expectedHarvest = proj ? proj.expectedProduced ?? proj.estProduced : 0;
   const parsedHarvest = parseOptionalNumber(estProduced);
@@ -172,11 +184,14 @@ export function DayDetailDrawer({
     proj &&
       parsedMorning === proj.actualOnHand &&
       parsedEndOfDay === savedEod &&
+      liveSelfConsumption === savedSelfConsumption &&
       previewTotalBuffer === proj.effectiveBuffer
   );
 
   const liveRawSellable = roundQty(liveEndingBalance - previewTotalBuffer);
-  const morningDelta = proj ? roundQty(liveMorning - proj.startingBalance) : 0;
+  const stockDelta = proj
+    ? roundQty(liveMorning - proj.startingBalance - (liveSelfConsumption - savedSelfConsumption))
+    : 0;
   const liveSellableOpen = !proj
     ? 0
     : inputsMatchSaved
@@ -184,7 +199,7 @@ export function DayDetailDrawer({
       : parsedEndOfDay !== null
         ? liveRawSellable
         : proj.reservedForFuture > 0
-          ? roundQty(Math.min(liveRawSellable, proj.sellableOpen + morningDelta))
+          ? roundQty(Math.min(liveRawSellable, proj.sellableOpen + stockDelta))
           : liveRawSellable;
   const liveAvailablePhysical = !proj
     ? 0
@@ -193,7 +208,7 @@ export function DayDetailDrawer({
       : parsedEndOfDay !== null
         ? liveEndingBalance
         : proj.reservedForFuture > 0
-          ? roundQty(Math.min(liveEndingBalance, proj.availablePhysical + morningDelta))
+          ? roundQty(Math.min(liveEndingBalance, proj.availablePhysical + stockDelta))
           : liveEndingBalance;
   const liveReservedForFuture = !proj
     ? 0
@@ -224,6 +239,7 @@ export function DayDetailDrawer({
         cascadeForward,
         bufferOverride: bufferOverride.trim() === '' ? null : Math.max(0, Number(bufferOverride)),
         extraBuffer: extraBuffer.trim() === '' ? 0 : Math.max(0, Number(extraBuffer)),
+        selfConsumption: liveSelfConsumption,
         notes: notes.trim() || null,
       });
       setPendingOverrideCascade(null);
@@ -324,7 +340,7 @@ export function DayDetailDrawer({
           )}
 
           {currentItem && proj ? (
-            <>
+            <fieldset disabled={readOnly} className="contents">
               {/* Header status row */}
               <div className="flex flex-wrap items-baseline justify-between gap-2">
                 <span className="text-sm font-semibold text-[#F0F6FC]">
@@ -422,9 +438,55 @@ export function DayDetailDrawer({
                       -{formatQty(slottedQty)}
                     </span>
                   </div>
+                  <div className="flex items-center justify-between gap-3 py-0.5">
+                    <div className="min-w-0">
+                      <label
+                        htmlFor="day-self-consumption"
+                        className="block font-medium text-[#C9D1D9]"
+                      >
+                        Self Consumption
+                      </label>
+                      <span className="block text-[10px] text-[#8B949E]">
+                        Personal / farm use (deducted like an order)
+                      </span>
+                    </div>
+                    <div className="flex w-[136px] shrink-0 items-center justify-end gap-1">
+                      <span className="font-mono text-xs text-[#8B949E]" aria-hidden="true">
+                        -
+                      </span>
+                      <input
+                        id="day-self-consumption"
+                        data-testid="day-self-consumption-input"
+                        type="number"
+                        min="0"
+                        step="0.5"
+                        value={selfConsumption}
+                        onChange={(e) => setSelfConsumption(e.target.value)}
+                        placeholder="0"
+                        aria-label="Self consumption"
+                        className={`min-h-[34px] w-full rounded-md border bg-[#161D24] px-2.5 py-1 text-right font-mono text-xs tabular-nums text-[#F0F6FC] placeholder:text-[#6E7681] focus:border-[#38BDF8] focus:outline-none ${
+                          liveSelfConsumption > 0 ? 'border-[#C084FC]/70' : 'border-[#283340]'
+                        }`}
+                      />
+                      {selfConsumption.trim() !== '' && (
+                        <button
+                          type="button"
+                          onClick={() => setSelfConsumption('')}
+                          title="Clear self consumption"
+                          aria-label="Clear self consumption"
+                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded border border-[#283340] bg-[#161D24] text-[#8B949E] hover:border-[#38BDF8] hover:text-[#38BDF8]"
+                        >
+                          <RotateCcw className="h-3 w-3" aria-hidden="true" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[#8B949E]">Remaining Before Harvest</span>
-                    <span className="font-mono font-semibold tabular-nums text-[#F0F6FC]">
+                    <span
+                      data-testid="day-remaining-before-harvest"
+                      className="font-mono font-semibold tabular-nums text-[#F0F6FC]"
+                    >
                       {formatQty(liveEndingBalance)}
                     </span>
                   </div>
@@ -814,7 +876,7 @@ export function DayDetailDrawer({
                   />
                 </div>
               </div>
-            </>
+            </fieldset>
           ) : (
             <p className="text-sm text-[#8B949E]">
               Configure at least one active Tracked Item in Settings to forecast daily supply.
@@ -824,23 +886,28 @@ export function DayDetailDrawer({
 
         {currentItem && (
           <div className="flex flex-col gap-2 border-t border-[#283340] px-6 py-4">
+            {readOnly && (
+              <p className="text-center text-[11px] font-medium text-[#7DD3FC]">
+                Read-only backup preview — exit preview to edit daily supply
+              </p>
+            )}
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                disabled={saving}
+                disabled={readOnly || saving}
                 data-testid="day-save-btn"
                 onClick={() => void handleSave(false)}
-                className="min-h-[40px] flex-1 whitespace-nowrap rounded-md bg-[#0EA5E9] px-4 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
+                className="min-h-[40px] flex-1 whitespace-nowrap rounded-md bg-[#0EA5E9] px-4 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
               >
                 {saving ? 'Saving...' : 'Save Day'}
               </button>
               {currentItem.supplyMode === 'continuous' && (
                 <button
                   type="button"
-                  disabled={saving}
+                  disabled={readOnly || saving}
                   data-testid="day-cascade-forward-btn"
                   onClick={() => void handleSave(true)}
-                  className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-[#38BDF8]/60 bg-[#1E2730] px-3 py-2 text-sm font-medium text-[#38BDF8] transition-colors hover:bg-[#25313D] disabled:opacity-50"
+                  className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-md border border-[#38BDF8]/60 bg-[#1E2730] px-3 py-2 text-sm font-medium text-[#38BDF8] transition-colors hover:bg-[#25313D] disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   Cascade Forward
                   <ArrowRight className="h-4 w-4" aria-hidden="true" />

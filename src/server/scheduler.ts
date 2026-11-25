@@ -44,6 +44,11 @@ export class BackgroundScheduler {
   public configure(settings: AppSettings): void {
     this.stop();
 
+    // Pause all automated background polling, backups, and live website pushes while in Sandbox or Backup Preview Mode
+    if (this.dbManager.isNonLiveMode()) {
+      return;
+    }
+
     // 1. Odoo polling schedule
     const pollMs = INTERVAL_MS[settings.odooSyncInterval];
     if (pollMs && this.config.odoo.url && this.config.odoo.apiKey) {
@@ -101,7 +106,7 @@ export class BackgroundScheduler {
   }
 
   private async runOdooSyncSafe(): Promise<void> {
-    if (this.syncInFlight) return;
+    if (this.syncInFlight || this.dbManager.isNonLiveMode()) return;
     this.syncInFlight = true;
     try {
       const db = this.dbManager.db;
@@ -120,6 +125,7 @@ export class BackgroundScheduler {
   }
 
   private async runScheduledBackupSafe(): Promise<void> {
+    if (this.dbManager.isNonLiveMode()) return;
     try {
       const settings = this.dbManager.getSettings();
       await this.dbManager.createBackup('scheduled');
@@ -130,7 +136,7 @@ export class BackgroundScheduler {
   }
 
   private async runGithubPublishSafe(): Promise<void> {
-    if (this.githubPublishInFlight) return;
+    if (this.githubPublishInFlight || this.dbManager.isNonLiveMode()) return;
     this.githubPublishInFlight = true;
     try {
       const result = await publishSnippetSnapshotToGithub({
