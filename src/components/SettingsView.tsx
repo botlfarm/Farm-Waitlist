@@ -94,6 +94,7 @@ export function SettingsView({
   const [rangeStart, setRangeStart] = useState('');
   const [rangeEnd, setRangeEnd] = useState('');
   const [rangeLabel, setRangeLabel] = useState('');
+  const [rangeIgnoreExisting, setRangeIgnoreExisting] = useState(false);
   const [odooTestResult, setOdooTestResult] = useState<string | null>(null);
   const [testingOdoo, setTestingOdoo] = useState(false);
 
@@ -334,12 +335,26 @@ export function SettingsView({
     }
   };
 
-  const handleSaveSettings = async (overridePatch?: Partial<AppSettings>) => {
+  const handleSaveSettings = async (
+    overridePatch?: Partial<AppSettings>,
+    customSuccessToast?: (removedIgnoredOrdersCount: number) => string
+  ) => {
     const payload = overridePatch ? { ...draftSettings, ...overridePatch } : draftSettings;
     try {
-      await api.updateSettings(payload);
+      const res = await api.updateSettings(payload);
       await onWorkspaceChanged();
-      onToast('Settings saved');
+      const removedCount = res.removedIgnoredOrdersCount ?? 0;
+      if (customSuccessToast) {
+        onToast(customSuccessToast(removedCount));
+      } else if (removedCount > 0) {
+        onToast(
+          `Settings saved — removed ${removedCount} existing Odoo ${
+            removedCount === 1 ? 'order' : 'orders'
+          } (Undo available)`
+        );
+      } else {
+        onToast('Settings saved');
+      }
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Failed to save settings', 'error');
     }
@@ -355,13 +370,38 @@ export function SettingsView({
       startDate: rangeStart,
       endDate: rangeEnd,
       label: rangeLabel.trim() || undefined,
+      ignoreExisting: rangeIgnoreExisting,
     };
     const nextRanges = [...draftSettings.odooIgnoredDateRanges, nextRange];
     setDraftSettings({ ...draftSettings, odooIgnoredDateRanges: nextRanges });
     setRangeStart('');
     setRangeEnd('');
     setRangeLabel('');
-    await handleSaveSettings({ odooIgnoredDateRanges: nextRanges });
+    setRangeIgnoreExisting(false);
+    await handleSaveSettings({ odooIgnoredDateRanges: nextRanges }, (removedCount) =>
+      removedCount > 0
+        ? `Ignored range added — cleared ${removedCount} existing Odoo ${
+            removedCount === 1 ? 'order' : 'orders'
+          } (Undo available)`
+        : 'Ignored date range added'
+    );
+  };
+
+  const handleToggleIgnoredRangeMode = async (id: string) => {
+    const nextRanges = draftSettings.odooIgnoredDateRanges.map((r) =>
+      r.id === id ? { ...r, ignoreExisting: !r.ignoreExisting } : r
+    );
+    const updatedRange = nextRanges.find((r) => r.id === id);
+    setDraftSettings({ ...draftSettings, odooIgnoredDateRanges: nextRanges });
+    await handleSaveSettings({ odooIgnoredDateRanges: nextRanges }, (removedCount) =>
+      removedCount > 0
+        ? `Range set to ignore completely — cleared ${removedCount} existing Odoo ${
+            removedCount === 1 ? 'order' : 'orders'
+          } (Undo available)`
+        : updatedRange?.ignoreExisting
+          ? 'Range set to ignore completely (new + existing orders)'
+          : 'Range set to skip new imports only'
+    );
   };
 
   const handleRemoveIgnoredRange = async (id: string) => {
@@ -1095,8 +1135,10 @@ export function SettingsView({
               Ignored Off-Season Date Ranges
             </h2>
             <p className="mt-1 text-xs text-[#8B949E]">
-              Brand-new quotations created within these local date blocks are skipped automatically.
-              Already-imported orders still receive updates and reconciliation checks.
+              Skip Odoo orders inside these local date blocks. By default only brand-new imports are
+              skipped — check <strong className="text-[#E6EDF3]">Ignore completely</strong> to also
+              clear out already-imported Odoo orders in that range (undoable) and suppress future
+              updates or reconciliation alerts.
             </p>
 
             <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-4 sm:items-end">
@@ -1127,7 +1169,7 @@ export function SettingsView({
                   type="text"
                   value={rangeLabel}
                   onChange={(e) => setRangeLabel(e.target.value)}
-                  placeholder="e.g., Summer Break"
+                  placeholder="e.g., Off-Season 2025"
                   className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-sm text-[#F0F6FC] placeholder:text-[#6E7681]"
                 />
               </div>
@@ -1141,21 +1183,67 @@ export function SettingsView({
               </button>
             </div>
 
+            <label className="mt-3 flex cursor-pointer items-start gap-2.5 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2.5 text-xs text-[#C9D1D9]">
+              <input
+                type="checkbox"
+                data-testid="ignored-range-complete-checkbox"
+                checked={rangeIgnoreExisting}
+                onChange={(e) => setRangeIgnoreExisting(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-[#283340] bg-[#161D24] accent-[#0EA5E9]"
+              />
+              <span>
+                <span className="font-semibold text-[#F0F6FC]">
+                  Ignore completely (including already-imported Odoo orders)
+                </span>
+                <span className="mt-0.5 block text-[11px] text-[#8B949E]">
+                  Immediately clears existing Odoo orders from this range off your waitlist,
+                  calendar, and alerts (1-click Undo available) and blocks future updates. Manual
+                  and standing orders are untouched.
+                </span>
+              </span>
+            </label>
+
             {draftSettings.odooIgnoredDateRanges.length > 0 && (
               <ul className="mt-4 divide-y divide-[#283340] text-xs">
                 {draftSettings.odooIgnoredDateRanges.map((r) => (
-                  <li key={r.id} className="flex items-center justify-between py-2.5">
-                    <span className="font-mono text-[#E6EDF3]">
-                      {r.startDate} → {r.endDate}
-                      {r.label ? ` · ${r.label}` : ''}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void handleRemoveIgnoredRange(r.id)}
-                      className="text-[#F87171] hover:underline"
-                    >
-                      Remove
-                    </button>
+                  <li
+                    key={r.id}
+                    data-testid={`ignored-range-row-${r.id}`}
+                    className="flex flex-wrap items-center justify-between gap-2 py-2.5"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-mono text-[#E6EDF3]">
+                        {r.startDate} → {r.endDate}
+                        {r.label ? ` · ${r.label}` : ''}
+                      </span>
+                      <span
+                        className={`rounded border px-1.5 py-0.5 text-[11px] font-medium ${
+                          r.ignoreExisting
+                            ? 'border-[#D97706]/50 bg-[#D97706]/15 text-[#FBBF24]'
+                            : 'border-[#283340] bg-[#0F1419] text-[#8B949E]'
+                        }`}
+                      >
+                        {r.ignoreExisting ? 'Ignore completely' : 'New imports only'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        data-testid={`toggle-ignored-range-mode-${r.id}`}
+                        onClick={() => void handleToggleIgnoredRangeMode(r.id)}
+                        className="text-[#38BDF8] hover:underline"
+                      >
+                        {r.ignoreExisting ? 'Switch to New Only' : 'Ignore Existing Too'}
+                      </button>
+                      <button
+                        type="button"
+                        data-testid={`remove-ignored-range-${r.id}`}
+                        onClick={() => void handleRemoveIgnoredRange(r.id)}
+                        className="text-[#F87171] hover:underline"
+                      >
+                        Remove
+                      </button>
+                    </div>
                   </li>
                 ))}
               </ul>

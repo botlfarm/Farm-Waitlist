@@ -7,6 +7,7 @@ import {
   renderPreApprovalMessage,
   selectBestPreApprovalTemplate,
 } from '../shared/generators';
+import { selectPrimaryOdooSide } from '../shared/orderMatching';
 import {
   findEarliestValidSlotDate,
   isWeekdayAllowedForChannel,
@@ -43,6 +44,7 @@ import type { DatabaseManager } from './db';
 import { testGithubPublishConnection } from './githubPublisher';
 import {
   getLatestSyncLog,
+  purgeOdooOrdersInFullIgnoredRanges,
   syncOdooCustomers,
   syncOdooQuotations,
   testOdooConnection,
@@ -1094,8 +1096,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       return;
     }
     const action = req.body?.action;
-    if (action !== 'confirm' && action !== 'keep') {
-      res.status(400).json({ error: 'Action must be "confirm" or "keep"' });
+    if (action !== 'confirm' && action !== 'keep' && action !== 'ignore') {
+      res.status(400).json({ error: 'Action must be "confirm", "keep", or "ignore"' });
       return;
     }
 
@@ -1103,17 +1105,43 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       db,
       action === 'confirm'
         ? `Confirm reconciled order (${existing.customerName})`
-        : `Dismiss missing flag (${existing.customerName})`
+        : action === 'ignore'
+          ? `Remove cancelled Odoo order (${existing.customerName})`
+          : `Keep order & clear missing flag (${existing.customerName})`
     );
 
+    const nowIso = new Date().toISOString();
     if (action === 'confirm') {
       db.prepare(
-        `UPDATE orders SET status = 'confirmed', odoo_missing_flagged = 0, updated_at = ? WHERE id = ?`
-      ).run(new Date().toISOString(), id);
+        `UPDATE orders
+         SET status = 'confirmed',
+             odoo_missing_flagged = 0,
+             odoo_missing_dismissed = 0,
+             odoo_suggested_confirmed_json = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      ).run(nowIso, id);
+    } else if (action === 'ignore') {
+      db.prepare(
+        `UPDATE orders
+         SET status = 'ignored',
+             slotted_date = NULL,
+             is_locked = 0,
+             odoo_missing_flagged = 0,
+             odoo_missing_dismissed = 0,
+             odoo_suggested_confirmed_json = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      ).run(nowIso, id);
     } else {
       db.prepare(
-        `UPDATE orders SET odoo_missing_flagged = 0, updated_at = ? WHERE id = ?`
-      ).run(new Date().toISOString(), id);
+        `UPDATE orders
+         SET odoo_missing_flagged = 0,
+             odoo_missing_dismissed = 1,
+             odoo_suggested_confirmed_json = NULL,
+             updated_at = ?
+         WHERE id = ?`
+      ).run(nowIso, id);
     }
     res.json(getOrderById(db, id));
   });
@@ -1230,16 +1258,51 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       return `${a}\n\n[Merged from ${sourceLabel}]\n${b}`;
     };
 
-    const nextNotes = combineDistinctText(target.notes, source.notes);
-    const nextOdooRawNotes = combineDistinctText(target.odooRawNotes, source.odooRawNotes);
-    const nextRawLines = Array.from(new Set([...target.odooRawLines, ...source.odooRawLines]));
+    const extractGeneralNotes = (ord: {
+      source: string;
+      notes: string | null;
+      odooRawNotes: string | null;
+    }): string | null => {
+      const trimmedNotes = (ord.notes || '').trim();
+      if (!trimmedNotes) return null;
+      const trimmedRaw = (ord.odooRawNotes || '').trim();
+      if (ord.source === 'odoo' && trimmedRaw && trimmedNotes === trimmedRaw) {
+        return null;
+      }
+      return ord.notes;
+    };
 
-    // Determine primary Odoo linkage vs suppressed merged_odoo_links entry
+    const nextNotes = combineDistinctText(
+      extractGeneralNotes(target),
+      extractGeneralNotes(source)
+    );
+    const nextOdooRawNotes = combineDistinctText(target.odooRawNotes, source.odooRawNotes);
+
+    // Determine primary Odoo linkage vs suppressed merged_odoo_links history entry.
+    // Active (non-missing) quotations always beat cancelled/missing ones, confirmed beats
+    // unconfirmed, and a newer active draft (e.g., replacement order) replaces an older waitlist draft
+    // so cancelling the old waitlist quotation in Odoo never breaks sync or triggers alerts.
+    const rawPrimaryPref = req.body?.primaryOdooPreference;
+    const primarySide: 'target' | 'source' =
+      rawPrimaryPref === 'source' && source.odooQuotationId !== null
+        ? 'source'
+        : rawPrimaryPref === 'target' && target.odooQuotationId !== null
+          ? 'target'
+          : selectPrimaryOdooSide(target, source);
+
     let nextOrderSource = target.source;
     let nextOdooId = target.odooQuotationId;
     let nextOdooName = target.odooQuotationName;
     let nextOdooPartnerId = target.odooPartnerId ?? source.odooPartnerId ?? null;
-    let nextOdooCreatedAtLocal = target.odooCreatedAtLocal ?? source.odooCreatedAtLocal ?? null;
+    // Preserve earliest arrival timestamp when chaining waitlist -> replacement order
+    const earliestArrival =
+      target.odooCreatedAtLocal && source.odooCreatedAtLocal
+        ? target.odooCreatedAtLocal <= source.odooCreatedAtLocal
+          ? target.odooCreatedAtLocal
+          : source.odooCreatedAtLocal
+        : (target.odooCreatedAtLocal ?? source.odooCreatedAtLocal ?? null);
+    let nextOdooCreatedAtLocal = earliestArrival;
+    let nextCustomerName = target.customerName;
     let suppressedOdooLink: { id: number; name: string | null } | null = null;
 
     if (!target.odooQuotationId && source.odooQuotationId) {
@@ -1252,16 +1315,28 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
         nextOrderSource = 'odoo';
       }
     } else if (target.odooQuotationId && source.odooQuotationId) {
-      // Both have Odoo IDs: prefer keeping the confirmed Sales Order ID as primary if target was still draft/pre-approved
-      if (source.status === 'confirmed' && target.status !== 'confirmed') {
+      if (primarySide === 'source') {
         suppressedOdooLink = { id: target.odooQuotationId, name: target.odooQuotationName };
         nextOdooId = source.odooQuotationId;
         nextOdooName = source.odooQuotationName;
         nextOdooPartnerId = source.odooPartnerId ?? target.odooPartnerId ?? null;
+        if (
+          !target.customerNameOverridden &&
+          /^Order\s+/i.test(target.customerName) &&
+          source.customerName &&
+          !/^Order\s+/i.test(source.customerName)
+        ) {
+          nextCustomerName = source.customerName;
+        }
       } else {
         suppressedOdooLink = { id: source.odooQuotationId, name: source.odooQuotationName };
       }
     }
+
+    const nextRawLines =
+      primarySide === 'source'
+        ? Array.from(new Set([...source.odooRawLines, ...target.odooRawLines]))
+        : Array.from(new Set([...target.odooRawLines, ...source.odooRawLines]));
 
     const nowIso = new Date().toISOString();
 
@@ -1279,6 +1354,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
            requested_date = ?,
            slotted_date = ?,
            is_locked = ?,
+           customer_name = ?,
            customer_email = ?,
            customer_phone = ?,
            pickup_channel_id = ?,
@@ -1293,6 +1369,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
            odoo_raw_lines_json = ?,
            odoo_updated_after_slot = 0,
            odoo_missing_flagged = 0,
+           odoo_missing_dismissed = 0,
            odoo_suggested_confirmed_json = NULL,
            updated_at = ?
          WHERE id = ?`
@@ -1303,6 +1380,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
         nextRequestedDate,
         nextStatus === 'waitlist' ? null : nextSlottedDate,
         nextLocked ? 1 : 0,
+        nextCustomerName,
         nextEmail,
         nextPhone,
         nextPickupChannelId,
@@ -1661,12 +1739,27 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     const nextPatch: Partial<AppSettings> = snippetFieldChanged
       ? { ...patch, availabilityLastEditedAt: getNow().toISOString() }
       : patch;
-    const updated = dbManager.updateSettings(nextPatch);
+    let updated = dbManager.updateSettings(nextPatch);
+
+    let removedIgnoredOrdersCount = 0;
+    if (patch.odooIgnoredDateRanges !== undefined) {
+      const purged = purgeOdooOrdersInFullIgnoredRanges(
+        dbManager.db,
+        updated.odooIgnoredDateRanges,
+        updated.timezone
+      );
+      removedIgnoredOrdersCount = purged.removedCount;
+      if (purged.affectedCalendar) {
+        updated = dbManager.updateSettings({ availabilityLastEditedAt: getNow().toISOString() });
+      }
+    }
+
     onSettingsUpdated?.(updated);
     res.json({
       settings: updated,
       odooStatus: getRedactedOdooStatus(config),
       githubPublishStatus: getRedactedGithubPublishStatus(config, updated),
+      removedIgnoredOrdersCount,
     });
   });
 

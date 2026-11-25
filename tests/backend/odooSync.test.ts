@@ -635,7 +635,7 @@ describe('Odoo 19.3 /json/2/ Synchronization, Chatter Filtering & Reconciliation
               date_order: '2026-11-23 18:05:00',
               commitment_date: false,
               partner_id: [701, 'Alex Rivera'],
-              note: '<p>Paid on EFF</p>',
+              note: '<p>Online store checkout</p>',
               order_line: [902],
             },
           ]),
@@ -756,8 +756,9 @@ describe('Odoo 19.3 /json/2/ Synchronization, Chatter Filtering & Reconciliation
       expect(kept.mergedOdooNames).toEqual(['S00801']);
       expect(kept.items).toEqual([expect.objectContaining({ trackedItemId: stdId, quantity: 2 })]);
       expect(kept.chatter.map((c) => c.odooMessageId)).toEqual([8801, 8802]);
-      expect(kept.notes).toContain('Waitlist request');
-      expect(kept.notes).toContain('Paid on EFF');
+      expect(kept.odooRawNotes).toContain('Waitlist request');
+      expect(kept.odooRawNotes).toContain('Online store checkout');
+      expect(kept.notes).toBeNull();
 
       // Re-run Odoo sync returning BOTH 801 and 802 -> 801 MUST NOT re-import as a duplicate!
       const resync = await syncOdooQuotations({
@@ -1401,4 +1402,506 @@ describe('Odoo 19.3 /json/2/ Synchronization, Chatter Filtering & Reconciliation
       mgr.close();
     }
   });
+
+  it('chains cancelled waitlist quotation -> active replacement draft quotation -> finalized sale cleanly and persists Keep/Remove reconciliation actions', async () => {
+    const mgr = createTempDb();
+    await mgr.init('America/New_York');
+    const now = new Date().toISOString();
+
+    const stdId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, keyword_rules_json, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 20, 4, 1, '["standard","eggs"]', 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+
+    let phase = 1;
+    const mockFetch: FetchLike = async (url, init) => {
+      const body = JSON.parse(String(init?.body || '{}')) as { domain?: unknown[] };
+      const domainStr = JSON.stringify(body.domain ?? []);
+
+      if (url.endsWith('/json/2/sale.order/search_read')) {
+        // Confirmed-only hint query
+        if (!domainStr.includes('"draft"') && domainStr.includes('"sale"') && domainStr.includes('"done"')) {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+
+        // Phase 1: Customer fills waitlist form -> S00100 (draft) AND another customer S00101 (draft)
+        if (phase === 1) {
+          return new Response(
+            JSON.stringify([
+              {
+                id: 100,
+                name: 'S00100',
+                state: 'draft',
+                create_date: '2026-11-23 13:00:00',
+                date_order: '2026-11-23 13:00:00',
+                partner_id: [801, 'Sarah Miller'],
+                note: '<p>Waitlist form: 2 standard eggs</p>',
+                order_line: [3001],
+              },
+              {
+                id: 101,
+                name: 'S00101',
+                state: 'draft',
+                create_date: '2026-11-23 13:30:00',
+                date_order: '2026-11-23 13:30:00',
+                partner_id: [802, 'Tom Keep'],
+                note: '<p>1 standard eggs</p>',
+                order_line: [3002],
+              },
+            ]),
+            { status: 200 }
+          );
+        }
+
+        // Phase 2: S00100 & S00101 were cancelled in Odoo; online store created new draft quotation S00105 for Sarah!
+        if (phase === 2) {
+          if (domainStr.includes('"id","in"')) {
+            return new Response(JSON.stringify([]), { status: 200 });
+          }
+          return new Response(
+            JSON.stringify([
+              {
+                id: 105,
+                name: 'S00105',
+                state: 'draft',
+                create_date: '2026-11-24 15:00:00',
+                date_order: '2026-11-24 15:00:00',
+                partner_id: [801, 'Sarah Miller'],
+                note: '<p>Storefront Order #5542</p>',
+                order_line: [3005],
+              },
+            ]),
+            { status: 200 }
+          );
+        }
+
+        // Phase 3: Farmer finalizes Sarah's replacement quotation S00105 into state='sale'; S00100 & S00101 remain deleted
+        if (domainStr.includes('"id","in"') && !domainStr.includes('105')) {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        return new Response(
+          JSON.stringify([
+            {
+              id: 105,
+              name: 'S00105',
+              state: 'sale',
+              create_date: '2026-11-24 15:00:00',
+              date_order: '2026-11-24 17:00:00',
+              partner_id: [801, 'Sarah Miller'],
+              note: '<p>Storefront Order #5542</p>',
+              order_line: [3005],
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      if (url.endsWith('/json/2/sale.order.line/search_read')) {
+        return new Response(
+          JSON.stringify([
+            { id: 3001, order_id: [100, 'S00100'], name: 'Standard Eggs', product_uom_qty: 2 },
+            { id: 3002, order_id: [101, 'S00101'], name: 'Standard Eggs', product_uom_qty: 1 },
+            { id: 3005, order_id: [105, 'S00105'], name: 'Standard Eggs', product_uom_qty: 3 },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      if (url.endsWith('/json/2/res.partner/search_read')) {
+        return new Response(
+          JSON.stringify([
+            { id: 801, name: 'Sarah Miller', email: 'sarah@example.com', phone: '555-3333' },
+            { id: 802, name: 'Tom Keep', email: 'tom@example.com', phone: '555-4444' },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      if (url.endsWith('/json/2/mail.message/search_read')) {
+        return new Response(
+          JSON.stringify([
+            {
+              id: 9100,
+              res_id: 100,
+              author_id: [2, 'Sarah Miller'],
+              message_type: 'comment',
+              subtype_id: [1, 'Discussions'],
+              body: '<p>Waitlist form submitted</p>',
+              date: '2026-11-23 13:01:00',
+            },
+            {
+              id: 9105,
+              res_id: 105,
+              author_id: [2, 'Storefront Integration'],
+              message_type: 'comment',
+              subtype_id: [1, 'Discussions'],
+              body: '<p>Placed on Online Store</p>',
+              date: '2026-11-24 15:02:00',
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+
+      return new Response('[]', { status: 200 });
+    };
+
+    const odooCreds = {
+      url: 'https://demo.odoo.example',
+      db: 'farm_db',
+      apiKey: 'secret-key',
+      source: 'env' as const,
+    };
+
+    // Phase 1: Pull initial waitlist quotations
+    await syncOdooQuotations({
+      db: mgr.db,
+      odoo: odooCreds,
+      settings: mgr.getSettings(),
+      trackedItems: listTrackedItems(mgr.db),
+      channels: listPickupChannels(mgr.db),
+      fetchFn: mockFetch,
+    });
+
+    const sarahWaitlist = listAllOrders(mgr.db).find((o) => o.odooQuotationId === 100)!;
+    const tomOrder = listAllOrders(mgr.db).find((o) => o.odooQuotationId === 101)!;
+
+    // Farmer schedules Sarah onto Saturday 2026-11-28 as pre_approved
+    mgr.db
+      .prepare(`UPDATE orders SET slotted_date = '2026-11-28', status = 'pre_approved' WHERE id = ?`)
+      .run(sarahWaitlist.id);
+
+    // Phase 2: Sarah places final order (S00105 arrives as draft), farmer cancels S00100 & S00101 in Odoo
+    phase = 2;
+    const sync2 = await syncOdooQuotations({
+      db: mgr.db,
+      odoo: odooCreds,
+      settings: mgr.getSettings(),
+      trackedItems: listTrackedItems(mgr.db),
+      channels: listPickupChannels(mgr.db),
+      fetchFn: mockFetch,
+    });
+    expect(sync2.syncLog.importedCount).toBe(1);
+    expect(sync2.syncLog.flaggedMissingCount).toBe(2);
+
+    const afterSync2 = listAllOrders(mgr.db);
+    const sarahCancelled = afterSync2.find((o) => o.odooQuotationId === 100)!;
+    const sarahReplacement = afterSync2.find((o) => o.odooQuotationId === 105)!;
+    expect(sarahCancelled.odooMissingFlagged).toBe(true);
+    expect(sarahReplacement.status).toBe('waitlist');
+    expect(sarahReplacement.odooMissingFlagged).toBe(false);
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath: mgr.dbPath,
+        backupDir: mgr.backupDir,
+        timezone: 'America/New_York',
+        haOptionsPath: '/nonexistent/options.json',
+        odoo: odooCreds,
+      },
+      fetchFn: mockFetch,
+    });
+    const server = await new Promise<import('http').Server>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const port = (server.address() as import('net').AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      // 1-click Replace: combine cancelled waitlist S00100 with newly arrived replacement draft S00105!
+      const replaceRes = await fetch(`${baseUrl}/api/orders/${sarahCancelled.id}/merge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceOrderId: sarahReplacement.id,
+          itemStrategy: 'use_source',
+          keepDate: '2026-11-28',
+        }),
+      });
+      expect(replaceRes.status).toBe(200);
+
+      const sarahChained = listAllOrders(mgr.db).find((o) => o.id === sarahCancelled.id)!;
+      // Active Odoo link MUST promote to live replacement draft S00105 (NOT stay stuck on deleted S00100!)
+      expect(sarahChained.odooQuotationId).toBe(105);
+      expect(sarahChained.odooQuotationName).toBe('S00105');
+      expect(sarahChained.mergedOdooNames).toEqual(['S00100']);
+      expect(sarahChained.odooMissingFlagged).toBe(false);
+      expect(sarahChained.slottedDate).toBe('2026-11-28');
+      expect(sarahChained.status).toBe('pre_approved');
+      expect(sarahChained.items).toEqual([expect.objectContaining({ trackedItemId: stdId, quantity: 3 })]);
+      expect(sarahChained.chatter.map((c) => c.odooMessageId)).toEqual([9100, 9105]);
+      expect(sarahChained.odooRawNotes).toContain('Waitlist form');
+      expect(sarahChained.odooRawNotes).toContain('Storefront Order #5542');
+      expect(sarahChained.notes).toBeNull();
+
+      // Farmer clicks "Keep" on Tom's missing order -> flag MUST stay dismissed on subsequent syncs!
+      const keepRes = await fetch(`${baseUrl}/api/orders/${tomOrder.id}/reconcile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'keep' }),
+      });
+      expect(keepRes.status).toBe(200);
+
+      // Phase 3: Farmer finalizes Sarah's replacement order S00105 in Odoo -> auto-promotes chained order to confirmed!
+      phase = 3;
+      const sync3 = await syncOdooQuotations({
+        db: mgr.db,
+        odoo: odooCreds,
+        settings: mgr.getSettings(),
+        trackedItems: listTrackedItems(mgr.db),
+        channels: listPickupChannels(mgr.db),
+        fetchFn: mockFetch,
+      });
+      expect(sync3.syncLog.flaggedMissingCount).toBe(0);
+
+      const afterSync3 = listAllOrders(mgr.db);
+      const sarahFinal = afterSync3.find((o) => o.id === sarahCancelled.id)!;
+      expect(sarahFinal.status).toBe('confirmed');
+      expect(sarahFinal.slottedDate).toBe('2026-11-28');
+      expect(sarahFinal.odooQuotationName).toBe('S00105');
+      expect(sarahFinal.mergedOdooNames).toEqual(['S00100']);
+      expect(sarahFinal.odooMissingFlagged).toBe(false);
+
+      // Tom stayed dismissed (NOT re-flagged!)
+      const tomAfterSync3 = afterSync3.find((o) => o.id === tomOrder.id)!;
+      expect(tomAfterSync3.odooMissingFlagged).toBe(false);
+
+      // Test 'ignore' reconcile action removes cancelled order cleanly
+      const removeRes = await fetch(`${baseUrl}/api/orders/${tomOrder.id}/reconcile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'ignore' }),
+      });
+      expect(removeRes.status).toBe(200);
+      const tomRemoved = listAllOrders(mgr.db).find((o) => o.id === tomOrder.id)!;
+      expect(tomRemoved.status).toBe('ignored');
+      expect(tomRemoved.slottedDate).toBeNull();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      mgr.close();
+    }
+  });
+
+  it('supports ignoring off-season date ranges completely (clearing already-imported Odoo orders with Undo, keeping manual & active orders, and blocking future re-import)', async () => {
+    const mgr = createTempDb();
+    await mgr.init('America/New_York');
+    mgr.updateSettings({ timezone: 'America/New_York', odooSyncCutoffDate: '2025-01-01' });
+    const now = new Date().toISOString();
+
+    const stdId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, keyword_rules_json, sort_order, created_at, updated_at)
+           VALUES ('Standard Chicken Eggs', 'dozens', 1, 'continuous', 20, 4, 1, '["standard"]', 0, ?, ?)`
+        )
+        .run(now, now).lastInsertRowid
+    );
+    const farmId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO pickup_channels (name, allowed_weekdays_json, color_token, is_active, sort_order)
+           VALUES ('Farm Pickup', '[1,2,3,4,5,6,7]', 'sky', 1, 0)`
+        )
+        .run().lastInsertRowid
+    );
+
+    // Mock Odoo returning 2 old off-season orders (July 2025) + 1 active-season order (Nov 2026)
+    const mockFetch: FetchLike = async (url, init) => {
+      const body = JSON.parse(String(init?.body ?? '{}'));
+      if (url.endsWith('/json/2/ir.model.fields/search_read')) {
+        return new Response(JSON.stringify([]), { status: 200 });
+      }
+      if (url.endsWith('/json/2/sale.order/search_read')) {
+        const domainStr = JSON.stringify(body.domain ?? []);
+        if (domainStr.includes('"sale","done"') && !domainStr.includes('"draft"')) {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        return new Response(
+          JSON.stringify([
+            {
+              id: 401,
+              name: 'S00401',
+              state: 'draft',
+              create_date: '2025-07-10 15:00:00',
+              partner_id: [4001, 'Old Waitlist One'],
+              note: '1 dozen standard',
+              order_line: [4101],
+            },
+            {
+              id: 402,
+              name: 'S00402',
+              state: 'draft',
+              create_date: '2025-07-18 16:00:00',
+              partner_id: [4002, 'Old Waitlist Two'],
+              note: '2 dozen standard',
+              order_line: [4102],
+            },
+            {
+              id: 403,
+              name: 'S00403',
+              state: 'draft',
+              create_date: '2026-11-20 15:00:00',
+              partner_id: [4003, 'Active Customer'],
+              note: '2 dozen standard',
+              order_line: [4103],
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/json/2/sale.order.line/search_read')) {
+        return new Response(
+          JSON.stringify([
+            { id: 4101, order_id: [401, 'S00401'], name: 'Standard Chicken Eggs', product_uom_qty: 1 },
+            { id: 4102, order_id: [402, 'S00402'], name: 'Standard Chicken Eggs', product_uom_qty: 2 },
+            { id: 4103, order_id: [403, 'S00403'], name: 'Standard Chicken Eggs', product_uom_qty: 2 },
+          ]),
+          { status: 200 }
+        );
+      }
+      if (url.endsWith('/json/2/res.partner/search_read')) {
+        return new Response(
+          JSON.stringify([
+            { id: 4001, name: 'Old Waitlist One', email: 'o1@example.com', phone: false },
+            { id: 4002, name: 'Old Waitlist Two', email: 'o2@example.com', phone: false },
+            { id: 4003, name: 'Active Customer', email: 'active@example.com', phone: false },
+          ]),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    };
+
+    const odooCreds = {
+      url: 'https://demo.odoo.example',
+      db: 'farm_db',
+      apiKey: 'secret-key',
+      source: 'env' as const,
+    };
+    await syncOdooQuotations({
+      db: mgr.db,
+      odoo: odooCreds,
+      settings: mgr.getSettings(),
+      trackedItems: listTrackedItems(mgr.db),
+      channels: listPickupChannels(mgr.db),
+      fetchFn: mockFetch,
+    });
+
+    // Also insert a manual order whose created_at falls in July 2025 — MUST NOT be deleted!
+    mgr.db
+      .prepare(
+        `INSERT INTO orders (
+          source, status, timing_type, customer_name, pickup_channel_id, created_at, updated_at
+        ) VALUES ('manual', 'waitlist', 'asap', 'Manual Summer Friend', ?, '2025-07-15T14:00:00.000Z', '2025-07-15T14:00:00.000Z')`
+      )
+      .run(farmId);
+
+    // Slot one of the old Odoo orders onto the calendar to ensure calendar orders get cleared too
+    const oldOrder2 = listAllOrders(mgr.db).find((o) => o.odooQuotationId === 402)!;
+    mgr.db
+      .prepare("UPDATE orders SET status = 'slotted', slotted_date = '2026-11-28' WHERE id = ?")
+      .run(oldOrder2.id);
+
+    expect(listAllOrders(mgr.db)).toHaveLength(4);
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath: mgr.dbPath,
+        backupDir: mgr.backupDir,
+        timezone: 'America/New_York',
+        haOptionsPath: '/nonexistent/options.json',
+        odoo: odooCreds,
+      },
+      fetchFn: mockFetch,
+    });
+
+    const server = await new Promise<import('http').Server>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const port = (server.address() as import('net').AddressInfo).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      // 1. Add range with ignoreExisting: false (New imports only) -> existing 2025 orders stay untouched
+      const resNewOnly = await fetch(`${baseUrl}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          odooIgnoredDateRanges: [
+            {
+              id: 'off-2025',
+              startDate: '2025-07-01',
+              endDate: '2025-07-31',
+              label: 'July 2025',
+              ignoreExisting: false,
+            },
+          ],
+        }),
+      });
+      expect(resNewOnly.status).toBe(200);
+      const bodyNewOnly = (await resNewOnly.json()) as { removedIgnoredOrdersCount: number };
+      expect(bodyNewOnly.removedIgnoredOrdersCount).toBe(0);
+      expect(listAllOrders(mgr.db)).toHaveLength(4);
+
+      // 2. Switch range to ignoreExisting: true ("Ignore completely") -> immediately purges both old Odoo orders!
+      const resComplete = await fetch(`${baseUrl}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          odooIgnoredDateRanges: [
+            {
+              id: 'off-2025',
+              startDate: '2025-07-01',
+              endDate: '2025-07-31',
+              label: 'July 2025',
+              ignoreExisting: true,
+            },
+          ],
+        }),
+      });
+      expect(resComplete.status).toBe(200);
+      const bodyComplete = (await resComplete.json()) as { removedIgnoredOrdersCount: number };
+      expect(bodyComplete.removedIgnoredOrdersCount).toBe(2);
+
+      const remaining = listAllOrders(mgr.db);
+      expect(remaining.map((o) => o.customerName).sort()).toEqual([
+        'Active Customer',
+        'Manual Summer Friend',
+      ]);
+
+      // 3. Re-syncing Odoo MUST NOT re-import those 2025 orders or flag anything missing
+      const resync = await syncOdooQuotations({
+        db: mgr.db,
+        odoo: odooCreds,
+        settings: mgr.getSettings(),
+        trackedItems: listTrackedItems(mgr.db),
+        channels: listPickupChannels(mgr.db),
+        fetchFn: mockFetch,
+      });
+      expect(resync.syncLog.importedCount).toBe(0);
+      expect(resync.syncLog.flaggedMissingCount).toBe(0);
+      expect(listAllOrders(mgr.db)).toHaveLength(2);
+
+      // 4. 1-click Undo restores both purged Odoo orders cleanly (including slotted date!)
+      const undoRes = await fetch(`${baseUrl}/api/checkpoints/undo`, { method: 'POST' });
+      expect(undoRes.status).toBe(200);
+      const afterUndo = listAllOrders(mgr.db);
+      expect(afterUndo).toHaveLength(4);
+      expect(afterUndo.find((o) => o.odooQuotationId === 402)?.slottedDate).toBe('2026-11-28');
+      expect(stdId).toBeGreaterThan(0);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      mgr.close();
+    }
+  });
 });
+
+

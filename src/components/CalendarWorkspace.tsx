@@ -7,6 +7,8 @@ import {
   CalendarClock,
   Check,
   ChevronRight,
+  CloudUpload,
+  GitMerge,
   GripVertical,
   Lock,
   PanelRightClose,
@@ -27,6 +29,7 @@ import {
   type DragEvent,
 } from 'react';
 import { formatQty } from '../shared/generators';
+import { findReplacementCandidates } from '../shared/orderMatching';
 import {
   channelHasScheduleRestriction,
   evaluateCandidateSlotDates,
@@ -59,6 +62,8 @@ interface CalendarWorkspaceProps {
   onDropOrderOnDate: (orderId: number, date: string) => Promise<void>;
   onSyncNow: () => Promise<void>;
   syncing: boolean;
+  onPublishAvailability?: () => Promise<void>;
+  publishingAvailability?: boolean;
   onAutoSlotAsap: () => Promise<void>;
   autoSlotting: boolean;
   onUndo: () => Promise<void>;
@@ -66,7 +71,12 @@ interface CalendarWorkspaceProps {
   onRestoreCheckpoint: (id: number) => Promise<void>;
   onExtendWeeks: () => void;
   onOpenSettings: () => void;
-  onReconcile: (orderId: number, action: 'confirm' | 'keep') => Promise<void>;
+  onReconcile: (orderId: number, action: 'confirm' | 'keep' | 'ignore') => Promise<void>;
+  onReplaceOrder?: (
+    missingOrderId: number,
+    replacementOrderId: number,
+    keepDate?: string | null
+  ) => Promise<void>;
   onReleaseHold: (orderId: number) => Promise<void>;
   onRestoreIgnored: (orderId: number) => Promise<void>;
   onReorderWaitlist?: (orderIds: number[]) => Promise<void>;
@@ -136,6 +146,8 @@ export function CalendarWorkspace({
   onDropOrderOnDate,
   onSyncNow,
   syncing,
+  onPublishAvailability,
+  publishingAvailability = false,
   onAutoSlotAsap,
   autoSlotting,
   onUndo,
@@ -144,6 +156,7 @@ export function CalendarWorkspace({
   onExtendWeeks,
   onOpenSettings,
   onReconcile,
+  onReplaceOrder,
   onReleaseHold,
   onRestoreIgnored,
   onReorderWaitlist,
@@ -163,6 +176,10 @@ export function CalendarWorkspace({
   const [pendingDrop, setPendingDrop] = useState<{ orderId: number; targetDate: string } | null>(
     null
   );
+  const [selectedReplacementByOrderId, setSelectedReplacementByOrderId] = useState<
+    Record<number, number>
+  >({});
+  const [replacingOrderId, setReplacingOrderId] = useState<number | null>(null);
   const queueScrollRef = useRef<HTMLDivElement | null>(null);
   const calendarScrollRef = useRef<HTMLDivElement | null>(null);
   const queueCardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -866,7 +883,7 @@ export function CalendarWorkspace({
         {/* Action Controls (horizontally scrollable on narrow phones so buttons never overlap) */}
         <div className="flex items-center gap-2 overflow-x-auto pb-0.5 lg:overflow-visible lg:pb-0">
           <div className="mr-1 hidden items-center gap-2 text-xs text-[#8B949E] xl:flex">
-            <span data-testid="last-synced-label">Last synced: {lastSyncLabel}</span>
+            <span data-testid="last-synced-label">Odoo synced: {lastSyncLabel}</span>
           </div>
 
           <button
@@ -890,14 +907,54 @@ export function CalendarWorkspace({
             onClick={() => void onSyncNow()}
             title={
               workspace.odooStatus.configured
-                ? 'Sync Draft Quotations & Chatter from Odoo 19.3'
+                ? 'Pull draft quotations, chatter & customer updates from Odoo 19.3 (does not publish to your website)'
                 : 'Configure Odoo credentials in HA add-on options or .env'
             }
             className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#E6EDF3] transition-colors hover:border-[#38BDF8] disabled:opacity-45"
           >
             <RefreshCw className={`h-3.5 w-3.5 ${syncing ? 'animate-spin' : ''}`} />
-            {syncing ? 'Syncing...' : 'Sync Now'}
+            {syncing ? 'Pulling Odoo...' : 'Pull from Odoo'}
           </button>
+
+          {onPublishAvailability && (() => {
+            const ghStatus = workspace.githubPublishStatus;
+            const canPublishWebsite = Boolean(ghStatus?.tokenConfigured && ghStatus?.repo);
+            const hasPendingEdits = Boolean(canPublishWebsite && ghStatus?.hasUnpublishedEdits);
+            return (
+              <button
+                type="button"
+                data-testid="publish-availability-btn"
+                data-pending-edits={hasPendingEdits ? 'true' : undefined}
+                disabled={publishingAvailability || !canPublishWebsite}
+                onClick={() => void onPublishAvailability()}
+                title={
+                  !canPublishWebsite
+                    ? 'Configure your GitHub Pages repository and token in Availability Snippet to publish'
+                    : hasPendingEdits
+                      ? 'Unpublished edits pending — push updated availability calendar to your public website now'
+                      : ghStatus?.lastPublishedAt
+                        ? `Push current availability calendar to your public website (last published ${formatLocalDateTime(new Date(ghStatus.lastPublishedAt), workspace.settings.timezone)})`
+                        : 'Push current availability calendar to your public website'
+                }
+                className={`inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border bg-[#0F1419] px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-45 ${
+                  hasPendingEdits
+                    ? 'border-[#FBBF24]/70 text-[#FBBF24] hover:border-[#FBBF24] hover:bg-[#D97706]/10'
+                    : 'border-[#283340] text-[#E6EDF3] hover:border-[#38BDF8]'
+                }`}
+              >
+                <CloudUpload
+                  className={`h-3.5 w-3.5 ${publishingAvailability ? 'animate-pulse' : ''}`}
+                />
+                {publishingAvailability ? 'Publishing...' : 'Publish to Website'}
+                {hasPendingEdits && !publishingAvailability && (
+                  <span
+                    className="h-1.5 w-1.5 rounded-full bg-[#FBBF24]"
+                    aria-label="Unpublished edits pending"
+                  />
+                )}
+              </button>
+            );
+          })()}
 
           <button
             type="button"
@@ -1044,7 +1101,7 @@ export function CalendarWorkspace({
         </div>
       )}
 
-      {/* Conditional Deleted Odoo Quotation Reconciliation Banner (Always 1-click manual confirmation) */}
+      {/* Conditional Cancelled / Removed Odoo Quotation Reconciliation Banner */}
       {workspace.reconciliationOrders.length > 0 && (
         <div
           data-testid="reconciliation-banner"
@@ -1052,47 +1109,163 @@ export function CalendarWorkspace({
         >
           <div className="flex flex-col gap-2">
             <div className="text-xs font-semibold text-[#FBBF24]">
-              Odoo Draft Quotations Removed ({workspace.reconciliationOrders.length}) — Confirm paid
-              Eat From Farms orders below:
+              Cancelled / Removed in Odoo ({workspace.reconciliationOrders.length}) — Replace with a
+              matching quotation or resolve below:
             </div>
-            <div className="flex flex-wrap gap-2">
-              {workspace.reconciliationOrders.map((order) => (
-                <div
-                  key={order.id}
-                  data-testid={`reconcile-item-${order.id}`}
-                  className="flex flex-wrap items-center gap-3 rounded-md border border-[#D97706]/40 bg-[#0F1419] px-3 py-1.5 text-xs"
-                >
-                  <button
-                    type="button"
-                    onClick={() => onSelectOrder(order)}
-                    className="font-semibold text-[#F0F6FC] hover:text-[#38BDF8]"
+            <div className="flex flex-col gap-2">
+              {workspace.reconciliationOrders.map((order) => {
+                const candidates = findReplacementCandidates(order, workspace.orders);
+                const chosenId = selectedReplacementByOrderId[order.id] ?? candidates[0]?.order.id;
+                const chosenMatch =
+                  candidates.find((c) => c.order.id === chosenId) ?? candidates[0] ?? null;
+                const replacementOrder = chosenMatch?.order ?? null;
+                const isReplacing = replacingOrderId === order.id;
+
+                const formatCompactItems = (target: OrderRecord) =>
+                  target.items
+                    .map((line) => {
+                      const item = itemsById.get(line.trackedItemId);
+                      return `${formatQty(line.quantity)} ${item ? item.name : `#${line.trackedItemId}`}`;
+                    })
+                    .join(', ');
+
+                return (
+                  <div
+                    key={order.id}
+                    data-testid={`reconcile-item-${order.id}`}
+                    className="flex flex-wrap items-center justify-between gap-2.5 rounded-md border border-[#D97706]/40 bg-[#0F1419] px-3 py-2 text-xs"
                   >
-                    {order.customerName}
-                  </button>
-                  <span className="text-[#8B949E]">
-                    {order.odooSuggestedConfirmed
-                      ? `Match hint: ${order.odooSuggestedConfirmed.odooOrderName}`
-                      : 'No confirmed SO match found'}
-                  </span>
-                  <button
-                    type="button"
-                    data-testid={`reconcile-confirm-${order.id}`}
-                    onClick={() => void onReconcile(order.id, 'confirm')}
-                    className="inline-flex items-center gap-1 rounded bg-[#16A34A] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#22C55E]"
-                  >
-                    <Check className="h-3 w-3" />
-                    Confirm
-                  </button>
-                  <button
-                    type="button"
-                    data-testid={`reconcile-keep-${order.id}`}
-                    onClick={() => void onReconcile(order.id, 'keep')}
-                    className="text-[11px] text-[#C9D1D9] hover:text-white hover:underline"
-                  >
-                    Keep Open
-                  </button>
-                </div>
-              ))}
+                    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                      <button
+                        type="button"
+                        onClick={() => onSelectOrder(order)}
+                        className="font-semibold text-[#F0F6FC] hover:text-[#38BDF8]"
+                      >
+                        {order.customerName}
+                      </button>
+                      {order.odooQuotationName && (
+                        <span className="font-mono text-[11px] text-[#8B949E]">
+                          {order.odooQuotationName}
+                        </span>
+                      )}
+                      {order.slottedDate && (
+                        <span className="text-[11px] text-[#C9D1D9]">
+                          · Scheduled {formatShortCalendarDate(order.slottedDate)}
+                        </span>
+                      )}
+
+                      {replacementOrder ? (
+                        <span className="inline-flex flex-wrap items-center gap-1.5 text-[11px] text-[#7DD3FC]">
+                          <span aria-hidden="true">→</span>
+                          <span>
+                            Matches{' '}
+                            <strong className="font-mono text-[#F0F6FC]">
+                              {replacementOrder.odooQuotationName || `#${replacementOrder.id}`}
+                            </strong>
+                            {replacementOrder.status === 'waitlist'
+                              ? ' (new in Waitlist'
+                              : ` (${replacementOrder.status.replace('_', ' ')}`}
+                            {formatCompactItems(replacementOrder)
+                              ? ` · ${formatCompactItems(replacementOrder)}`
+                              : ''}
+                            )
+                          </span>
+                          {candidates.length > 1 && (
+                            <select
+                              aria-label={`Choose replacement quotation for ${order.customerName}`}
+                              data-testid={`reconcile-match-select-${order.id}`}
+                              value={replacementOrder.id}
+                              onChange={(e) =>
+                                setSelectedReplacementByOrderId((prev) => ({
+                                  ...prev,
+                                  [order.id]: Number(e.target.value),
+                                }))
+                              }
+                              className="rounded border border-[#283340] bg-[#161D24] px-1.5 py-0.5 text-[11px] text-[#E6EDF3]"
+                            >
+                              {candidates.map((cand) => (
+                                <option key={cand.order.id} value={cand.order.id}>
+                                  {cand.order.odooQuotationName || `#${cand.order.id}`} (
+                                  {cand.order.status === 'waitlist'
+                                    ? 'Waitlist'
+                                    : cand.order.slottedDate
+                                      ? formatShortCalendarDate(cand.order.slottedDate)
+                                      : cand.order.status}
+                                  )
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </span>
+                      ) : (
+                        <span className="text-[11px] text-[#8B949E]">
+                          {order.odooSuggestedConfirmed
+                            ? `Odoo Sales Order ${order.odooSuggestedConfirmed.odooOrderName} found`
+                            : 'No matching replacement quotation in waitlist yet'}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {replacementOrder && onReplaceOrder && (
+                        <button
+                          type="button"
+                          disabled={isReplacing}
+                          data-testid={`reconcile-replace-${order.id}`}
+                          onClick={async () => {
+                            setReplacingOrderId(order.id);
+                            try {
+                              await onReplaceOrder(
+                                order.id,
+                                replacementOrder.id,
+                                order.slottedDate ?? replacementOrder.slottedDate
+                              );
+                            } finally {
+                              setReplacingOrderId(null);
+                            }
+                          }}
+                          title={`Combine ${order.odooQuotationName || 'this order'} with ${replacementOrder.odooQuotationName || 'the new quotation'}, keep your scheduled date, and preserve the full order chain`}
+                          className="inline-flex items-center gap-1 rounded bg-[#0EA5E9] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:opacity-50"
+                        >
+                          <GitMerge className="h-3 w-3" />
+                          {isReplacing
+                            ? 'Linking...'
+                            : `Replace with ${replacementOrder.odooQuotationName || 'New Order'}`}
+                        </button>
+                      )}
+                      {!replacementOrder && order.odooSuggestedConfirmed && (
+                        <button
+                          type="button"
+                          data-testid={`reconcile-confirm-${order.id}`}
+                          onClick={() => void onReconcile(order.id, 'confirm')}
+                          className="inline-flex items-center gap-1 rounded bg-[#16A34A] px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-[#22C55E]"
+                        >
+                          <Check className="h-3 w-3" />
+                          Mark Confirmed
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        data-testid={`reconcile-keep-${order.id}`}
+                        onClick={() => void onReconcile(order.id, 'keep')}
+                        title="Keep this order on the schedule and dismiss this alert"
+                        className="rounded border border-[#283340] px-2 py-1 text-[11px] text-[#C9D1D9] hover:border-[#38BDF8] hover:text-white"
+                      >
+                        Keep
+                      </button>
+                      <button
+                        type="button"
+                        data-testid={`reconcile-remove-${order.id}`}
+                        onClick={() => void onReconcile(order.id, 'ignore')}
+                        title="Remove this cancelled quotation from the schedule and free up its eggs (Undo available)"
+                        className="text-[11px] text-[#F87171] hover:text-[#FCA5A5] hover:underline"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -1772,7 +1945,7 @@ export function CalendarWorkspace({
                     data-testid="empty-waitlist-queue"
                     className="py-10 text-center text-xs text-[#8B949E]"
                   >
-                    Waitlist queue is clear. Use Quick Add Order or Sync Now to pull new requests.
+                    Waitlist queue is clear. Use Quick Add Order or Pull from Odoo to pull new requests.
                   </p>
                 ) : (
                   unslottedOrders.map((order, idx) => {

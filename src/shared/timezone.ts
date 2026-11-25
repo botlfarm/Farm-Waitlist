@@ -214,6 +214,18 @@ export function isDateInIgnoredRanges(localYmd: string, ranges: IgnoredDateRange
   return ranges.some((r) => r.startDate && r.endDate && localYmd >= r.startDate && localYmd <= r.endDate);
 }
 
+export function isDateInFullIgnoredRanges(localYmd: string, ranges: IgnoredDateRange[]): boolean {
+  if (!localYmd) return false;
+  return ranges.some(
+    (r) =>
+      Boolean(r.ignoreExisting) &&
+      Boolean(r.startDate) &&
+      Boolean(r.endDate) &&
+      localYmd >= r.startDate &&
+      localYmd <= r.endDate
+  );
+}
+
 export const ISO_WEEKDAY_LABELS: Record<number, string> = {
   1: 'Mon',
   2: 'Tue',

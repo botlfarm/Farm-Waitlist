@@ -527,9 +527,15 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     const earliestHint = await screen.findByTestId('queue-earliest-11');
     expect(earliestHint).toHaveTextContent('Nov 24');
 
-    // Tap waitlist card -> OrderDetailDrawer opens with Schedule Pickup Slot panel
+    // Tap waitlist card -> OrderDetailDrawer opens with Pickup & Schedule panel
     await user.click(screen.getByTestId('queue-order-11'));
     expect(await screen.findByTestId('order-scheduler-panel')).toBeInTheDocument();
+
+    // Availability date list starts condensed (no nested scroll box); clicking expands it inline
+    expect(screen.queryByTestId('slot-availability-list')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('toggle-availability-picker-btn'));
+    const availabilityList = screen.getByTestId('slot-availability-list');
+    expect(availabilityList).not.toHaveClass('overflow-y-auto');
 
     // Day 1 shows Buffer (1 open -> -2 buffer), Day 2 shows Fits (24 open -> 21 left)
     expect(screen.getByTestId('slot-candidate-2026-11-23')).toHaveTextContent('Buffer');
@@ -1931,15 +1937,15 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
 
     try {
       const ok = await copyRichMessageToClipboard(
-        'Hey Jane, order at <a href="https://eatfromfarms.com/pre">Eat From Farms</a>\nThanks!'
+        'Hey Jane, order at <a href="https://farmstore.example.com/pre">Online Farm Store</a>\nThanks!'
       );
       expect(ok).toBe(true);
       expect(writtenClipboard['text/html']).toBe(
-        '<div>Hey Jane, order at <a href="https://eatfromfarms.com/pre" target="_blank" rel="noopener noreferrer">Eat From Farms</a><br>Thanks!</div>'
+        '<div>Hey Jane, order at <a href="https://farmstore.example.com/pre" target="_blank" rel="noopener noreferrer">Online Farm Store</a><br>Thanks!</div>'
       );
       expect(writtenClipboard['text/html']).not.toMatch(/background|rgb\(|#0f1419|#e6edf3|color:/i);
       expect(writtenClipboard['text/plain']).toBe(
-        'Hey Jane, order at Eat From Farms (https://eatfromfarms.com/pre)\nThanks!'
+        'Hey Jane, order at Online Farm Store (https://farmstore.example.com/pre)\nThanks!'
       );
     } finally {
       document.execCommand = origExecCommand;
@@ -2198,5 +2204,347 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
       expect(screen.getByTestId('order-chip-11')).toBeInTheDocument();
     });
   });
+
+  it('shows Pull from Odoo and Publish to Website side by side on the calendar toolbar and publishes with force', async () => {
+    const user = userEvent.setup();
+    const ws = makeBaseWorkspace({
+      githubPublishStatus: {
+        tokenConfigured: true,
+        tokenSource: 'env',
+        mode: 'auto',
+        repo: 'myfarm/public-availability',
+        branch: 'main',
+        filePath: 'availability.json',
+        interval: '1h',
+        idleMinutes: 15,
+        publicUrl: 'https://myfarm.github.io/public-availability/availability.json',
+        lastPublishedAt: '2026-11-23T08:00:00.000Z',
+        lastEditedAt: '2026-11-23T10:15:00.000Z',
+        hasUnpublishedEdits: true,
+        lastPublishedHash: 'abc123',
+        lastPublishStatus: 'success',
+        lastPublishError: null,
+      },
+    });
+
+    const publishBodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/snippet/github/publish') {
+          publishBodies.push(JSON.parse(String(init?.body ?? '{}')));
+          ws.githubPublishStatus = {
+            ...ws.githubPublishStatus!,
+            lastPublishedAt: '2026-11-23T10:20:00.000Z',
+            hasUnpublishedEdits: false,
+          };
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              skipped: false,
+              changed: true,
+              message: 'Published live availability to GitHub Pages.',
+              publicUrl: 'https://myfarm.github.io/public-availability/availability.json',
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    const pullBtn = await screen.findByTestId('sync-now-btn');
+    const publishBtn = screen.getByTestId('publish-availability-btn');
+
+    expect(pullBtn).toHaveTextContent('Pull from Odoo');
+    expect(publishBtn).toHaveTextContent('Publish to Website');
+    expect(publishBtn).toHaveAttribute('data-pending-edits', 'true');
+    expect(publishBtn).not.toBeDisabled();
+
+    await user.click(publishBtn);
+
+    await waitFor(() => {
+      expect(publishBodies).toEqual([{ force: true }]);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('publish-availability-btn')).not.toHaveAttribute(
+        'data-pending-edits'
+      );
+    });
+  });
+
+  it('matches a cancelled Odoo waitlist quotation to a newly arrived replacement quotation in the banner, replaces with 1 click, and shows the full Odoo chain in the drawer', async () => {
+    const user = userEvent.setup();
+    const cancelledWaitlistOrder = {
+      id: 51,
+      source: 'odoo' as const,
+      status: 'pre_approved' as const,
+      timingType: 'asap' as const,
+      requestedDate: null,
+      slottedDate: '2026-11-24',
+      isLocked: false,
+      customerName: 'Sarah Miller',
+      customerNameOverridden: false,
+      customerEmail: 'sarah@example.com',
+      customerPhone: '555-3333',
+      pickupChannelId: 1,
+      freeTextPickup: null,
+      notes: 'Waitlist request',
+      preApprovedAt: '2026-11-23T15:00:00Z',
+      standingOrderId: null,
+      standingOccurrenceDate: null,
+      odooQuotationId: 100,
+      odooQuotationName: 'S00100',
+      odooPartnerId: 801,
+      odooCreatedAtLocal: '2026-11-23 09:00:00',
+      odooRawNotes: 'Waitlist request',
+      odooRawLines: ['2 × Standard Eggs'],
+      odooUpdatedAfterSlot: false,
+      odooMissingFlagged: true,
+      odooSuggestedConfirmed: null,
+      mergedOdooNames: [] as string[],
+      dismissedDuplicateOrderIds: [] as number[],
+      waitlistSortOrder: null,
+      createdAt: '2026-11-23T14:00:00Z',
+      updatedAt: '2026-11-23T15:00:00Z',
+      items: [{ trackedItemId: 1, quantity: 2 }],
+      chatter: [],
+    };
+    const newReplacementQuotation = {
+      ...cancelledWaitlistOrder,
+      id: 52,
+      status: 'waitlist' as const,
+      slottedDate: null,
+      notes: 'Storefront Order #5542',
+      preApprovedAt: null,
+      odooQuotationId: 105,
+      odooQuotationName: 'S00105',
+      odooCreatedAtLocal: '2026-11-24 10:00:00',
+      odooRawNotes: 'Storefront Order #5542',
+      odooRawLines: ['3 × Standard Eggs'],
+      odooMissingFlagged: false,
+      items: [{ trackedItemId: 1, quantity: 3 }],
+    };
+
+    const ws = makeBaseWorkspace();
+    ws.orders = [...ws.orders, cancelledWaitlistOrder, newReplacementQuotation];
+    ws.reconciliationOrders = [cancelledWaitlistOrder];
+
+    const mergePayloads: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/51/merge') {
+          const parsed = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+          mergePayloads.push({ url: input, body: parsed });
+          const chained = {
+            ...cancelledWaitlistOrder,
+            odooQuotationId: 105,
+            odooQuotationName: 'S00105',
+            mergedOdooNames: ['S00100'],
+            odooMissingFlagged: false,
+            items: [{ trackedItemId: 1, quantity: 3 }],
+          };
+          ws.orders = ws.orders
+            .filter((o) => o.id !== 52)
+            .map((o) => (o.id === 51 ? chained : o));
+          ws.reconciliationOrders = [];
+          return new Response(JSON.stringify({ order: chained, mergedOrderId: 52 }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    const banner = await screen.findByTestId('reconciliation-banner');
+    expect(banner).toHaveTextContent('Cancelled / Removed in Odoo');
+    expect(banner).not.toHaveTextContent('Confirm paid');
+    expect(banner).toHaveTextContent('Matches S00105');
+
+    const replaceBtn = screen.getByTestId('reconcile-replace-51');
+    expect(replaceBtn).toHaveTextContent('Replace with S00105');
+
+    await user.click(replaceBtn);
+
+    await waitFor(() => {
+      expect(mergePayloads).toEqual([
+        {
+          url: './api/orders/51/merge',
+          body: {
+            sourceOrderId: 52,
+            itemStrategy: 'use_source',
+            keepDate: '2026-11-24',
+          },
+        },
+      ]);
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('reconciliation-banner')).not.toBeInTheDocument();
+    });
+
+    // Open the chained order on the calendar and verify full chain S00100 -> S00105 is displayed
+    await user.click(screen.getByTestId('order-chip-51'));
+    const chainBadge = await screen.findByTestId('order-merged-refs');
+    expect(chainBadge).toHaveTextContent('Chain: S00100 → S00105');
+  });
+
+  it('places Items at the top of OrderDetailDrawer, keeps general Notes separate from Odoo Order Details, and expands availability inline without nested scroll', async () => {
+    const user = userEvent.setup();
+    const ws = makeBaseWorkspace();
+    ws.orders = [
+      {
+        ...ws.orders[0],
+        id: 77,
+        source: 'odoo',
+        status: 'slotted',
+        slottedDate: '2026-11-23',
+        customerName: 'Clara Hens',
+        odooQuotationId: 770,
+        odooQuotationName: 'S00770',
+        notes: 'Odoo web form submission: 2 doz eggs for Farm Pickup',
+        odooRawNotes: 'Odoo web form submission: 2 doz eggs for Farm Pickup',
+        odooRawLines: ['Standard Chicken Eggs x 2'],
+      },
+    ];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    await user.click(await screen.findByTestId('order-chip-77'));
+    const itemsSection = await screen.findByTestId('order-items-section');
+    const schedulerPanel = screen.getByTestId('order-scheduler-panel');
+
+    // Items section appears BEFORE Pickup & Schedule in DOM order
+    expect(
+      itemsSection.compareDocumentPosition(schedulerPanel) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
+
+    // General Notes field stays empty (does NOT duplicate Odoo Order Details), while Odoo Order Details renders separately
+    const notesInput = screen.getByTestId('order-notes-input') as HTMLTextAreaElement;
+    expect(notesInput.value).toBe('');
+    expect(screen.getByTestId('order-odoo-raw-section')).toHaveTextContent(
+      'Odoo web form submission: 2 doz eggs for Farm Pickup'
+    );
+
+    // Date availability picker starts collapsed and expands inline without overflow-y-auto (no scroll-in-scroll)
+    expect(screen.queryByTestId('slot-availability-list')).not.toBeInTheDocument();
+    await user.click(screen.getByTestId('toggle-availability-picker-btn'));
+    const slotList = screen.getByTestId('slot-availability-list');
+    expect(slotList).toBeInTheDocument();
+    expect(slotList.className).not.toContain('overflow-y-auto');
+  });
+
+  it('lets users set Ignored Off-Season Date Ranges to Ignore completely (clearing already-imported Odoo orders)', async () => {
+    const user = userEvent.setup();
+    const ws = makeBaseWorkspace();
+    ws.settings.odooIgnoredDateRanges = [
+      {
+        id: 'existing-range-1',
+        startDate: '2025-01-01',
+        endDate: '2025-03-31',
+        label: 'Winter 2025',
+        ignoreExisting: false,
+      },
+    ];
+
+    const savedSettingPatches: Array<Record<string, unknown>> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/settings' && init?.method === 'PUT') {
+          const parsed = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+          savedSettingPatches.push(parsed);
+          if (Array.isArray(parsed.odooIgnoredDateRanges)) {
+            ws.settings.odooIgnoredDateRanges = parsed.odooIgnoredDateRanges as typeof ws.settings.odooIgnoredDateRanges;
+          }
+          return new Response(
+            JSON.stringify({
+              settings: ws.settings,
+              odooStatus: ws.odooStatus,
+              removedIgnoredOrdersCount: 5,
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    await user.click(await screen.findByTestId('nav-settings'));
+    await user.click(await screen.findByTestId('settings-tab-odoo'));
+
+    // Existing range starts as "New imports only" with 1-click "Ignore Existing Too" button
+    const existingRow = await screen.findByTestId('ignored-range-row-existing-range-1');
+    expect(existingRow).toHaveTextContent('New imports only');
+    await user.click(screen.getByTestId('toggle-ignored-range-mode-existing-range-1'));
+
+    await waitFor(() => {
+      expect(savedSettingPatches).toHaveLength(1);
+      const ranges = savedSettingPatches[0].odooIgnoredDateRanges as Array<{
+        id: string;
+        ignoreExisting?: boolean;
+      }>;
+      expect(ranges.find((r) => r.id === 'existing-range-1')?.ignoreExisting).toBe(true);
+    });
+    expect(screen.getByTestId('ignored-range-row-existing-range-1')).toHaveTextContent(
+      'Ignore completely'
+    );
+
+    // Add a new range with the "Ignore completely" checkbox checked
+    await user.type(screen.getByTestId('ignored-range-start-input'), '2025-07-01');
+    await user.type(screen.getByTestId('ignored-range-end-input'), '2025-08-31');
+    await user.type(screen.getByTestId('ignored-range-label-input'), 'Summer 2025');
+    await user.click(screen.getByTestId('ignored-range-complete-checkbox'));
+    await user.click(screen.getByTestId('add-ignored-range-btn'));
+
+    await waitFor(() => {
+      expect(savedSettingPatches).toHaveLength(2);
+      const ranges = savedSettingPatches[1].odooIgnoredDateRanges as Array<{
+        startDate: string;
+        endDate: string;
+        label?: string;
+        ignoreExisting?: boolean;
+      }>;
+      expect(ranges).toContainEqual(
+        expect.objectContaining({
+          startDate: '2025-07-01',
+          endDate: '2025-08-31',
+          label: 'Summer 2025',
+          ignoreExisting: true,
+        })
+      );
+    });
+  });
 });
+
+
+
+
 

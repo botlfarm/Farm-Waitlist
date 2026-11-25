@@ -20,6 +20,13 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { CustomerAutocompleteInput } from './CustomerAutocompleteInput';
 import { formatQty } from '../shared/generators';
 import {
+  buildOrderOdooChain,
+  findReplacementCandidates,
+  isStandingRecurringOrder,
+  scoreDuplicateOrder,
+  selectPrimaryOdooSide,
+} from '../shared/orderMatching';
+import {
   channelHasScheduleRestriction,
   evaluateCandidateSlotDates,
   type CandidateSlotDate,
@@ -79,7 +86,7 @@ interface OrderDetailDrawerProps {
   onReleaseHold: (orderId: number) => Promise<void>;
   onIgnore: (orderId: number) => Promise<void>;
   onRestoreIgnored: (orderId: number) => Promise<void>;
-  onReconcile: (orderId: number, action: 'confirm' | 'keep') => Promise<void>;
+  onReconcile: (orderId: number, action: 'confirm' | 'keep' | 'ignore') => Promise<void>;
   onMergeOrders?: (
     targetOrderId: number,
     sourceOrderId: number,
@@ -130,64 +137,6 @@ function fitStyle(fit: CandidateSlotFit): { label: string; text: string; rowHove
 function formatCandidateDateLabel(dateYmd: string, isoWeekday: number, isToday: boolean): string {
   const base = `${ISO_WEEKDAY_LABELS[isoWeekday]}, ${formatShortCalendarDate(dateYmd)}`;
   return isToday ? `${base} (Today)` : base;
-}
-
-function isStandingRecurringOrder(order: OrderRecord): boolean {
-  return order.source === 'standing' || order.standingOrderId !== null;
-}
-
-function scoreDuplicateOrder(target: OrderRecord, candidate: OrderRecord): number {
-  if (isStandingRecurringOrder(target) || isStandingRecurringOrder(candidate)) {
-    return 0;
-  }
-  let score = 0;
-
-  if (
-    target.odooPartnerId &&
-    candidate.odooPartnerId &&
-    target.odooPartnerId === candidate.odooPartnerId
-  ) {
-    score += 100;
-  }
-
-  const nameA = target.customerName.trim().toLowerCase().replace(/\s+/g, ' ');
-  const nameB = candidate.customerName.trim().toLowerCase().replace(/\s+/g, ' ');
-  if (nameA && nameB) {
-    if (nameA === nameB) {
-      score += 90;
-    } else if (
-      nameA.length >= 4 &&
-      nameB.length >= 4 &&
-      (nameA.includes(nameB) || nameB.includes(nameA))
-    ) {
-      score += 40;
-    } else {
-      const partsA = nameA.split(' ');
-      const partsB = nameB.split(' ');
-      // Only treat first-name-only match as a likely duplicate when one side has no last name
-      if (
-        (partsA.length === 1 || partsB.length === 1) &&
-        partsA[0].length >= 3 &&
-        partsA[0] === partsB[0]
-      ) {
-        score += 25;
-      }
-    }
-  }
-
-  const emailA = (target.customerEmail || '').trim().toLowerCase();
-  const emailB = (candidate.customerEmail || '').trim().toLowerCase();
-  if (emailA && emailB && emailA === emailB) {
-    score += 85;
-  }
-
-  const phoneA = (target.customerPhone || '').replace(/\D/g, '');
-  const phoneB = (candidate.customerPhone || '').replace(/\D/g, '');
-  if (phoneA.length >= 7 && phoneB.length >= 7 && phoneA === phoneB) {
-    score += 80;
-  }
-
-  return score;
 }
 
 function DuplicateOrderDetailsBody({
@@ -378,6 +327,8 @@ export function OrderDetailDrawer({
   >([]);
   const [saving, setSaving] = useState(false);
   const [slottingTarget, setSlottingTarget] = useState<string | null>(null);
+  const [availabilityExpanded, setAvailabilityExpanded] = useState(false);
+  const [showAllAvailabilityDates, setShowAllAvailabilityDates] = useState(false);
   const [onlyOpenDates, setOnlyOpenDates] = useState(false);
   const [showOffChannel, setShowOffChannel] = useState(false);
 
@@ -395,6 +346,15 @@ export function OrderDetailDrawer({
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const rowKeyCounter = useRef(0);
 
+  const getInitialGeneralNotes = (ord: OrderRecord): string => {
+    const trimmedNotes = (ord.notes ?? '').trim();
+    const trimmedRawNotes = (ord.odooRawNotes ?? '').trim();
+    if (ord.source === 'odoo' && trimmedNotes !== '' && trimmedNotes === trimmedRawNotes) {
+      return '';
+    }
+    return ord.notes ?? '';
+  };
+
   useEffect(() => {
     if (!order) return;
     setCustomerName(order.customerName);
@@ -405,7 +365,7 @@ export function OrderDetailDrawer({
     setSlottedDate(order.slottedDate ?? '');
     setStatus(order.status);
     setIsLocked(order.isLocked);
-    setNotes(order.notes ?? '');
+    setNotes(getInitialGeneralNotes(order));
     setOrderItems(
       order.items.map((l, idx) => ({
         rowKey: `init-${order.id}-${idx}-${l.trackedItemId}`,
@@ -413,6 +373,8 @@ export function OrderDetailDrawer({
         qtyText: formatQty(l.quantity),
       }))
     );
+    setAvailabilityExpanded(false);
+    setShowAllAvailabilityDates(false);
     setOnlyOpenDates(false);
     setShowOffChannel(false);
     setSlottingTarget(null);
@@ -584,7 +546,8 @@ export function OrderDetailDrawer({
     if (parsedChannelId !== order.pickupChannelId) return true;
     if ((requestedDate || null) !== order.requestedDate) return true;
     if (isLocked !== order.isLocked) return true;
-    if ((notes.trim() || null) !== order.notes) return true;
+    const baselineNotes = getInitialGeneralNotes(order).trim() || null;
+    if ((notes.trim() || null) !== baselineNotes) return true;
     if (validDraftItems.length !== order.items.length) return true;
     return validDraftItems.some(
       (line, idx) =>
@@ -637,23 +600,24 @@ export function OrderDetailDrawer({
           <div className="min-w-0 flex-1 pr-3">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-[#8B949E]">
               <span className="capitalize">{order.source}</span>
-              {order.odooQuotationName && (
-                <>
-                  <span aria-hidden="true">·</span>
-                  <span className="font-mono text-[#C9D1D9]">{order.odooQuotationName}</span>
-                </>
-              )}
-              {order.mergedOdooNames && order.mergedOdooNames.length > 0 && (
+              {order.mergedOdooNames && order.mergedOdooNames.length > 0 ? (
                 <>
                   <span aria-hidden="true">·</span>
                   <span
                     data-testid="order-merged-refs"
-                    className="font-mono text-[#38BDF8]"
-                    title="Merged Odoo quotations/orders (suppressed from future duplicate syncs)"
+                    className="inline-flex items-center gap-1 rounded border border-[#38BDF8]/40 bg-[#0EA5E9]/10 px-1.5 py-0.5 font-mono text-[11px] text-[#7DD3FC]"
+                    title="Full linked Odoo order chain (waitlist → active order). Notes & chatter from every step are combined, and earlier cancelled quotations will not re-import."
                   >
-                    Merged: {order.mergedOdooNames.join(', ')}
+                    Chain: {buildOrderOdooChain(order).join(' → ')}
                   </span>
                 </>
+              ) : (
+                order.odooQuotationName && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="font-mono text-[#C9D1D9]">{order.odooQuotationName}</span>
+                  </>
+                )
               )}
               {order.odooCreatedAtLocal && (
                 <>
@@ -662,12 +626,9 @@ export function OrderDetailDrawer({
                 </>
               )}
             </div>
-            <h2 className="mt-1 truncate font-['Plus_Jakarta_Sans'] text-lg font-bold text-[#F0F6FC]">
+            <h2 className="mt-0.5 truncate font-['Plus_Jakarta_Sans'] text-lg font-bold text-[#F0F6FC]">
               {order.customerName}
             </h2>
-            <p className="mt-0.5 truncate font-mono text-xs tabular-nums text-[#C9D1D9]">
-              {itemsSummary}
-            </p>
             {requestedDate && (
               <div
                 data-testid="order-header-requested-pickup"
@@ -696,41 +657,118 @@ export function OrderDetailDrawer({
           ref={scrollContainerRef}
           className="flex-1 space-y-5 overflow-y-auto px-4 py-4 sm:space-y-6 sm:px-6 sm:py-5"
         >
-          {/* Odoo Reconciliation Warning (Always 1-click manual confirmation) */}
-          {order.odooMissingFlagged && (
-            <div
-              data-testid="order-reconcile-box"
-              className="rounded-md border border-[#D97706]/60 bg-[#D97706]/10 p-4 text-sm"
-            >
-              <p className="font-semibold text-[#FBBF24]">
-                Odoo Draft Quotation Removed — Confirm Paid Order?
-              </p>
-              <p className="mt-1 text-xs text-[#E6EDF3]">
-                {order.odooSuggestedConfirmed
-                  ? `Suggested confirmed Odoo order: ${order.odooSuggestedConfirmed.odooOrderName} (${order.odooSuggestedConfirmed.partnerName}, ${order.odooSuggestedConfirmed.dateOrderLocal}).`
-                  : 'This draft quotation is no longer in Odoo. Confirm if payment was completed on Eat From Farms.'}
-              </p>
-              <div className="mt-3 flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  data-testid="drawer-reconcile-confirm-btn"
-                  onClick={() => void onReconcile(order.id, 'confirm')}
-                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#16A34A] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#22C55E]"
-                >
-                  <Check className="h-3.5 w-3.5" />
-                  Confirm Order
-                </button>
-                <button
-                  type="button"
-                  data-testid="drawer-reconcile-keep-btn"
-                  onClick={() => void onReconcile(order.id, 'keep')}
-                  className="min-h-[36px] rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#38BDF8]"
-                >
-                  Keep Active &amp; Clear Flag
-                </button>
+          {/* Cancelled / Removed Odoo Quotation Reconciliation Box */}
+          {order.odooMissingFlagged && (() => {
+            const replacementCandidates = findReplacementCandidates(order, allOrders);
+            const topReplacement = replacementCandidates[0]?.order ?? null;
+            return (
+              <div
+                data-testid="order-reconcile-box"
+                className="rounded-md border border-[#D97706]/60 bg-[#D97706]/10 p-4 text-sm"
+              >
+                <p className="font-semibold text-[#FBBF24]">
+                  Quotation Cancelled / Removed in Odoo
+                </p>
+                {topReplacement ? (
+                  <p className="mt-1 text-xs text-[#E6EDF3]">
+                    Matches newer quotation{' '}
+                    <span className="font-mono font-semibold text-[#7DD3FC]">
+                      {topReplacement.odooQuotationName || `#${topReplacement.id}`}
+                    </span>{' '}
+                    ({topReplacement.status === 'waitlist'
+                      ? 'new in Waitlist'
+                      : topReplacement.status.replace('_', ' ')}
+                    ). Link them to keep this scheduled slot, combine all notes &amp; chatter, and
+                    track{' '}
+                    <span className="font-mono text-[#F0F6FC]">
+                      {order.odooQuotationName || `#${order.id}`} →{' '}
+                      {topReplacement.odooQuotationName || `#${topReplacement.id}`}
+                    </span>
+                    .
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs text-[#E6EDF3]">
+                    {order.odooSuggestedConfirmed
+                      ? `No matching waitlist quotation found locally, but Odoo Sales Order ${order.odooSuggestedConfirmed.odooOrderName} (${order.odooSuggestedConfirmed.partnerName}) exists.`
+                      : 'This quotation is no longer active in Odoo. If a replacement quotation arrived in the waitlist, link them below — otherwise keep or remove this order.'}
+                  </p>
+                )}
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  {topReplacement && onMergeOrders && (
+                    <button
+                      type="button"
+                      disabled={merging}
+                      data-testid="drawer-reconcile-replace-btn"
+                      onClick={async () => {
+                        setMerging(true);
+                        try {
+                          await onMergeOrders(
+                            order.id,
+                            topReplacement.id,
+                            'use_source',
+                            order.slottedDate ?? topReplacement.slottedDate ?? null
+                          );
+                        } finally {
+                          setMerging(false);
+                        }
+                      }}
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#0EA5E9] px-3 py-1.5 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:opacity-50"
+                    >
+                      <GitMerge className="h-3.5 w-3.5" />
+                      {merging
+                        ? 'Linking...'
+                        : `Replace with ${topReplacement.odooQuotationName || 'New Order'}`}
+                    </button>
+                  )}
+                  {onMergeOrders && (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) && (
+                    <button
+                      type="button"
+                      data-testid="drawer-reconcile-compare-btn"
+                      onClick={() => {
+                        const pick = topReplacement ?? mergeCandidates.likely[0] ?? mergeCandidates.others[0];
+                        if (pick) {
+                          setMergeSourceId(String(pick.id));
+                          setMergeStrategy('use_source');
+                          setMergeKeepDate(order.slottedDate ?? pick.slottedDate ?? '');
+                        }
+                        setMergePanelOpen(true);
+                      }}
+                      className="min-h-[36px] rounded-md border border-[#38BDF8]/50 bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#7DD3FC] hover:border-[#38BDF8]"
+                    >
+                      Compare / Link Order
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="drawer-reconcile-keep-btn"
+                    onClick={() => void onReconcile(order.id, 'keep')}
+                    className="min-h-[36px] rounded-md border border-[#283340] bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#C9D1D9] hover:border-[#38BDF8]"
+                  >
+                    Keep Order &amp; Clear Flag
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="drawer-reconcile-remove-btn"
+                    onClick={() => void onReconcile(order.id, 'ignore')}
+                    className="min-h-[36px] rounded-md border border-[#DC2626]/50 bg-[#DC2626]/10 px-3 py-1.5 text-xs font-medium text-[#FCA5A5] hover:border-[#F87171]"
+                  >
+                    Remove Cancelled Order
+                  </button>
+                  {order.odooSuggestedConfirmed && (
+                    <button
+                      type="button"
+                      data-testid="drawer-reconcile-confirm-btn"
+                      onClick={() => void onReconcile(order.id, 'confirm')}
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#16A34A] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#22C55E]"
+                    >
+                      <Check className="h-3.5 w-3.5" />
+                      Mark Confirmed
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Odoo Updated After Slotting Notice */}
           {order.odooUpdatedAfterSlot && (
@@ -1216,24 +1254,53 @@ export function OrderDetailDrawer({
 
                         <div
                           data-testid="merge-result-summary"
-                          className="rounded border border-[#38BDF8]/30 bg-[#0EA5E9]/10 px-2.5 py-2 text-[11px] text-[#BAE6FD]"
+                          className="space-y-1 rounded border border-[#38BDF8]/30 bg-[#0EA5E9]/10 px-2.5 py-2 text-[11px] text-[#BAE6FD]"
                         >
-                          {resolvedMergeDate ? (
-                            <>
-                              Result: <span className="font-semibold text-[#F0F6FC]">1 order on {formatShortCalendarDate(resolvedMergeDate)}</span>
-                              {hasDifferentMergeDates && order.slottedDate && selectedMergeSource.slottedDate
-                                ? ` · duplicate on ${formatShortCalendarDate(
-                                    resolvedMergeDate === order.slottedDate
-                                      ? selectedMergeSource.slottedDate
-                                      : order.slottedDate
-                                  )} will be removed.`
-                                : ' · duplicate will be removed.'}
-                            </>
-                          ) : (
-                            <>
-                              Result: <span className="font-semibold text-[#F0F6FC]">1 unslotted order</span> · duplicate will be removed.
-                            </>
-                          )}
+                          <div>
+                            {resolvedMergeDate ? (
+                              <>
+                                Result:{' '}
+                                <span className="font-semibold text-[#F0F6FC]">
+                                  1 order on {formatShortCalendarDate(resolvedMergeDate)}
+                                </span>
+                                {hasDifferentMergeDates &&
+                                order.slottedDate &&
+                                selectedMergeSource.slottedDate
+                                  ? ` · duplicate on ${formatShortCalendarDate(
+                                      resolvedMergeDate === order.slottedDate
+                                        ? selectedMergeSource.slottedDate
+                                        : order.slottedDate
+                                    )} will be removed.`
+                                  : ' · duplicate will be removed.'}
+                              </>
+                            ) : (
+                              <>
+                                Result:{' '}
+                                <span className="font-semibold text-[#F0F6FC]">
+                                  1 unslotted order
+                                </span>{' '}
+                                · duplicate will be removed.
+                              </>
+                            )}
+                          </div>
+                          {order.odooQuotationId && selectedMergeSource.odooQuotationId && (() => {
+                            const primarySide = selectPrimaryOdooSide(order, selectedMergeSource);
+                            const primaryRef =
+                              primarySide === 'source'
+                                ? selectedMergeSource.odooQuotationName || `#${selectedMergeSource.odooQuotationId}`
+                                : order.odooQuotationName || `#${order.odooQuotationId}`;
+                            const archivedRef =
+                              primarySide === 'source'
+                                ? order.odooQuotationName || `#${order.odooQuotationId}`
+                                : selectedMergeSource.odooQuotationName || `#${selectedMergeSource.odooQuotationId}`;
+                            return (
+                              <div className="font-mono text-[10px] text-[#7DD3FC]">
+                                Odoo chain: {archivedRef} →{' '}
+                                <span className="font-semibold text-[#F0F6FC]">{primaryRef}</span>{' '}
+                                (stays synced)
+                              </div>
+                            );
+                          })()}
                         </div>
 
                         <button
@@ -1283,7 +1350,88 @@ export function OrderDetailDrawer({
             </div>
           )}
 
-          {/* Mobile-First Smart Pickup Slot Scheduler (Availability + 1-Tap First Available) */}
+          {/* 1. Order Items (Top of card for immediate visibility & quick edits) */}
+          <section
+            data-testid="order-items-section"
+            aria-label="Order Items"
+            className="rounded-lg border border-[#283340] bg-[#11171D] p-3.5 sm:p-4"
+          >
+            <div className="mb-2.5 flex items-center justify-between gap-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <h3 className="font-['Plus_Jakarta_Sans'] text-sm font-bold text-[#F0F6FC]">
+                  Items
+                </h3>
+                {validDraftItems.length > 0 && (
+                  <span className="truncate font-mono text-[11px] tabular-nums text-[#8B949E]">
+                    {itemsSummary}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                data-testid="order-add-item-line-btn"
+                onClick={addItemLine}
+                disabled={items.length === 0}
+                className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-[#38BDF8] hover:underline disabled:opacity-40"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Add Item
+              </button>
+            </div>
+            {orderItems.length === 0 ? (
+              <p className="text-xs text-[#8B949E]">
+                No items assigned yet. Add items here or dismiss if unrelated.
+              </p>
+            ) : (
+              <div className="space-y-2">
+                {orderItems.map((line, idx) => (
+                  <div key={line.rowKey} className="flex items-center gap-2">
+                    <select
+                      data-testid={`order-item-select-${idx}`}
+                      value={line.trackedItemId}
+                      onChange={(e) => {
+                        const next = [...orderItems];
+                        next[idx] = { ...line, trackedItemId: Number(e.target.value) };
+                        setOrderItems(next);
+                      }}
+                      className="min-h-[38px] flex-1 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+                    >
+                      {items.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name} ({item.unitLabel})
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      data-testid={`order-item-qty-${idx}`}
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="Qty"
+                      value={line.qtyText}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        if (raw !== '' && !/^\d*\.?\d*$/.test(raw)) return;
+                        const next = [...orderItems];
+                        next[idx] = { ...line, qtyText: raw };
+                        setOrderItems(next);
+                      }}
+                      className="min-h-[38px] w-20 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 font-mono text-sm tabular-nums text-[#F0F6FC] placeholder:text-[#6E7681] focus:border-[#38BDF8] focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setOrderItems(orderItems.filter((_, i) => i !== idx))}
+                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-[#8B949E] hover:bg-[#1E2730] hover:text-[#F87171]"
+                      aria-label="Remove item line"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* 2. Pickup & Schedule (Compact fields + Click-to-Expand Inline Availability Picker) */}
           {order.status !== 'ignored' && (
             <section
               data-testid="order-scheduler-panel"
@@ -1294,23 +1442,109 @@ export function OrderDetailDrawer({
                 <div className="flex items-center gap-2">
                   <CalendarCheck className="h-4 w-4 text-[#38BDF8]" aria-hidden="true" />
                   <h3 className="font-['Plus_Jakarta_Sans'] text-sm font-bold text-[#F0F6FC]">
-                    Schedule Pickup Slot
+                    Pickup &amp; Schedule
                   </h3>
                 </div>
                 {order.slottedDate && order.status !== 'waitlist' && (
                   <span className="font-mono text-xs tabular-nums text-[#38BDF8]">
-                    Current: {formatShortCalendarDate(order.slottedDate)}
+                    Scheduled: {formatShortCalendarDate(order.slottedDate)}
                   </span>
                 )}
               </div>
 
-              {/* Customer Requested Pickup Date (Editable + 1-Tap Try Requested Date) */}
-              <div className="mt-3 rounded-md border border-[#D97706]/40 bg-[#D97706]/8 p-2.5">
+              {/* Compact 2-Column Row: Pickup Date + Pickup Channel */}
+              <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label
+                    htmlFor="order-slotted-date"
+                    className="mb-1 block text-xs font-medium text-[#C9D1D9]"
+                  >
+                    Pickup Date
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      id="order-slotted-date"
+                      data-testid="order-slotted-date-input"
+                      type="date"
+                      value={slottedDate}
+                      onChange={(e) => {
+                        setSlottedDate(e.target.value);
+                        if (e.target.value && status === 'waitlist') {
+                          setStatus('slotted');
+                        }
+                      }}
+                      className="min-h-[38px] min-w-0 flex-1 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 font-mono text-xs text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+                    />
+                    {slottedDate && (
+                      <button
+                        type="button"
+                        data-testid="clear-slotted-date-btn"
+                        onClick={() => {
+                          setSlottedDate('');
+                          setStatus('waitlist');
+                        }}
+                        className="min-h-[38px] shrink-0 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 text-xs font-medium text-[#8B949E] hover:text-[#F0F6FC]"
+                      >
+                        Unassign
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="order-channel"
+                    className="mb-1 flex items-center justify-between gap-2 text-xs font-medium text-[#C9D1D9]"
+                  >
+                    <span>Pickup Channel</span>
+                    {selectedChannel && channelHasScheduleRestriction(selectedChannel) && (
+                      <span className="truncate font-mono text-[11px] text-[#8B949E]">
+                        {selectedChannel.allowedWeekdays.length > 0
+                          ? selectedChannel.allowedWeekdays
+                              .map((d) => ISO_WEEKDAY_LABELS[d])
+                              .join(' / ')
+                          : `${(selectedChannel.specificDates ?? []).length} event date(s)`}
+                      </span>
+                    )}
+                  </label>
+                  <select
+                    id="order-channel"
+                    data-testid="order-channel-select"
+                    value={pickupChannelId}
+                    onChange={(e) => setPickupChannelId(e.target.value)}
+                    className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+                  >
+                    <option value="">Unassigned / Any Day</option>
+                    {channels.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {order.freeTextPickup && (
+                <p className="mt-1.5 text-[11px] text-[#8B949E]">
+                  Form pickup text: {order.freeTextPickup}
+                </p>
+              )}
+
+              {/* Requested Pickup Date (Subtle when empty, amber when customer specified a date) */}
+              <div
+                className={`mt-3 rounded-md border p-2.5 ${
+                  requestedDate
+                    ? 'border-[#D97706]/40 bg-[#D97706]/8'
+                    : 'border-[#283340] bg-[#0F1419]/60'
+                }`}
+              >
                 <div className="flex items-end gap-2">
                   <div className="flex-1">
                     <label
                       htmlFor="order-requested-date"
-                      className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-[#FBBF24]"
+                      className={`mb-1 flex items-center gap-1.5 text-xs font-medium ${
+                        requestedDate ? 'font-semibold text-[#FBBF24]' : 'text-[#8B949E]'
+                      }`}
                     >
                       <Calendar className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
                       <span>Requested Pickup Date</span>
@@ -1321,7 +1555,7 @@ export function OrderDetailDrawer({
                       type="date"
                       value={requestedDate}
                       onChange={(e) => setRequestedDate(e.target.value)}
-                      className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 font-mono text-xs text-[#F0F6FC] focus:border-[#FBBF24] focus:outline-none"
+                      className="min-h-[36px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 font-mono text-xs text-[#F0F6FC] focus:border-[#FBBF24] focus:outline-none"
                     />
                   </div>
                   {requestedDate && (
@@ -1329,7 +1563,7 @@ export function OrderDetailDrawer({
                       type="button"
                       data-testid="clear-requested-date-btn"
                       onClick={() => setRequestedDate('')}
-                      className="min-h-[38px] shrink-0 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 text-xs font-medium text-[#8B949E] hover:text-[#F0F6FC]"
+                      className="min-h-[36px] shrink-0 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 text-xs font-medium text-[#8B949E] hover:text-[#F0F6FC]"
                     >
                       Clear
                     </button>
@@ -1341,7 +1575,7 @@ export function OrderDetailDrawer({
                     data-testid="slot-requested-date-btn"
                     disabled={isLocked || slottingTarget !== null}
                     onClick={() => void handleQuickSlot(requestedDate)}
-                    className={`mt-2 flex min-h-[38px] w-full items-center justify-between gap-2 rounded-md border px-3 py-1.5 text-left text-xs font-semibold transition-colors disabled:opacity-50 ${
+                    className={`mt-2 flex min-h-[36px] w-full items-center justify-between gap-2 rounded-md border px-3 py-1.5 text-left text-xs font-semibold transition-colors disabled:opacity-50 ${
                       requestedDateCandidate?.fit === 'fits'
                         ? 'border-[#22C55E]/60 bg-[#16A34A]/15 text-[#4ADE80] hover:bg-[#16A34A]/25'
                         : 'border-[#D97706]/60 bg-[#D97706]/15 text-[#FBBF24] hover:bg-[#D97706]/25'
@@ -1361,44 +1595,6 @@ export function OrderDetailDrawer({
                 )}
               </div>
 
-              {/* Pickup Channel selector right inside scheduler so channel days update live */}
-              <div className="mt-3">
-                <label
-                  htmlFor="order-channel"
-                  className="mb-1 flex items-center justify-between text-xs font-medium text-[#C9D1D9]"
-                >
-                  <span>Pickup Channel</span>
-                  {selectedChannel && channelHasScheduleRestriction(selectedChannel) && (
-                    <span className="font-mono text-[11px] text-[#8B949E]">
-                      {selectedChannel.allowedWeekdays.length > 0
-                        ? selectedChannel.allowedWeekdays
-                            .map((d) => ISO_WEEKDAY_LABELS[d])
-                            .join(' / ')
-                        : `${(selectedChannel.specificDates ?? []).length} event date(s)`}
-                    </span>
-                  )}
-                </label>
-                <select
-                  id="order-channel"
-                  data-testid="order-channel-select"
-                  value={pickupChannelId}
-                  onChange={(e) => setPickupChannelId(e.target.value)}
-                  className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
-                >
-                  <option value="">Unassigned / Any Day</option>
-                  {channels.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                    </option>
-                  ))}
-                </select>
-                {order.freeTextPickup && (
-                  <p className="mt-1 text-xs text-[#8B949E]">
-                    Form text: {order.freeTextPickup}
-                  </p>
-                )}
-              </div>
-
               {isLocked && (
                 <p className="mt-3 rounded-md border border-[#38BDF8]/40 bg-[#38BDF8]/10 px-3 py-2 text-xs text-[#BAE6FD]">
                   This order is locked. Unlock it below before rescheduling to a different date.
@@ -1407,8 +1603,8 @@ export function OrderDetailDrawer({
 
               {/* Primary 1-Tap Schedule First Available Action */}
               {validDraftItems.length === 0 ? (
-                <p className="mt-3 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2.5 text-xs text-[#8B949E]">
-                  Assign at least one Tracked Item below to see live stock availability and the earliest open date.
+                <p className="mt-3 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-xs text-[#8B949E]">
+                  Add at least one item above to see live availability and the earliest open date.
                 </p>
               ) : firstAvailable ? (
                 <button
@@ -1416,7 +1612,7 @@ export function OrderDetailDrawer({
                   data-testid="schedule-first-available-btn"
                   disabled={isLocked || slottingTarget !== null}
                   onClick={() => void handleQuickSlot(firstAvailable.date)}
-                  className="mt-3 flex min-h-[46px] w-full items-center justify-between gap-2 rounded-md bg-[#0EA5E9] px-3.5 py-2.5 text-left text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
+                  className="mt-3 flex min-h-[42px] w-full items-center justify-between gap-2 rounded-md bg-[#0EA5E9] px-3.5 py-2 text-left text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
                 >
                   <span className="flex min-w-0 items-center gap-2">
                     <Sparkles className="h-4 w-4 shrink-0" aria-hidden="true" />
@@ -1439,7 +1635,7 @@ export function OrderDetailDrawer({
               ) : (
                 <div
                   data-testid="no-open-slot-notice"
-                  className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[#D97706]/50 bg-[#D97706]/10 px-3 py-2.5 text-xs text-[#FBBF24]"
+                  className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border border-[#D97706]/50 bg-[#D97706]/10 px-3 py-2 text-xs text-[#FBBF24]"
                 >
                   <span>No dates fit above safety buffer in the next {weeks} weeks.</span>
                   <button
@@ -1453,193 +1649,223 @@ export function OrderDetailDrawer({
                 </div>
               )}
 
-              {/* Live Availability Date List */}
-              {candidateDates.length > 0 && (
-                <div className="mt-3">
-                  <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 text-xs">
-                    <span className="font-medium text-[#C9D1D9]">
-                      Tap a Date to Schedule ({visibleCandidates.length})
-                    </span>
-                    <div className="flex items-center gap-3">
-                      {validDraftItems.length > 0 && (
-                        <button
-                          type="button"
-                          data-testid="filter-open-dates-btn"
-                          onClick={() => setOnlyOpenDates((prev) => !prev)}
-                          className={`text-xs font-medium transition-colors ${
-                            onlyOpenDates
-                              ? 'text-[#4ADE80]'
-                              : 'text-[#8B949E] hover:text-[#E6EDF3]'
-                          }`}
-                        >
-                          {onlyOpenDates ? 'Showing open only' : 'Open only'}
-                        </button>
-                      )}
-                      {channelRestrictsWeekdays && (
-                        <button
-                          type="button"
-                          data-testid="toggle-off-channel-dates-btn"
-                          onClick={() => setShowOffChannel((prev) => !prev)}
-                          className={`text-xs font-medium transition-colors ${
-                            showOffChannel
-                              ? 'text-[#38BDF8]'
-                              : 'text-[#8B949E] hover:text-[#E6EDF3]'
-                          }`}
-                        >
-                          {showOffChannel ? 'Hide off-channel' : 'Show off-channel'}
-                        </button>
-                      )}
-                    </div>
-                  </div>
+              {/* Click-to-Expand Inline Date Availability Picker (Zero nested scroll) */}
+              {candidateDates.length > 0 && (() => {
+                const openCount = candidateDates.filter(
+                  (c) => (showOffChannel || c.channelAllowed) && c.fit === 'fits'
+                ).length;
+                const INITIAL_VISIBLE_LIMIT = 10;
+                const displayedCandidates = showAllAvailabilityDates
+                  ? visibleCandidates
+                  : visibleCandidates.slice(0, INITIAL_VISIBLE_LIMIT);
+                const hiddenCount = Math.max(0, visibleCandidates.length - displayedCandidates.length);
 
-                  {visibleCandidates.length === 0 ? (
-                    <div className="rounded-md border border-[#283340] bg-[#0F1419] px-3 py-4 text-center text-xs text-[#8B949E]">
-                      No matching dates in the current {weeks}-week window.{' '}
-                      {onlyOpenDates && (
-                        <button
-                          type="button"
-                          onClick={() => setOnlyOpenDates(false)}
-                          className="font-medium text-[#38BDF8] hover:underline"
-                        >
-                          Show all dates
-                        </button>
-                      )}
-                    </div>
-                  ) : (
-                    <div
-                      data-testid="slot-availability-list"
-                      className="max-h-60 divide-y divide-[#283340] overflow-y-auto rounded-md border border-[#283340] bg-[#0F1419]"
+                return (
+                  <div className="mt-3 border-t border-[#283340] pt-3">
+                    <button
+                      type="button"
+                      data-testid="toggle-availability-picker-btn"
+                      aria-expanded={availabilityExpanded}
+                      onClick={() => setAvailabilityExpanded((prev) => !prev)}
+                      className="flex min-h-[38px] w-full items-center justify-between gap-2 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-left text-xs transition-colors hover:border-[#38BDF8]/60"
                     >
-                      {visibleCandidates.map((cand) => {
-                        const style = fitStyle(cand.fit);
-                        const isBusy = slottingTarget === cand.date;
-                        return (
-                          <button
-                            key={cand.date}
-                            type="button"
-                            data-testid={`slot-candidate-${cand.date}`}
-                            disabled={isLocked || slottingTarget !== null}
-                            onClick={() => void handleQuickSlot(cand.date)}
-                            className={`flex min-h-[52px] w-full flex-col gap-1 px-3 py-2.5 text-left transition-colors disabled:opacity-50 ${
-                              cand.isCurrentSlot ? 'bg-[#38BDF8]/10' : style.rowHover
-                            }`}
-                          >
-                            <div className="flex w-full items-center justify-between gap-2">
-                              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
-                                <span className="font-semibold text-[#F0F6FC]">
-                                  {formatCandidateDateLabel(
-                                    cand.date,
-                                    cand.isoWeekday,
-                                    cand.isToday
-                                  )}
-                                </span>
-                                {cand.isFirstAvailable && (
-                                  <span className="font-semibold text-[#4ADE80]">Earliest</span>
-                                )}
-                                {cand.isCurrentSlot && (
-                                  <span className="font-semibold text-[#38BDF8]">Current</span>
-                                )}
-                                {cand.isRequestedDate && (
-                                  <span className="font-semibold text-[#FBBF24]">Requested</span>
-                                )}
-                                {!cand.channelAllowed && (
-                                  <span className="text-[#8B949E]">Off-channel</span>
-                                )}
-                              </div>
-                              <span
-                                className={`shrink-0 text-xs font-semibold ${style.text}`}
+                      <span className="flex min-w-0 items-center gap-2 font-medium text-[#E6EDF3]">
+                        <Calendar className="h-3.5 w-3.5 shrink-0 text-[#38BDF8]" aria-hidden="true" />
+                        <span className="truncate">
+                          {availabilityExpanded
+                            ? 'Hide Date Availability'
+                            : 'Pick From Available Dates'}
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-2 text-[11px] text-[#8B949E]">
+                        {validDraftItems.length > 0 ? (
+                          <span className={openCount > 0 ? 'text-[#4ADE80]' : 'text-[#FBBF24]'}>
+                            {openCount} open
+                          </span>
+                        ) : (
+                          <span>{visibleCandidates.length} dates</span>
+                        )}
+                        {availabilityExpanded ? (
+                          <ChevronUp className="h-4 w-4 text-[#8B949E]" aria-hidden="true" />
+                        ) : (
+                          <ChevronDown className="h-4 w-4 text-[#8B949E]" aria-hidden="true" />
+                        )}
+                      </span>
+                    </button>
+
+                    {availabilityExpanded && (
+                      <div className="mt-2.5 space-y-2">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                          <span className="text-[11px] text-[#8B949E]">
+                            Tap a date to slot ({visibleCandidates.length})
+                          </span>
+                          <div className="flex items-center gap-3">
+                            {validDraftItems.length > 0 && (
+                              <button
+                                type="button"
+                                data-testid="filter-open-dates-btn"
+                                onClick={() => setOnlyOpenDates((prev) => !prev)}
+                                className={`text-xs font-medium transition-colors ${
+                                  onlyOpenDates
+                                    ? 'text-[#4ADE80]'
+                                    : 'text-[#8B949E] hover:text-[#E6EDF3]'
+                                }`}
                               >
-                                {isBusy ? 'Slotting...' : style.label}
-                              </span>
+                                {onlyOpenDates ? 'Showing open only' : 'Open only'}
+                              </button>
+                            )}
+                            {channelRestrictsWeekdays && (
+                              <button
+                                type="button"
+                                data-testid="toggle-off-channel-dates-btn"
+                                onClick={() => setShowOffChannel((prev) => !prev)}
+                                className={`text-xs font-medium transition-colors ${
+                                  showOffChannel
+                                    ? 'text-[#38BDF8]'
+                                    : 'text-[#8B949E] hover:text-[#E6EDF3]'
+                                }`}
+                              >
+                                {showOffChannel ? 'Hide off-channel' : 'Show off-channel'}
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {visibleCandidates.length === 0 ? (
+                          <div className="rounded-md border border-[#283340] bg-[#0F1419] px-3 py-4 text-center text-xs text-[#8B949E]">
+                            No matching dates in the current {weeks}-week window.{' '}
+                            {onlyOpenDates && (
+                              <button
+                                type="button"
+                                onClick={() => setOnlyOpenDates(false)}
+                                className="font-medium text-[#38BDF8] hover:underline"
+                              >
+                                Show all dates
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <>
+                            <div
+                              data-testid="slot-availability-list"
+                              className="divide-y divide-[#283340] rounded-md border border-[#283340] bg-[#0F1419]"
+                            >
+                              {displayedCandidates.map((cand) => {
+                                const style = fitStyle(cand.fit);
+                                const isBusy = slottingTarget === cand.date;
+                                return (
+                                  <button
+                                    key={cand.date}
+                                    type="button"
+                                    data-testid={`slot-candidate-${cand.date}`}
+                                    disabled={isLocked || slottingTarget !== null}
+                                    onClick={() => void handleQuickSlot(cand.date)}
+                                    className={`flex min-h-[46px] w-full flex-col gap-0.5 px-3 py-2 text-left transition-colors disabled:opacity-50 ${
+                                      cand.isCurrentSlot ? 'bg-[#38BDF8]/10' : style.rowHover
+                                    }`}
+                                  >
+                                    <div className="flex w-full items-center justify-between gap-2">
+                                      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-xs">
+                                        <span className="font-semibold text-[#F0F6FC]">
+                                          {formatCandidateDateLabel(
+                                            cand.date,
+                                            cand.isoWeekday,
+                                            cand.isToday
+                                          )}
+                                        </span>
+                                        {cand.isFirstAvailable && (
+                                          <span className="font-semibold text-[#4ADE80]">
+                                            Earliest
+                                          </span>
+                                        )}
+                                        {cand.isCurrentSlot && (
+                                          <span className="font-semibold text-[#38BDF8]">
+                                            Current
+                                          </span>
+                                        )}
+                                        {cand.isRequestedDate && (
+                                          <span className="font-semibold text-[#FBBF24]">
+                                            Requested
+                                          </span>
+                                        )}
+                                        {!cand.channelAllowed && (
+                                          <span className="text-[#8B949E]">Off-channel</span>
+                                        )}
+                                      </div>
+                                      <span
+                                        className={`shrink-0 text-xs font-semibold ${style.text}`}
+                                      >
+                                        {isBusy ? 'Slotting...' : style.label}
+                                      </span>
+                                    </div>
+
+                                    {cand.items.length > 0 && (
+                                      <div className="flex flex-col gap-0.5 font-mono text-[11px] tabular-nums text-[#C9D1D9]">
+                                        {cand.items.map((snap) => (
+                                          <div
+                                            key={snap.trackedItemId}
+                                            className="flex flex-wrap items-center justify-between gap-x-2"
+                                          >
+                                            <span className="truncate text-[#8B949E]">
+                                              {cand.items.length > 1 ? `${snap.itemName}: ` : ''}
+                                              {formatQty(snap.currentOpen)} open →{' '}
+                                              <span
+                                                className={
+                                                  snap.minDownstreamEnding < 0
+                                                    ? 'font-semibold text-[#F87171]'
+                                                    : snap.minDownstreamOpen < 0
+                                                      ? 'font-semibold text-[#FBBF24]'
+                                                      : 'font-semibold text-[#4ADE80]'
+                                                }
+                                              >
+                                                {snap.afterEnding < 0
+                                                  ? `${formatQty(snap.afterEnding)} short`
+                                                  : snap.afterOpen < 0
+                                                    ? `${formatQty(snap.afterOpen)} buffer`
+                                                    : `${formatQty(snap.afterOpen)} left`}
+                                              </span>
+                                            </span>
+                                            {snap.constrainingDate && (
+                                              <span className="text-[10px] text-[#FBBF24]">
+                                                dips {formatShortCalendarDate(snap.constrainingDate)}
+                                              </span>
+                                            )}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </button>
+                                );
+                              })}
                             </div>
 
-                            {cand.items.length > 0 && (
-                              <div className="flex flex-col gap-0.5 font-mono text-[11px] tabular-nums text-[#C9D1D9]">
-                                {cand.items.map((snap) => (
-                                  <div
-                                    key={snap.trackedItemId}
-                                    className="flex flex-wrap items-center justify-between gap-x-2"
-                                  >
-                                    <span className="truncate text-[#8B949E]">
-                                      {cand.items.length > 1 ? `${snap.itemName}: ` : ''}
-                                      {formatQty(snap.currentOpen)} open →{' '}
-                                      <span
-                                        className={
-                                          snap.minDownstreamEnding < 0
-                                            ? 'font-semibold text-[#F87171]'
-                                            : snap.minDownstreamOpen < 0
-                                              ? 'font-semibold text-[#FBBF24]'
-                                              : 'font-semibold text-[#4ADE80]'
-                                        }
-                                      >
-                                        {snap.afterEnding < 0
-                                          ? `${formatQty(snap.afterEnding)} short`
-                                          : snap.afterOpen < 0
-                                            ? `${formatQty(snap.afterOpen)} buffer`
-                                            : `${formatQty(snap.afterOpen)} left`}
-                                      </span>
-                                    </span>
-                                    {snap.constrainingDate && (
-                                      <span className="text-[10px] text-[#FBBF24]">
-                                        dips {formatShortCalendarDate(snap.constrainingDate)}
-                                      </span>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Secondary manual date input for custom dates outside the current window */}
-              <div className="mt-3 flex items-end gap-2 border-t border-[#283340] pt-3">
-                <div className="flex-1">
-                  <label
-                    htmlFor="order-slotted-date"
-                    className="mb-1 block text-[11px] font-medium text-[#8B949E]"
-                  >
-                    Custom Pickup Date (Manual Entry)
-                  </label>
-                  <input
-                    id="order-slotted-date"
-                    data-testid="order-slotted-date-input"
-                    type="date"
-                    value={slottedDate}
-                    onChange={(e) => {
-                      setSlottedDate(e.target.value);
-                      if (e.target.value && status === 'waitlist') {
-                        setStatus('slotted');
-                      }
-                    }}
-                    className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 font-mono text-xs text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
-                  />
-                </div>
-                {slottedDate && (
-                  <button
-                    type="button"
-                    data-testid="clear-slotted-date-btn"
-                    onClick={() => {
-                      setSlottedDate('');
-                      setStatus('waitlist');
-                    }}
-                    className="min-h-[38px] shrink-0 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#8B949E] hover:text-[#F0F6FC]"
-                  >
-                    Unassign
-                  </button>
-                )}
-              </div>
+                            {(hiddenCount > 0 || showAllAvailabilityDates) &&
+                              visibleCandidates.length > INITIAL_VISIBLE_LIMIT && (
+                                <button
+                                  type="button"
+                                  data-testid="show-all-availability-dates-btn"
+                                  onClick={() => setShowAllAvailabilityDates((prev) => !prev)}
+                                  className="w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-center text-xs font-medium text-[#38BDF8] hover:border-[#38BDF8]/60"
+                                >
+                                  {showAllAvailabilityDates
+                                    ? 'Show fewer dates'
+                                    : `Show all ${visibleCandidates.length} dates (+${hiddenCount} more)`}
+                                </button>
+                              )}
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </section>
           )}
 
-          {/* Status Pipeline + Pre-Approve Trigger */}
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <label className="text-xs font-medium text-[#8B949E]">Order Status</label>
+          {/* 3. Status Pipeline + Pre-Approve Trigger */}
+          <section className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-semibold text-[#C9D1D9]">Status</label>
               <button
                 type="button"
                 data-testid="order-lock-toggle-btn"
@@ -1676,83 +1902,34 @@ export function OrderDetailDrawer({
                 type="button"
                 data-testid="order-pre-approve-btn"
                 onClick={() => void onPreApprove(order.id)}
-                className="mt-3 min-h-[40px] w-full rounded-md border border-[#22C55E]/60 bg-[#16A34A]/15 px-4 py-2 text-sm font-semibold text-[#4ADE80] transition-colors hover:bg-[#16A34A]/25"
+                className="min-h-[40px] w-full rounded-md border border-[#22C55E]/60 bg-[#16A34A]/15 px-4 py-2 text-sm font-semibold text-[#4ADE80] transition-colors hover:bg-[#16A34A]/25"
               >
                 Pre-Approve &amp; Open Copy Message
               </button>
             )}
-          </div>
+          </section>
 
-          {/* Assigned Tracked Items (kept right under Status so items can be adjusted quickly to re-check availability) */}
-          <div className="border-t border-[#283340] pt-4">
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-xs font-semibold text-[#F0F6FC]">Assigned Tracked Items</span>
-              <button
-                type="button"
-                data-testid="order-add-item-line-btn"
-                onClick={addItemLine}
-                disabled={items.length === 0}
-                className="inline-flex items-center gap-1 text-xs font-medium text-[#38BDF8] hover:underline disabled:opacity-40"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                Add Item
-              </button>
+          {/* 4. General Notes (Strictly internal notes, never duplicating Odoo order details) */}
+          <section className="border-t border-[#283340] pt-4">
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <label htmlFor="order-notes" className="text-xs font-semibold text-[#C9D1D9]">
+                Notes
+              </label>
+              <span className="text-[11px] text-[#8B949E]">General farm notes</span>
             </div>
-            {orderItems.length === 0 ? (
-              <p className="text-xs text-[#8B949E]">
-                No Tracked Items assigned yet. Assign items here or ignore if unrelated.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {orderItems.map((line, idx) => (
-                  <div key={line.rowKey} className="flex items-center gap-2">
-                    <select
-                      data-testid={`order-item-select-${idx}`}
-                      value={line.trackedItemId}
-                      onChange={(e) => {
-                        const next = [...orderItems];
-                        next[idx] = { ...line, trackedItemId: Number(e.target.value) };
-                        setOrderItems(next);
-                      }}
-                      className="min-h-[38px] flex-1 rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-sm text-[#F0F6FC]"
-                    >
-                      {items.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name} ({item.unitLabel})
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      data-testid={`order-item-qty-${idx}`}
-                      type="text"
-                      inputMode="decimal"
-                      placeholder="Qty"
-                      value={line.qtyText}
-                      onChange={(e) => {
-                        const raw = e.target.value;
-                        if (raw !== '' && !/^\d*\.?\d*$/.test(raw)) return;
-                        const next = [...orderItems];
-                        next[idx] = { ...line, qtyText: raw };
-                        setOrderItems(next);
-                      }}
-                      className="min-h-[38px] w-24 rounded-md border border-[#283340] bg-[#0F1419] px-2.5 py-1.5 font-mono text-sm tabular-nums text-[#F0F6FC] placeholder:text-[#6E7681]"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setOrderItems(orderItems.filter((_, i) => i !== idx))}
-                      className="flex h-9 w-9 items-center justify-center rounded-md text-[#8B949E] hover:bg-[#1E2730] hover:text-[#F87171]"
-                      aria-label="Remove item line"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+            <textarea
+              id="order-notes"
+              data-testid="order-notes-input"
+              rows={2}
+              placeholder="Add general notes for this order..."
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              className="w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] placeholder:text-[#6E7681] focus:border-[#38BDF8] focus:outline-none"
+            />
+          </section>
 
-          {/* Customer Info */}
-          <div className="grid grid-cols-1 gap-4 border-t border-[#283340] pt-4 sm:grid-cols-2">
+          {/* 5. Customer Contact Details */}
+          <section className="grid grid-cols-1 gap-3 border-t border-[#283340] pt-4 sm:grid-cols-2">
             <div className="sm:col-span-2">
               <CustomerAutocompleteInput
                 id="order-customer-name"
@@ -1776,7 +1953,7 @@ export function OrderDetailDrawer({
             </div>
 
             <div>
-              <label htmlFor="order-email" className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
+              <label htmlFor="order-email" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
                 Email
               </label>
               <input
@@ -1785,12 +1962,12 @@ export function OrderDetailDrawer({
                 type="email"
                 value={customerEmail}
                 onChange={(e) => setCustomerEmail(e.target.value)}
-                className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+                className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
               />
             </div>
 
             <div>
-              <label htmlFor="order-phone" className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
+              <label htmlFor="order-phone" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
                 Phone
               </label>
               <input
@@ -1799,30 +1976,15 @@ export function OrderDetailDrawer({
                 type="text"
                 value={customerPhone}
                 onChange={(e) => setCustomerPhone(e.target.value)}
-                className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
+                className="min-h-[38px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-1.5 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
               />
             </div>
-          </div>
+          </section>
 
-          {/* Notes */}
-          <div>
-            <label htmlFor="order-notes" className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
-              Notes
-            </label>
-            <textarea
-              id="order-notes"
-              data-testid="order-notes-input"
-              rows={3}
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              className="w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-sm text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
-            />
-          </div>
-
-          {/* Raw Odoo Quotation Payload & Lines */}
+          {/* 6. Raw Odoo Quotation Payload & Lines */}
           {(order.odooRawNotes || order.odooRawLines.length > 0) && (
             <div className="border-t border-[#283340] pt-4" data-testid="order-odoo-raw-section">
-              <h3 className="text-xs font-semibold text-[#F0F6FC]">Odoo Order Details</h3>
+              <h3 className="text-xs font-semibold text-[#C9D1D9]">Odoo Order Details</h3>
               {order.odooRawLines.length > 0 && (
                 <ul className="mt-2 space-y-1 text-xs text-[#C9D1D9]">
                   {order.odooRawLines.map((rawLine, idx) => (

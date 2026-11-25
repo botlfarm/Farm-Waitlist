@@ -47,6 +47,7 @@ export default function App() {
 
   const [weekdayPrompt, setWeekdayPrompt] = useState<WeekdayConfirmPrompt | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [publishingAvailability, setPublishingAvailability] = useState(false);
   const [autoSlotting, setAutoSlotting] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
 
@@ -140,7 +141,7 @@ export default function App() {
       showToast(
         `Odoo sync complete: ${syncLog.importedCount} imported, ${syncLog.updatedCount} updated${
           syncLog.flaggedMissingCount > 0
-            ? `, ${syncLog.flaggedMissingCount} flagged for confirmation`
+            ? `, ${syncLog.flaggedMissingCount} cancelled/removed in Odoo`
             : ''
         }`
       );
@@ -148,6 +149,29 @@ export default function App() {
       showToast(err instanceof Error ? err.message : 'Odoo sync failed', 'error');
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const handlePublishAvailability = async () => {
+    setPublishingAvailability(true);
+    try {
+      const res = await api.publishSnippetToGithub({ force: true });
+      await refreshWorkspace();
+      const isPaused = workspace?.settings.publicSnippetEnabled === false;
+      showToast(
+        res.published
+          ? isPaused
+            ? 'Published paused waitlist notice to your website'
+            : 'Published live availability to your website'
+          : res.reason || 'Website availability is already up to date'
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : 'Failed to publish availability to website',
+        'error'
+      );
+    } finally {
+      setPublishingAvailability(false);
     }
   };
 
@@ -237,6 +261,8 @@ export default function App() {
               }}
               onSyncNow={handleSyncNow}
               syncing={syncing}
+              onPublishAvailability={handlePublishAvailability}
+              publishingAvailability={publishingAvailability}
               onAutoSlotAsap={handleAutoSlotAsap}
               autoSlotting={autoSlotting}
               onUndo={handleUndo}
@@ -257,9 +283,34 @@ export default function App() {
                 await refreshWorkspace();
                 showToast(
                   action === 'confirm'
-                    ? 'Order confirmed'
-                    : 'Cleared missing quotation flag'
+                    ? 'Order marked confirmed'
+                    : action === 'ignore'
+                      ? 'Cancelled quotation removed from schedule (Undo available)'
+                      : 'Order kept active & missing flag cleared'
                 );
+              }}
+              onReplaceOrder={async (missingOrderId, replacementOrderId, keepDate) => {
+                try {
+                  const result = await api.mergeOrders(
+                    missingOrderId,
+                    replacementOrderId,
+                    'use_source',
+                    keepDate
+                  );
+                  await refreshWorkspace();
+                  const activeRef = result.order?.odooQuotationName || 'replacement order';
+                  const keptDate = result.order?.slottedDate;
+                  showToast(
+                    keptDate
+                      ? `Linked to ${activeRef} on ${keptDate} — chain preserved (Undo available)`
+                      : `Linked to ${activeRef} — chain preserved (Undo available)`
+                  );
+                } catch (err) {
+                  showToast(
+                    err instanceof Error ? err.message : 'Failed to replace with new quotation',
+                    'error'
+                  );
+                }
               }}
               onReleaseHold={async (orderId) => {
                 await api.releaseHold(orderId);
@@ -447,7 +498,16 @@ export default function App() {
             onReconcile={async (orderId, action) => {
               await api.reconcileOrder(orderId, action);
               await refreshWorkspace();
-              showToast(action === 'confirm' ? 'Order confirmed' : 'Reconciliation flag cleared');
+              if (action === 'ignore') {
+                setSelectedOrderId(null);
+              }
+              showToast(
+                action === 'confirm'
+                  ? 'Order marked confirmed'
+                  : action === 'ignore'
+                    ? 'Cancelled quotation removed from schedule (Undo available)'
+                    : 'Order kept active & missing flag cleared'
+              );
             }}
             onMergeOrders={async (targetOrderId, sourceOrderId, itemStrategy, keepDate) => {
               try {

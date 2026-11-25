@@ -60,7 +60,7 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const mgr = new DatabaseManager(dbPath, backupDir);
     const res = await mgr.init('America/New_York');
 
-    expect(res.appliedVersions).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(res.appliedVersions).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(res.preMigrateBackup).toBeNull();
     expect(listTrackedItems(mgr.db)).toHaveLength(0);
     expect(listPickupChannels(mgr.db)).toHaveLength(0);
@@ -78,15 +78,15 @@ describe('SQLite Blank-Slate Init, Startup Migrations & Backup/Restore', () => {
     const extendedMigrations: Migration[] = [
       ...MIGRATIONS,
       {
-        version: 8,
+        version: 9,
         name: 'add_test_marker_table',
-        sql: 'CREATE TABLE IF NOT EXISTS migration_v8_test (id INTEGER PRIMARY KEY);',
+        sql: 'CREATE TABLE IF NOT EXISTS migration_v9_test (id INTEGER PRIMARY KEY);',
       },
     ];
 
     const mgr2 = new DatabaseManager(dbPath, backupDir, extendedMigrations);
     const res = await mgr2.init('America/New_York');
-    expect(res.appliedVersions).toEqual([8]);
+    expect(res.appliedVersions).toEqual([9]);
     expect(res.preMigrateBackup).toMatch(/^pre-migrate-.*\.db$/);
     expect(fs.existsSync(path.join(backupDir, res.preMigrateBackup!))).toBe(true);
     mgr2.close();

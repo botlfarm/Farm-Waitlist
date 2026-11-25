@@ -349,7 +349,7 @@ export const api = {
   restoreIgnoredOrder: (id: number) =>
     requestJson<OrderRecord>(`./api/orders/${id}/restore-ignored`, { method: 'POST' }),
 
-  reconcileOrder: (id: number, action: 'confirm' | 'keep') =>
+  reconcileOrder: (id: number, action: 'confirm' | 'keep' | 'ignore') =>
     requestJson<OrderRecord>(`./api/orders/${id}/reconcile`, {
       method: 'POST',
       body: JSON.stringify({ action }),
@@ -436,6 +436,7 @@ export const api = {
       settings: AppSettings;
       odooStatus: OdooConnectionStatus;
       githubPublishStatus?: GithubPublishStatus;
+      removedIgnoredOrdersCount?: number;
     }>('./api/settings', {
       method: 'PUT',
       body: JSON.stringify(patch),

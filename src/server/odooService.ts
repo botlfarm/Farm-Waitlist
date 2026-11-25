@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 import {
   DEFAULT_TIMEZONE,
+  formatDateKeyInTimezone,
+  isDateInFullIgnoredRanges,
   isDateInIgnoredRanges,
   localDateStartToOdooUtc,
   odooUtcToLocalDateKey,
@@ -8,6 +10,7 @@ import {
 } from '../shared/timezone';
 import type {
   AppSettings,
+  IgnoredDateRange,
   OrderItemLine,
   OrderTimingType,
   PickupChannel,
@@ -15,6 +18,7 @@ import type {
   SyncLog,
   TrackedItem,
 } from '../shared/types';
+import { captureCheckpoint } from './checkpointService';
 import { normalizeOdooBaseUrl, type OdooCredentials } from './config';
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -697,12 +701,16 @@ export async function syncOdooQuotations(params: {
   };
 
   try {
+    // 0. If any ignored date range is set to "Ignore completely", purge matching local Odoo orders first
+    purgeOdooOrdersInFullIgnoredRanges(db, settings.odooIgnoredDateRanges, timezone);
+
     // Load existing local Odoo orders (both active and ignored)
     const localOdooRows = db
       .prepare(
         `SELECT id, status, timing_type, requested_date, slotted_date, is_locked,
                 customer_name, customer_name_overridden,
-                odoo_quotation_id, odoo_partner_id, odoo_missing_flagged
+                odoo_quotation_id, odoo_partner_id, odoo_missing_flagged,
+                odoo_missing_dismissed
          FROM orders
          WHERE source = 'odoo' AND odoo_quotation_id IS NOT NULL`
       )
@@ -718,6 +726,7 @@ export async function syncOdooQuotations(params: {
       odoo_quotation_id: number;
       odoo_partner_id: number | null;
       odoo_missing_flagged: number;
+      odoo_missing_dismissed: number;
     }>;
 
     const localByOdooId = new Map(localOdooRows.map((r) => [r.odoo_quotation_id, r]));
@@ -772,14 +781,11 @@ export async function syncOdooQuotations(params: {
 
     const allFetchedOrders = Array.from(fetchedById.values());
 
-    // Filter out brand-new orders that are locally ignored, already merged into another order, or inside ignored date ranges
+    // Filter out orders that are locally ignored, already merged into another order, or inside ignored date ranges
+    const fullIgnoredExistingIds: number[] = [];
     const eligibleQuotations = allFetchedOrders.filter((q) => {
       if (mergedOdooIdSet.has(q.id)) {
         return false;
-      }
-      const existing = localByOdooId.get(q.id);
-      if (existing) {
-        return existing.status !== 'ignored';
       }
       const isConfirmedInOdoo = q.state === 'sale' || q.state === 'done';
       const anchorTimestamp =
@@ -787,11 +793,41 @@ export async function syncOdooQuotations(params: {
           ? q.date_order
           : q.create_date;
       const localOrderDate = odooUtcToLocalDateKey(anchorTimestamp, timezone);
-      if (isDateInIgnoredRanges(localOrderDate, settings.odooIgnoredDateRanges)) {
+      const localCreateDate = odooUtcToLocalDateKey(q.create_date, timezone);
+
+      const existing = localByOdooId.get(q.id);
+      if (existing) {
+        if (
+          isDateInFullIgnoredRanges(localOrderDate, settings.odooIgnoredDateRanges) ||
+          isDateInFullIgnoredRanges(localCreateDate, settings.odooIgnoredDateRanges)
+        ) {
+          fullIgnoredExistingIds.push(existing.id);
+          return false;
+        }
+        return existing.status !== 'ignored';
+      }
+      if (
+        isDateInIgnoredRanges(localOrderDate, settings.odooIgnoredDateRanges) ||
+        isDateInIgnoredRanges(localCreateDate, settings.odooIgnoredDateRanges)
+      ) {
         return false;
       }
       return true;
     });
+
+    if (fullIgnoredExistingIds.length > 0) {
+      captureCheckpoint(
+        db,
+        `Ignore ${fullIgnoredExistingIds.length} Odoo order(s) in off-season range`
+      );
+      const delStmt = db.prepare('DELETE FROM orders WHERE id = ?');
+      const delTx = db.transaction(() => {
+        for (const id of fullIgnoredExistingIds) {
+          delStmt.run(id);
+        }
+      });
+      delTx();
+    }
 
     const eligibleIds = eligibleQuotations.map((q) => q.id);
 
@@ -971,7 +1007,7 @@ export async function syncOdooQuotations(params: {
               partnerPhone,
               signals.pickupChannelId,
               signals.freeTextPickup,
-              noteText || null,
+              null,
               q.id,
               q.name || `SO-${q.id}`,
               partnerId,
@@ -1031,6 +1067,7 @@ export async function syncOdooQuotations(params: {
                odoo_raw_notes = ?,
                odoo_raw_lines_json = ?,
                odoo_missing_flagged = 0,
+               odoo_missing_dismissed = 0,
                odoo_suggested_confirmed_json = NULL,
                odoo_updated_after_slot = CASE WHEN ? = 1 THEN 1 ELSE odoo_updated_after_slot END,
                updated_at = ?
@@ -1115,6 +1152,7 @@ export async function syncOdooQuotations(params: {
       (r) =>
         r.status !== 'ignored' &&
         r.status !== 'confirmed' &&
+        !r.odoo_missing_dismissed &&
         !fetchedById.has(r.odoo_quotation_id)
     );
 
@@ -1350,3 +1388,69 @@ export async function syncOdooCustomers(params: {
     syncedCount,
   };
 }
+
+/**
+ * Removes already-imported local Odoo orders whose local Odoo creation date falls
+ * within any ignored date range configured with `ignoreExisting: true`.
+ * Captures an automatic Undo checkpoint before deleting so the cleanup is 1-click reversible.
+ */
+export function purgeOdooOrdersInFullIgnoredRanges(
+  db: Database.Database,
+  ranges: IgnoredDateRange[],
+  timezone: string = DEFAULT_TIMEZONE
+): { removedCount: number; affectedCalendar: boolean } {
+  const fullRanges = ranges.filter(
+    (r) => Boolean(r.ignoreExisting) && Boolean(r.startDate) && Boolean(r.endDate)
+  );
+  if (fullRanges.length === 0) {
+    return { removedCount: 0, affectedCalendar: false };
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT id, status, slotted_date, odoo_created_at_local, created_at
+       FROM orders
+       WHERE source = 'odoo'`
+    )
+    .all() as Array<{
+    id: number;
+    status: string;
+    slotted_date: string | null;
+    odoo_created_at_local: string | null;
+    created_at: string;
+  }>;
+
+  const matching = rows.filter((row) => {
+    const rawLocal = (row.odoo_created_at_local || '').trim();
+    const localDateYmd = /^\d{4}-\d{2}-\d{2}/.test(rawLocal)
+      ? rawLocal.slice(0, 10)
+      : formatDateKeyInTimezone(new Date(row.created_at), timezone);
+    return isDateInFullIgnoredRanges(localDateYmd, fullRanges);
+  });
+
+  if (matching.length === 0) {
+    return { removedCount: 0, affectedCalendar: false };
+  }
+
+  const affectedCalendar = matching.some(
+    (row) =>
+      Boolean(row.slotted_date) &&
+      (row.status === 'slotted' || row.status === 'pre_approved' || row.status === 'confirmed')
+  );
+
+  captureCheckpoint(
+    db,
+    `Ignore ${matching.length} Odoo order${matching.length === 1 ? '' : 's'} in off-season range`
+  );
+
+  const deleteStmt = db.prepare('DELETE FROM orders WHERE id = ?');
+  const tx = db.transaction(() => {
+    for (const row of matching) {
+      deleteStmt.run(row.id);
+    }
+  });
+  tx();
+
+  return { removedCount: matching.length, affectedCalendar };
+}
+

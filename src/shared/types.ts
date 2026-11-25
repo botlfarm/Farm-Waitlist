@@ -41,6 +41,8 @@ export interface IgnoredDateRange {
   startDate: string; // YYYY-MM-DD (local timezone)
   endDate: string;   // YYYY-MM-DD (local timezone)
   label?: string;
+  /** When true, ignores ALL Odoo orders in this range (skips new imports AND removes already-imported orders). */
+  ignoreExisting?: boolean;
 }
 
 export interface AppSettings {

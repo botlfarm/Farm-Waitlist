@@ -211,18 +211,12 @@ export function prependReleaseSection(existingChangelog, version, dateYmd, secti
 }
 
 /**
- * Promotes `UNRELEASED.md` into root `CHANGELOG.md` and `farm-waitlist/CHANGELOG.md`,
- * syncs `package.json`, and resets `UNRELEASED.md`.
- *
- * When `autoBump: true` (used in CI on pushes to `main`), if the version in
- * `farm-waitlist/config.yaml` is already tagged in git OR already present in `CHANGELOG.md`,
- * the patch version is automatically incremented (e.g. `1.0.1` -> `1.0.2`) and written back
- * to `farm-waitlist/config.yaml` so Home Assistant always detects an updatable release.
- * If the author already manually bumped `config.yaml` (e.g. to `1.1.0`), that version is kept as-is.
+ * Resolves the target release version without modifying any files on disk.
+ * Used in CI before Docker builds so image tags match the final bumped version
+ * while deferring changelog/version file edits until after all builds succeed.
  */
-export function releaseChangelog(options = {}) {
+export function resolveNextReleaseVersion(options = {}) {
   const rootDir = options.rootDir ?? process.cwd();
-  const dateYmd = options.dateYmd ?? new Date().toISOString().slice(0, 10);
   const autoBump = Boolean(options.autoBump);
   const hasTag =
     typeof options.hasTag === 'function'
@@ -231,9 +225,6 @@ export function releaseChangelog(options = {}) {
 
   const configPath = path.join(rootDir, 'farm-waitlist', 'config.yaml');
   const rootChangelogPath = path.join(rootDir, 'CHANGELOG.md');
-  const addonChangelogPath = path.join(rootDir, 'farm-waitlist', 'CHANGELOG.md');
-  const unreleasedPath = path.join(rootDir, 'UNRELEASED.md');
-  const packageJsonPath = path.join(rootDir, 'package.json');
 
   if (!fs.existsSync(configPath)) {
     throw new Error(`Missing Home Assistant add-on config at ${configPath}`);
@@ -249,25 +240,62 @@ export function releaseChangelog(options = {}) {
     : '';
 
   const isAlreadyReleased = (ver) => changelogHasVersion(existingChangelog, ver) || hasTag(ver);
+  const alreadyReleased = isAlreadyReleased(version);
   let autoBumped = false;
 
-  if (isAlreadyReleased(version)) {
-    if (!autoBump) {
-      if (
-        !fs.existsSync(addonChangelogPath) ||
-        fs.readFileSync(addonChangelogPath, 'utf8') !== existingChangelog
-      ) {
-        fs.writeFileSync(addonChangelogPath, existingChangelog, 'utf8');
-      }
-      return { released: false, autoBumped: false, version, notes: '' };
-    }
-
+  if (alreadyReleased && autoBump) {
     let guard = 0;
     while (isAlreadyReleased(version) && guard < 100) {
       version = bumpPatchVersion(version);
       guard += 1;
     }
     autoBumped = true;
+  }
+
+  return {
+    version,
+    autoBumped,
+    alreadyReleased,
+    configYamlRaw,
+    existingChangelog,
+  };
+}
+
+/**
+ * Promotes `UNRELEASED.md` into root `CHANGELOG.md` and `farm-waitlist/CHANGELOG.md`,
+ * syncs `package.json`, and resets `UNRELEASED.md`.
+ *
+ * When `autoBump: true` (used in CI on pushes to `main`), if the version in
+ * `farm-waitlist/config.yaml` is already tagged in git OR already present in `CHANGELOG.md`,
+ * the patch version is automatically incremented (e.g. `1.0.1` -> `1.0.2`) and written back
+ * to `farm-waitlist/config.yaml` so Home Assistant always detects an updatable release.
+ * If the author already manually bumped `config.yaml` (e.g. to `1.1.0`), that version is kept as-is.
+ */
+export function releaseChangelog(options = {}) {
+  const rootDir = options.rootDir ?? process.cwd();
+  const dateYmd = options.dateYmd ?? new Date().toISOString().slice(0, 10);
+  const autoBump = Boolean(options.autoBump);
+
+  const configPath = path.join(rootDir, 'farm-waitlist', 'config.yaml');
+  const rootChangelogPath = path.join(rootDir, 'CHANGELOG.md');
+  const addonChangelogPath = path.join(rootDir, 'farm-waitlist', 'CHANGELOG.md');
+  const unreleasedPath = path.join(rootDir, 'UNRELEASED.md');
+  const packageJsonPath = path.join(rootDir, 'package.json');
+
+  const resolved = resolveNextReleaseVersion(options);
+  const { version, autoBumped, alreadyReleased, configYamlRaw, existingChangelog } = resolved;
+
+  if (alreadyReleased && !autoBump) {
+    if (
+      !fs.existsSync(addonChangelogPath) ||
+      fs.readFileSync(addonChangelogPath, 'utf8') !== existingChangelog
+    ) {
+      fs.writeFileSync(addonChangelogPath, existingChangelog, 'utf8');
+    }
+    return { released: false, autoBumped: false, version, notes: '' };
+  }
+
+  if (autoBumped) {
     fs.writeFileSync(configPath, writeAddonVersionText(configYamlRaw, version), 'utf8');
   }
 
@@ -315,22 +343,32 @@ if (isDirectRun) {
   const args = process.argv.slice(2);
   let notesOutPath;
   let autoBump = false;
+  let resolveOnly = false;
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === '--auto-bump') {
       autoBump = true;
+    } else if (args[i] === '--resolve-version') {
+      resolveOnly = true;
     } else if (args[i] === '--notes-out' && args[i + 1]) {
       notesOutPath = args[i + 1];
       i += 1;
     }
   }
-  const result = releaseChangelog({ notesOutPath, autoBump });
-  if (result.released) {
-    console.log(
-      `${result.autoBumped ? 'Auto-bumped add-on version and promoted' : 'Promoted'} UNRELEASED.md into CHANGELOG.md and farm-waitlist/CHANGELOG.md for v${result.version}`
-    );
+
+  if (resolveOnly) {
+    const { version } = resolveNextReleaseVersion({ autoBump });
+    process.stdout.write(`${version}\n`);
   } else {
-    console.log(
-      `v${result.version} is already in CHANGELOG.md — kept UNRELEASED.md for the next version bump.`
-    );
+    const result = releaseChangelog({ notesOutPath, autoBump });
+    if (result.released) {
+      console.log(
+        `${result.autoBumped ? 'Auto-bumped add-on version and promoted' : 'Promoted'} UNRELEASED.md into CHANGELOG.md and farm-waitlist/CHANGELOG.md for v${result.version}`
+      );
+    } else {
+      console.log(
+        `v${result.version} is already in CHANGELOG.md — kept UNRELEASED.md for the next version bump.`
+      );
+    }
   }
 }
+

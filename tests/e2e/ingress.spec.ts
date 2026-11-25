@@ -265,6 +265,7 @@ test.describe('Home Assistant Ingress E2E Smoke Suite', () => {
     await mobileWaitlistCard.click();
 
     await expect(page.getByTestId('order-scheduler-panel')).toBeVisible();
+    await page.getByTestId('toggle-availability-picker-btn').click();
     await expect(page.getByTestId('slot-availability-list')).toBeVisible();
     // Monday starts at 0 stock (afternoon harvest rolls to Tuesday), so Monday is Short and Tuesday is First Available
     await expect(page.getByTestId('slot-candidate-2026-11-23')).toContainText('Short');

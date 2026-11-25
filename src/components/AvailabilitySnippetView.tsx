@@ -1405,7 +1405,7 @@ export function AvailabilitySnippetView({
               className="inline-flex min-h-[40px] items-center gap-1.5 rounded-md border border-[#38BDF8]/60 bg-[#0EA5E9]/15 px-4 py-2 text-xs font-semibold text-[#38BDF8] hover:bg-[#0EA5E9]/25 disabled:opacity-45"
             >
               <CloudUpload className="h-4 w-4" />
-              {publishingGithub ? 'Publishing...' : 'Publish Now'}
+              {publishingGithub ? 'Publishing...' : 'Publish to Website'}
             </button>
 
             <button
@@ -1450,7 +1450,7 @@ export function AvailabilitySnippetView({
             </li>
             <li>
               Enter <code className="font-mono">owner/repo</code> above, click{' '}
-              <strong className="text-[#F0F6FC]">Publish Now</strong>, then click{' '}
+              <strong className="text-[#F0F6FC]">Publish to Website</strong>, then click{' '}
               <strong className="text-[#F0F6FC]">Copy Live Embed Code</strong> and paste it once into
               an Odoo Website <em>Embed Code</em> block. Your website will automatically show fresh
               availability whenever you publish or on your Auto Sync interval.

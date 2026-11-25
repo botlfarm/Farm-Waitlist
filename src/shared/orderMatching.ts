@@ -1,0 +1,234 @@
+import type { OrderItemLine, OrderRecord } from './types';
+
+export function isStandingRecurringOrder(order: OrderRecord): boolean {
+  return order.source === 'standing' || order.standingOrderId !== null;
+}
+
+function itemsMatchSignature(items: OrderItemLine[]): string {
+  return [...items]
+    .filter((i) => i.quantity > 0)
+    .sort((a, b) => a.trackedItemId - b.trackedItemId)
+    .map((i) => `${i.trackedItemId}:${i.quantity}`)
+    .join('|');
+}
+
+/**
+ * Scores how likely two active orders belong to the same customer (excluding recurring standing orders).
+ */
+export function scoreDuplicateOrder(target: OrderRecord, candidate: OrderRecord): number {
+  if (isStandingRecurringOrder(target) || isStandingRecurringOrder(candidate)) {
+    return 0;
+  }
+  let score = 0;
+
+  if (
+    target.odooPartnerId &&
+    candidate.odooPartnerId &&
+    target.odooPartnerId === candidate.odooPartnerId
+  ) {
+    score += 100;
+  }
+
+  const nameA = target.customerName.trim().toLowerCase().replace(/\s+/g, ' ');
+  const nameB = candidate.customerName.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (nameA && nameB) {
+    if (nameA === nameB) {
+      score += 90;
+    } else if (
+      nameA.length >= 4 &&
+      nameB.length >= 4 &&
+      (nameA.includes(nameB) || nameB.includes(nameA))
+    ) {
+      score += 40;
+    } else {
+      const partsA = nameA.split(' ');
+      const partsB = nameB.split(' ');
+      // Only treat first-name-only match as a likely duplicate when one side has no last name
+      if (
+        (partsA.length === 1 || partsB.length === 1) &&
+        partsA[0].length >= 3 &&
+        partsA[0] === partsB[0]
+      ) {
+        score += 25;
+      }
+    }
+  }
+
+  const emailA = (target.customerEmail || '').trim().toLowerCase();
+  const emailB = (candidate.customerEmail || '').trim().toLowerCase();
+  if (emailA && emailB && emailA === emailB) {
+    score += 85;
+  }
+
+  const phoneA = (target.customerPhone || '').replace(/\D/g, '');
+  const phoneB = (candidate.customerPhone || '').replace(/\D/g, '');
+  if (phoneA.length >= 7 && phoneB.length >= 7 && phoneA === phoneB) {
+    score += 80;
+  }
+
+  return score;
+}
+
+export interface ReplacementCandidate {
+  order: OrderRecord;
+  customerScore: number;
+  rankScore: number;
+  reasons: string[];
+}
+
+/**
+ * Ranks active orders that could replace a cancelled/removed Odoo quotation
+ * (e.g., a newly arrived storefront quotation in the waitlist for the same customer).
+ */
+export function findReplacementCandidates(
+  missingOrder: OrderRecord,
+  allActiveOrders: OrderRecord[]
+): ReplacementCandidate[] {
+  const dismissed = new Set(missingOrder.dismissedDuplicateOrderIds ?? []);
+  const missingSig = itemsMatchSignature(missingOrder.items);
+  const results: ReplacementCandidate[] = [];
+
+  for (const candidate of allActiveOrders) {
+    if (candidate.id === missingOrder.id) continue;
+    if (candidate.status === 'ignored') continue;
+    if (candidate.odooMissingFlagged) continue;
+    if (
+      dismissed.has(candidate.id) ||
+      (candidate.dismissedDuplicateOrderIds ?? []).includes(missingOrder.id)
+    ) {
+      continue;
+    }
+    if (isStandingRecurringOrder(candidate)) continue;
+
+    const customerScore = scoreDuplicateOrder(missingOrder, candidate);
+    if (customerScore < 25) continue;
+
+    let rankScore = customerScore;
+    const reasons: string[] = [];
+
+    if (candidate.source === 'odoo') {
+      rankScore += 20;
+    }
+    if (candidate.status === 'waitlist') {
+      rankScore += 18;
+      reasons.push('new in waitlist');
+    } else if (candidate.status === 'confirmed') {
+      rankScore += 10;
+      reasons.push('confirmed order');
+    }
+
+    const isNewerOdoo =
+      candidate.odooQuotationId !== null &&
+      missingOrder.odooQuotationId !== null &&
+      (candidate.odooQuotationId > missingOrder.odooQuotationId ||
+        Boolean(
+          candidate.odooCreatedAtLocal &&
+            missingOrder.odooCreatedAtLocal &&
+            candidate.odooCreatedAtLocal > missingOrder.odooCreatedAtLocal
+        ));
+    if (isNewerOdoo) {
+      rankScore += 15;
+      if (!reasons.includes('new in waitlist')) {
+        reasons.push('newer Odoo quotation');
+      }
+    }
+
+    const candSig = itemsMatchSignature(candidate.items);
+    if (missingSig && candSig && missingSig === candSig) {
+      rankScore += 10;
+      reasons.push('same items');
+    }
+
+    results.push({
+      order: candidate,
+      customerScore,
+      rankScore,
+      reasons,
+    });
+  }
+
+  results.sort((a, b) => {
+    if (b.rankScore !== a.rankScore) return b.rankScore - a.rankScore;
+    const idA = a.order.odooQuotationId ?? 0;
+    const idB = b.order.odooQuotationId ?? 0;
+    if (idB !== idA) return idB - idA;
+    return b.order.id - a.order.id;
+  });
+
+  return results;
+}
+
+/**
+ * Decides which side's Odoo quotation ID stays active/primary when merging two Odoo-backed orders:
+ * 1. Active (non-missing) always beats cancelled/removed (`odooMissingFlagged`).
+ * 2. Confirmed always beats unconfirmed.
+ * 3. When both are active & unconfirmed (e.g., Waitlist draft + newly arrived replacement draft),
+ *    the newer Odoo quotation becomes primary so cancelling the older waitlist draft later
+ *    causes zero alerts and future syncs track the live replacement quotation.
+ * 4. Otherwise, `target` remains primary.
+ */
+export function selectPrimaryOdooSide(
+  target: Pick<
+    OrderRecord,
+    'odooQuotationId' | 'odooCreatedAtLocal' | 'status' | 'odooMissingFlagged'
+  >,
+  source: Pick<
+    OrderRecord,
+    'odooQuotationId' | 'odooCreatedAtLocal' | 'status' | 'odooMissingFlagged'
+  >
+): 'target' | 'source' {
+  if (!target.odooQuotationId && source.odooQuotationId) return 'source';
+  if (target.odooQuotationId && !source.odooQuotationId) return 'target';
+  if (!target.odooQuotationId && !source.odooQuotationId) return 'target';
+
+  // 1. Active always beats removed/cancelled in Odoo
+  if (target.odooMissingFlagged && !source.odooMissingFlagged) return 'source';
+  if (!target.odooMissingFlagged && source.odooMissingFlagged) return 'target';
+
+  // 2. Confirmed always beats unconfirmed
+  if (source.status === 'confirmed' && target.status !== 'confirmed') return 'source';
+  if (target.status === 'confirmed' && source.status !== 'confirmed') return 'target';
+
+  // 3. Two active unconfirmed quotations: prefer the newer quotation (e.g., new order replacing waitlist form)
+  if (target.status !== 'confirmed' && source.status !== 'confirmed') {
+    if (
+      source.odooCreatedAtLocal &&
+      target.odooCreatedAtLocal &&
+      source.odooCreatedAtLocal !== target.odooCreatedAtLocal
+    ) {
+      return source.odooCreatedAtLocal > target.odooCreatedAtLocal ? 'source' : 'target';
+    }
+    if ((source.odooQuotationId ?? 0) > (target.odooQuotationId ?? 0)) {
+      return 'source';
+    }
+  }
+
+  return 'target';
+}
+
+/**
+ * Builds the chronological chain of linked Odoo quotation/order references
+ * from earliest waitlist quotation(s) to the active live Odoo order.
+ */
+export function buildOrderOdooChain(
+  order: Pick<OrderRecord, 'odooQuotationName' | 'mergedOdooNames'>
+): string[] {
+  const seen = new Set<string>();
+  const chain: string[] = [];
+
+  for (const name of order.mergedOdooNames ?? []) {
+    const trimmed = name.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      chain.push(trimmed);
+    }
+  }
+
+  const active = (order.odooQuotationName || '').trim();
+  if (active && !seen.has(active)) {
+    seen.add(active);
+    chain.push(active);
+  }
+
+  return chain;
+}

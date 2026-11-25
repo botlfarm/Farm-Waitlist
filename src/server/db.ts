@@ -22,7 +22,7 @@ export interface Migration {
 }
 
 const DEFAULT_EMAIL_TEMPLATE_BODY =
-  "Hey {{name}}, you're pre-approved for {{items_summary}} on {{date}} ({{channel}}). Place the order through EFF using the pre-approved option.";
+  "Hey {{name}}, you're pre-approved for {{items_summary}} on {{date}} ({{channel}}). Please place your order using the pre-approved option.";
 
 const DEFAULT_SMS_TEMPLATE_BODY =
   "Hi {{name}}! You're pre-approved for {{items_summary}} on {{date}} ({{channel}}). Place your order using the pre-approved option.";
@@ -362,6 +362,13 @@ export const MIGRATIONS: Migration[] = [
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_odoo_customers_name ON odoo_customers(name COLLATE NOCASE);
+    `,
+  },
+  {
+    version: 8,
+    name: 'add_odoo_missing_dismissed',
+    sql: `
+      ALTER TABLE orders ADD COLUMN odoo_missing_dismissed INTEGER NOT NULL DEFAULT 0;
     `,
   },
 ];

@@ -7,6 +7,7 @@ import {
   extractUnreleasedBody,
   readAddonVersion,
   releaseChangelog,
+  resolveNextReleaseVersion,
 } from '../../scripts/release-changelog.mjs';
 
 const tmpDirs: string[] = [];
@@ -196,4 +197,30 @@ All notable changes to Farm Waitlist are documented in this file.
     const changelog = fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
     expect(changelog).toContain('## [1.0.2] - 2026-11-26\n\n### Changes\n\n- Small tweak from git log');
   });
+
+  it('resolves the next release version read-only without mutating config.yaml, CHANGELOG.md, UNRELEASED.md, or package.json', () => {
+    const unreleased = `# Unreleased Changes\n\n### Added\n\n- Pending feature\n`;
+    const changelog = `# Changelog\n\n## [1.0.3] - 2026-11-24\n\n### Added\n\n- Prior release\n`;
+    const dir = createTempRepo('1.0.3', unreleased, changelog);
+
+    const beforeConfig = fs.readFileSync(path.join(dir, 'farm-waitlist', 'config.yaml'), 'utf8');
+    const beforePkg = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
+
+    const resolved = resolveNextReleaseVersion({
+      rootDir: dir,
+      autoBump: true,
+      hasTag: () => false,
+    });
+
+    expect(resolved.version).toBe('1.0.4');
+    expect(resolved.autoBumped).toBe(true);
+    expect(resolved.alreadyReleased).toBe(true);
+
+    // Zero files modified on disk during read-only resolution
+    expect(fs.readFileSync(path.join(dir, 'farm-waitlist', 'config.yaml'), 'utf8')).toBe(beforeConfig);
+    expect(fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8')).toBe(changelog);
+    expect(fs.readFileSync(path.join(dir, 'UNRELEASED.md'), 'utf8')).toBe(unreleased);
+    expect(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).toBe(beforePkg);
+  });
 });
+
