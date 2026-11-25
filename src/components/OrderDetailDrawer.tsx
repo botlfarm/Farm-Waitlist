@@ -1,4 +1,5 @@
 import {
+  ArrowRight,
   Calendar,
   CalendarCheck,
   Check,
@@ -28,6 +29,7 @@ import {
 } from '../shared/orderMatching';
 import {
   channelHasScheduleRestriction,
+  computeNextBumpDate,
   evaluateCandidateSlotDates,
   type CandidateSlotDate,
   type CandidateSlotFit,
@@ -35,6 +37,7 @@ import {
 import {
   ISO_WEEKDAY_LABELS,
   formatAgingBadge,
+  formatDateNoYear,
   formatShortCalendarDate,
   getAgingHoldHours,
   getIsoWeekday,
@@ -84,6 +87,8 @@ interface OrderDetailDrawerProps {
   ) => Promise<void>;
   onExtendWeeks: () => void;
   onPreApprove: (orderId: number) => Promise<void>;
+  onConfirmOrder?: (orderId: number) => Promise<void>;
+  onBumpOrder?: (orderId: number, targetDate?: string) => Promise<void>;
   onReleaseHold: (orderId: number) => Promise<void>;
   onIgnore: (orderId: number) => Promise<void>;
   onRestoreIgnored: (orderId: number) => Promise<void>;
@@ -306,6 +311,8 @@ export function OrderDetailDrawer({
   onQuickSlotOrder,
   onExtendWeeks,
   onPreApprove,
+  onConfirmOrder,
+  onBumpOrder,
   onReleaseHold,
   onIgnore,
   onRestoreIgnored,
@@ -1331,32 +1338,79 @@ export function OrderDetailDrawer({
               </div>
             )}
 
-          {/* Aging Pre-Approved Hold Notice */}
-          {order.status === 'pre_approved' && agingHours !== null && (
-            <div
-              className={`flex flex-wrap items-center justify-between gap-3 rounded-md border px-4 py-3 text-xs ${
-                isHoldOverThreshold
-                  ? 'border-[#D97706]/70 bg-[#D97706]/10 text-[#FBBF24]'
-                  : 'border-[#283340] bg-[#1E2730] text-[#C9D1D9]'
-              }`}
-            >
-              <div>
-                <span className="font-semibold">{formatAgingBadge(agingHours)}</span>
-                <span className="ml-2 text-[#8B949E]">
-                  Pre-approved hold threshold: {holdThresholdHours}h
-                </span>
-              </div>
-              <button
-                type="button"
-                disabled={readOnly}
-                data-testid="order-release-hold-btn"
-                onClick={() => void onReleaseHold(order.id)}
-                className="min-h-[34px] shrink-0 whitespace-nowrap rounded-md border border-[#D97706]/70 bg-[#0F1419] px-3 py-1.5 text-xs font-semibold text-[#FBBF24] hover:bg-[#D97706]/20 disabled:cursor-not-allowed disabled:opacity-45"
-              >
-                Release Hold / Return to Waitlist
-              </button>
-            </div>
-          )}
+          {/* Aging / Past-Date Pre-Approved Hold Notice */}
+          {order.status === 'pre_approved' &&
+            (agingHours !== null || Boolean(order.slottedDate && order.slottedDate < today)) &&
+            (() => {
+              const isPastDate = Boolean(order.slottedDate && order.slottedDate < today);
+              const nextBumpDate = computeNextBumpDate(order, channels, today);
+              const bumpLabel =
+                nextBumpDate === today
+                  ? `Today (${formatDateNoYear(nextBumpDate)})`
+                  : formatDateNoYear(nextBumpDate);
+
+              return (
+                <div
+                  className={`flex flex-col gap-2.5 rounded-md border px-4 py-3 text-xs ${
+                    isPastDate
+                      ? 'border-[#DC2626]/60 bg-[#DC2626]/10 text-[#FCA5A5]'
+                      : isHoldOverThreshold
+                        ? 'border-[#D97706]/70 bg-[#D97706]/10 text-[#FBBF24]'
+                        : 'border-[#283340] bg-[#1E2730] text-[#C9D1D9]'
+                  }`}
+                >
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    {isPastDate && (
+                      <span className="rounded bg-[#DC2626]/25 px-1.5 py-0.5 text-[10px] font-semibold text-[#F87171]">
+                        Past pickup date
+                      </span>
+                    )}
+                    {agingHours !== null && (
+                      <span className="font-semibold">{formatAgingBadge(agingHours)}</span>
+                    )}
+                    <span className="text-[#8B949E]">
+                      Pre-approved hold cutoff: {holdThresholdHours}h
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {onConfirmOrder && (
+                      <button
+                        type="button"
+                        disabled={readOnly}
+                        data-testid="order-confirm-hold-btn"
+                        onClick={() => void onConfirmOrder(order.id)}
+                        className="inline-flex min-h-[34px] items-center gap-1 rounded-md border border-[#16A34A]/60 bg-[#16A34A]/15 px-3 py-1.5 text-xs font-semibold text-[#4ADE80] hover:bg-[#16A34A]/25 disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                        Mark Confirmed
+                      </button>
+                    )}
+                    {onBumpOrder && order.slottedDate && (
+                      <button
+                        type="button"
+                        disabled={readOnly}
+                        data-testid="order-bump-hold-btn"
+                        onClick={() => void onBumpOrder(order.id, nextBumpDate)}
+                        className="inline-flex min-h-[34px] items-center gap-1 rounded-md border border-[#38BDF8]/60 bg-[#0EA5E9]/15 px-3 py-1.5 text-xs font-semibold text-[#38BDF8] hover:bg-[#0EA5E9]/25 disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        <span>Bump</span>
+                        <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>{bumpLabel}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={readOnly}
+                      data-testid="order-release-hold-btn"
+                      onClick={() => void onReleaseHold(order.id)}
+                      className="min-h-[34px] shrink-0 whitespace-nowrap rounded-md border border-[#D97706]/70 bg-[#0F1419] px-3 py-1.5 text-xs font-semibold text-[#FBBF24] hover:bg-[#D97706]/20 disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                      Release Hold / Return to Waitlist
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
 
           {/* 1. Order Items (Top of card for immediate visibility & quick edits) */}
           <fieldset disabled={readOnly} className="contents">

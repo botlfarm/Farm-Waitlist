@@ -344,6 +344,15 @@ export const api = {
       }
     ),
 
+  bumpOrder: (id: number, date?: string) =>
+    requestJson<{ order: OrderRecord; previousDate: string | null; bumpedToDate: string }>(
+      `./api/orders/${id}/bump`,
+      {
+        method: 'POST',
+        body: JSON.stringify(date ? { date } : {}),
+      }
+    ),
+
   releaseHold: (id: number) =>
     requestJson<OrderRecord>(`./api/orders/${id}/release-hold`, { method: 'POST' }),
 

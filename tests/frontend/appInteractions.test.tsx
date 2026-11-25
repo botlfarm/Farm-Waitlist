@@ -3024,6 +3024,148 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     });
     expect(await screen.findByTestId('order-chip-10')).toHaveTextContent('Backup Betty');
   });
+
+  it('prompts Confirm, Bump, and Return to Waitlist for past-date & expired-hold orders and exposes hold cutoff variables in template settings', async () => {
+    const user = userEvent.setup();
+    const ws = makeBaseWorkspace();
+    ws.today = '2026-11-24';
+
+    const pastOrder = {
+      ...ws.orders[0],
+      id: 40,
+      customerName: 'Past Paula',
+      status: 'pre_approved' as const,
+      slottedDate: '2026-11-23',
+      preApprovedAt: '2026-11-22T12:00:00Z',
+    };
+    const expiredHoldOrder = {
+      ...ws.orders[0],
+      id: 41,
+      customerName: 'Hold Hannah',
+      status: 'pre_approved' as const,
+      slottedDate: '2026-11-25',
+      preApprovedAt: '2026-11-21T12:00:00Z',
+    };
+    ws.orders = [pastOrder, expiredHoldOrder];
+    ws.overdueOrders = [pastOrder];
+    ws.expiredHoldOrders = [expiredHoldOrder];
+    ws.settings.publicSnippetCutoffRules = [
+      {
+        id: 'cutoff-1day',
+        enabled: true,
+        mode: 'days_before',
+        daysBefore: 1,
+        cutoffWeekday: 5,
+        cutoffTime: '16:00',
+        pickupWeekdays: [],
+      },
+    ];
+    ws.settings.preApprovalTemplates = [
+      {
+        id: 'default',
+        name: 'Default',
+        format: 'html',
+        body: 'Hi {{first_name}}!',
+        channelIds: [],
+        itemIds: [],
+        isDefault: true,
+      },
+    ];
+
+    const confirmedIds: number[] = [];
+    const bumpedCalls: Array<{ id: number; date?: string }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/40' && init?.method === 'PUT') {
+          const body = JSON.parse(String(init.body ?? '{}')) as { status?: string };
+          if (body.status === 'confirmed') {
+            confirmedIds.push(40);
+            ws.overdueOrders = [];
+            ws.orders = ws.orders.map((o) => (o.id === 40 ? { ...o, status: 'confirmed' } : o));
+          }
+          return new Response(JSON.stringify(ws.orders[0]), { status: 200 });
+        }
+        if (input === './api/orders/41/bump' && init?.method === 'POST') {
+          const body = JSON.parse(String(init.body ?? '{}')) as { date?: string };
+          bumpedCalls.push({ id: 41, date: body.date });
+          ws.expiredHoldOrders = [];
+          ws.orders = ws.orders.map((o) =>
+            o.id === 41 ? { ...o, slottedDate: body.date ?? '2026-11-26' } : o
+          );
+          return new Response(
+            JSON.stringify({
+              order: ws.orders.find((o) => o.id === 41),
+              previousDate: '2026-11-25',
+              bumpedToDate: body.date ?? '2026-11-26',
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    // Both past-date and expired-hold orders appear in the Needs Attention banner
+    const banner = await screen.findByTestId('overdue-banner');
+    expect(banner).toHaveTextContent('Past Paula');
+    expect(banner).toHaveTextContent('Hold Hannah');
+    expect(screen.getByTestId('overdue-bump-40')).toHaveTextContent(/Today \(Tue, Nov 24\)/);
+    expect(screen.getByTestId('overdue-bump-41')).toHaveTextContent(/Thu, Nov 26/);
+
+    // Click Mark Confirmed on Past Paula
+    await user.click(screen.getByTestId('overdue-confirm-40'));
+    await waitFor(() => {
+      expect(confirmedIds).toEqual([40]);
+      expect(screen.queryByTestId('overdue-order-40')).not.toBeInTheDocument();
+    });
+
+    // Click Bump on Hold Hannah -> moves to Thu, Nov 26 and clears banner
+    await user.click(screen.getByTestId('overdue-bump-41'));
+    await waitFor(() => {
+      expect(bumpedCalls).toEqual([{ id: 41, date: '2026-11-26' }]);
+      expect(screen.queryByTestId('overdue-banner')).not.toBeInTheDocument();
+    });
+
+    // Navigate to Settings -> Message Templates and insert hold cutoff variables
+    await user.click(screen.getByTestId('nav-settings'));
+    await user.click(await screen.findByTestId('settings-tab-templates'));
+    await user.click(await screen.findByTestId('template-var-hold_cutoff'));
+    await user.click(screen.getByTestId('template-var-hold_cutoff_by'));
+    await user.click(screen.getByTestId('template-var-hold_cutoff_date'));
+
+    expect(screen.getByTestId('settings-template-textarea')).toHaveValue(
+      'Hi {{first_name}}! {{hold_cutoff}} {{hold_cutoff_by}} {{hold_cutoff_date}}'
+    );
+    expect(screen.getByTestId('settings-template-preview')).toHaveTextContent(
+      'Hi Alex! 48 hours Fri, Nov 27 at 2:00 PM Fri, Nov 27'
+    );
+
+    // Changing Hold Cutoff Hours to 24 updates the live sample preview immediately
+    const holdInput = screen.getByTestId('settings-hold-hours-input');
+    await user.clear(holdInput);
+    await user.type(holdInput, '24');
+    expect(screen.getByTestId('settings-template-preview')).toHaveTextContent(
+      'Hi Alex! 24 hours Thu, Nov 26 at 2:00 PM Thu, Nov 26'
+    );
+
+    // Public Order Cutoff variables reflect the configured Availability Snippet cutoff rule (1 day before at 4:00 PM)
+    await user.click(screen.getByTestId('template-var-order_cutoff'));
+    await user.click(screen.getByTestId('template-var-order_cutoff_date'));
+    await user.click(screen.getByTestId('template-var-order_cutoff_time'));
+    expect(screen.getByTestId('settings-template-textarea')).toHaveValue(
+      'Hi {{first_name}}! {{hold_cutoff}} {{hold_cutoff_by}} {{hold_cutoff_date}} {{order_cutoff}} {{order_cutoff_date}} {{order_cutoff_time}}'
+    );
+    expect(screen.getByTestId('settings-template-preview')).toHaveTextContent(
+      'Hi Alex! 24 hours Thu, Nov 26 at 2:00 PM Thu, Nov 26 Fri, Nov 27 at 4:00 PM Fri, Nov 27 4:00 PM'
+    );
+  });
 });
 
 

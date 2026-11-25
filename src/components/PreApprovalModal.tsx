@@ -11,6 +11,7 @@ import type {
   OrderRecord,
   PickupChannel,
   PreApprovalTemplate,
+  SnippetCutoffRule,
   TrackedItem,
 } from '../shared/types';
 import { RichMessagePreview } from './RichMessagePreview';
@@ -24,6 +25,10 @@ interface PreApprovalModalProps {
   templates: PreApprovalTemplate[];
   items: TrackedItem[];
   channels: PickupChannel[];
+  holdThresholdHours?: number;
+  timezone?: string;
+  publicSnippetCutoffRules?: SnippetCutoffRule[];
+  publicSnippetShowSameDay?: boolean;
   onClose: () => void;
 }
 
@@ -36,6 +41,10 @@ export function PreApprovalModal({
   templates,
   items,
   channels,
+  holdThresholdHours,
+  timezone,
+  publicSnippetCutoffRules,
+  publicSnippetShowSameDay,
   onClose,
 }: PreApprovalModalProps) {
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
@@ -88,6 +97,10 @@ export function PreApprovalModal({
           order,
           items,
           channels,
+          holdThresholdHours,
+          timezone,
+          publicSnippetCutoffRules,
+          publicSnippetShowSameDay,
         })
       );
     } else {

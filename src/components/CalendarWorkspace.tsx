@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowDown,
+  ArrowRight,
   ArrowUp,
   Bookmark,
   Calendar,
@@ -32,6 +33,7 @@ import { formatQty } from '../shared/generators';
 import { findReplacementCandidates } from '../shared/orderMatching';
 import {
   channelHasScheduleRestriction,
+  computeNextBumpDate,
   evaluateCandidateSlotDates,
   isChannelActiveOnDate,
   previewOrderMoveProjections,
@@ -40,6 +42,7 @@ import {
   ISO_WEEKDAY_LABELS,
   compareWaitlistOrders,
   formatAgingBadge,
+  formatDateNoYear,
   formatLocalDateTime,
   formatShortCalendarDate,
   getAgingHoldHours,
@@ -78,6 +81,8 @@ interface CalendarWorkspaceProps {
     replacementOrderId: number,
     keepDate?: string | null
   ) => Promise<void>;
+  onConfirmOrder?: (orderId: number) => Promise<void>;
+  onBumpOrder?: (orderId: number, targetDate?: string) => Promise<void>;
   onReleaseHold: (orderId: number) => Promise<void>;
   onRestoreIgnored: (orderId: number) => Promise<void>;
   onReorderWaitlist?: (orderIds: number[]) => Promise<void>;
@@ -159,6 +164,8 @@ export function CalendarWorkspace({
   onOpenSettings,
   onReconcile,
   onReplaceOrder,
+  onConfirmOrder,
+  onBumpOrder,
   onReleaseHold,
   onRestoreIgnored,
   onReorderWaitlist,
@@ -1080,49 +1087,158 @@ export function CalendarWorkspace({
         </div>
       )}
 
-      {/* Conditional Overdue / Needs Attention Banner */}
-      {workspace.overdueOrders.length > 0 && (
-        <div
-          data-testid="overdue-banner"
-          className="border-b border-[#DC2626]/50 bg-[#DC2626]/10 px-4 py-3 lg:px-6"
-        >
-          <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-center gap-2 text-xs font-semibold text-[#F87171]">
-              <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
-              <span>
-                Overdue / Needs Attention: {workspace.overdueOrders.length} past-date order(s) still in
-                Slotted or Pre-Approved status
-              </span>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {workspace.overdueOrders.map((order) => (
-                <div
-                  key={order.id}
-                  data-testid={`overdue-order-${order.id}`}
-                  className="inline-flex items-center gap-2 rounded-md border border-[#DC2626]/40 bg-[#0F1419] px-2.5 py-1 text-xs"
-                >
-                  <button
-                    type="button"
-                    onClick={() => onSelectOrder(order)}
-                    className="font-medium text-[#F0F6FC] hover:text-[#38BDF8]"
-                  >
-                    {order.customerName} ({order.slottedDate})
-                  </button>
-                  <button
-                    type="button"
-                    disabled={readOnly}
-                    data-testid={`overdue-release-${order.id}`}
-                    onClick={() => void onReleaseHold(order.id)}
-                    className="text-[11px] font-medium text-[#FBBF24] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
-                  >
-                    Return to Waitlist
-                  </button>
+      {/* Conditional Overdue & Hold Cutoff Needs Attention Banner */}
+      {(() => {
+        const seenIds = new Set<number>();
+        const attentionOrders: Array<{
+          order: OrderRecord;
+          isPastDate: boolean;
+          isHoldExpired: boolean;
+        }> = [];
+        const expiredIdSet = new Set((workspace.expiredHoldOrders ?? []).map((o) => o.id));
+        const holdThreshold = workspace.settings.holdThresholdHours || 48;
+
+        for (const order of workspace.overdueOrders) {
+          if (seenIds.has(order.id)) continue;
+          seenIds.add(order.id);
+          const aging =
+            order.status === 'pre_approved' ? getAgingHoldHours(order.preApprovedAt) : null;
+          attentionOrders.push({
+            order,
+            isPastDate: true,
+            isHoldExpired:
+              expiredIdSet.has(order.id) || (aging !== null && aging >= holdThreshold),
+          });
+        }
+        for (const order of workspace.expiredHoldOrders ?? []) {
+          if (seenIds.has(order.id)) continue;
+          seenIds.add(order.id);
+          attentionOrders.push({
+            order,
+            isPastDate: Boolean(order.slottedDate && order.slottedDate < workspace.today),
+            isHoldExpired: true,
+          });
+        }
+
+        if (attentionOrders.length === 0) return null;
+
+        return (
+          <div
+            data-testid="overdue-banner"
+            className="border-b border-[#DC2626]/50 bg-[#DC2626]/10 px-4 py-3 lg:px-6"
+          >
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-semibold text-[#F87171]">
+                  <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span>
+                    Needs Attention ({attentionOrders.length}) — Confirm unconfirmed orders, bump
+                    forward, or release hold:
+                  </span>
                 </div>
-              ))}
+                <span className="text-[11px] text-[#FCA5A5]/80">
+                  Hold cutoff: {holdThreshold}h
+                </span>
+              </div>
+              <div className="flex flex-col gap-2">
+                {attentionOrders.map(({ order, isPastDate, isHoldExpired }) => {
+                  const nextBumpDate = computeNextBumpDate(
+                    order,
+                    workspace.channels,
+                    workspace.today
+                  );
+                  const bumpLabel =
+                    nextBumpDate === workspace.today
+                      ? `Today (${formatDateNoYear(nextBumpDate)})`
+                      : formatDateNoYear(nextBumpDate);
+                  const compactItems = order.items
+                    .map((line) => {
+                      const item = itemsById.get(line.trackedItemId);
+                      return `${formatQty(line.quantity)} ${item ? item.name : `#${line.trackedItemId}`}`;
+                    })
+                    .join(', ');
+
+                  return (
+                    <div
+                      key={order.id}
+                      data-testid={`overdue-order-${order.id}`}
+                      className="flex flex-wrap items-center justify-between gap-2.5 rounded-md border border-[#DC2626]/40 bg-[#0F1419] px-3 py-2 text-xs"
+                    >
+                      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                        <button
+                          type="button"
+                          onClick={() => onSelectOrder(order)}
+                          className="font-semibold text-[#F0F6FC] hover:text-[#38BDF8]"
+                        >
+                          {order.customerName}
+                        </button>
+                        {compactItems && (
+                          <span className="font-mono text-[11px] tabular-nums text-[#C9D1D9]">
+                            {compactItems}
+                          </span>
+                        )}
+                        {order.slottedDate && (
+                          <span className="text-[11px] text-[#8B949E]">
+                            Scheduled {formatDateNoYear(order.slottedDate)}
+                          </span>
+                        )}
+                        {isPastDate && (
+                          <span className="rounded bg-[#DC2626]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#F87171]">
+                            Past pickup date
+                          </span>
+                        )}
+                        {isHoldExpired && (
+                          <span className="rounded bg-[#D97706]/20 px-1.5 py-0.5 text-[10px] font-semibold text-[#FBBF24]">
+                            Hold cutoff ({holdThreshold}h) passed
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {onConfirmOrder && (
+                          <button
+                            type="button"
+                            disabled={readOnly}
+                            data-testid={`overdue-confirm-${order.id}`}
+                            onClick={() => void onConfirmOrder(order.id)}
+                            className="inline-flex min-h-[28px] items-center gap-1 rounded border border-[#16A34A]/60 bg-[#16A34A]/15 px-2.5 py-1 text-[11px] font-semibold text-[#4ADE80] transition-colors hover:bg-[#16A34A]/25 disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            <Check className="h-3 w-3" aria-hidden="true" />
+                            Mark Confirmed
+                          </button>
+                        )}
+                        {onBumpOrder && (
+                          <button
+                            type="button"
+                            disabled={readOnly}
+                            data-testid={`overdue-bump-${order.id}`}
+                            title={`Move order to ${nextBumpDate}${order.status === 'pre_approved' ? ' and reset hold timer' : ''}`}
+                            onClick={() => void onBumpOrder(order.id, nextBumpDate)}
+                            className="inline-flex min-h-[28px] items-center gap-1 rounded border border-[#38BDF8]/60 bg-[#0EA5E9]/15 px-2.5 py-1 text-[11px] font-semibold text-[#38BDF8] transition-colors hover:bg-[#0EA5E9]/25 disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            <span>Bump</span>
+                            <ArrowRight className="h-3 w-3" aria-hidden="true" />
+                            <span>{bumpLabel}</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={readOnly}
+                          data-testid={`overdue-release-${order.id}`}
+                          onClick={() => void onReleaseHold(order.id)}
+                          className="inline-flex min-h-[28px] items-center rounded border border-[#D97706]/50 bg-[#D97706]/10 px-2.5 py-1 text-[11px] font-medium text-[#FBBF24] transition-colors hover:bg-[#D97706]/20 disabled:cursor-not-allowed disabled:opacity-45"
+                        >
+                          Return to Waitlist
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Conditional Cancelled / Removed Odoo Quotation Reconciliation Banner */}
       {workspace.reconciliationOrders.length > 0 && (

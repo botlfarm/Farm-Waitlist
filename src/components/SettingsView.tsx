@@ -21,6 +21,8 @@ import {
   PRE_APPROVAL_TEMPLATE_VARIABLES,
   isSafeHttpUrl,
   renderPreApprovalSamplePreview,
+  resolveHoldCutoffValues,
+  resolvePublicOrderCutoffValues,
 } from '../shared/generators';
 import {
   ISO_WEEKDAY_LABELS,
@@ -108,6 +110,9 @@ export function SettingsView({
 
   // --- Settings form state ---
   const [draftSettings, setDraftSettings] = useState<AppSettings>(settings);
+  const [holdHoursInput, setHoldHoursInput] = useState<string>(() =>
+    String(settings.holdThresholdHours)
+  );
   const [selectedTemplateId, setSelectedTemplateId] = useState<string>(
     () =>
       settings.preApprovalTemplates?.find((t) => t.isDefault)?.id ??
@@ -130,6 +135,7 @@ export function SettingsView({
 
   useEffect(() => {
     setDraftSettings(settings);
+    setHoldHoursInput(String(settings.holdThresholdHours));
     const list = settings.preApprovalTemplates ?? [];
     if (list.length > 0 && !list.some((t) => t.id === selectedTemplateId)) {
       setSelectedTemplateId(list.find((t) => t.isDefault)?.id ?? list[0].id);
@@ -1582,38 +1588,71 @@ export function SettingsView({
                     </span>
                   </div>
                   <div className="mb-2 space-y-1.5 rounded-md border border-[#283340] bg-[#0F1419]/60 p-2.5">
-                    {(
-                      [
-                        { group: 'name', title: 'Name' },
-                        { group: 'date', title: 'Date' },
-                        { group: 'order', title: 'Order' },
-                      ] as const
-                    ).map(({ group, title }) => (
-                      <div key={group} className="flex flex-wrap items-center gap-1.5">
-                        <span className="w-11 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-[#8B949E]">
-                          {title}
-                        </span>
-                        {PRE_APPROVAL_TEMPLATE_VARIABLES.filter((v) => v.group === group).map(
-                          (v) => (
-                            <button
-                              key={v.key}
-                              type="button"
-                              data-testid={`template-var-${v.key}`}
-                              title={`${v.label} — e.g. ${v.example}`}
-                              onClick={() =>
-                                updateActiveTemplate({
-                                  body: `${activeTemplate.body}${activeTemplate.body && !activeTemplate.body.endsWith(' ') && !activeTemplate.body.endsWith('\n') ? ' ' : ''}${v.token}`,
-                                })
-                              }
-                              className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#161D24] px-1.5 py-0.5 text-[10px] text-[#38BDF8] transition-colors hover:border-[#38BDF8] hover:bg-[#1E2730]"
-                            >
-                              <span className="font-mono">+{v.token}</span>
-                              <span className="text-[#8B949E]">({v.example})</span>
-                            </button>
-                          )
-                        )}
-                      </div>
-                    ))}
+                    {(() => {
+                      const sampleHold = resolveHoldCutoffValues({
+                        holdThresholdHours: draftSettings.holdThresholdHours,
+                        baseIso: '2026-11-25T19:00:00Z',
+                        timezone: draftSettings.timezone,
+                      });
+                      const sampleOrderCutoff = resolvePublicOrderCutoffValues({
+                        pickupDate: '2026-11-28',
+                        cutoffRules: draftSettings.publicSnippetCutoffRules,
+                        showSameDay: draftSettings.publicSnippetShowSameDay,
+                      });
+                      const dynamicExample = (key: string, fallback: string) => {
+                        if (key === 'hold_cutoff') return sampleHold.holdCutoff;
+                        if (key === 'hold_cutoff_by') return sampleHold.holdCutoffBy;
+                        if (key === 'hold_cutoff_date') return sampleHold.holdCutoffDate;
+                        if (key === 'order_cutoff') return sampleOrderCutoff.orderCutoff;
+                        if (key === 'order_cutoff_date') return sampleOrderCutoff.orderCutoffDate;
+                        if (key === 'order_cutoff_time') return sampleOrderCutoff.orderCutoffTime;
+                        return fallback;
+                      };
+
+                      return (
+                        [
+                          { group: 'name', title: 'Name' },
+                          { group: 'date', title: 'Date' },
+                          { group: 'order', title: 'Order' },
+                          { group: 'hold', title: 'Hold' },
+                          { group: 'cutoff', title: 'Cutoff' },
+                        ] as const
+                      ).map(({ group, title }) => (
+                        <div key={group} className="flex flex-wrap items-center gap-1.5">
+                          <span className="w-11 shrink-0 text-[10px] font-semibold uppercase tracking-wide text-[#8B949E]">
+                            {title}
+                          </span>
+                          {PRE_APPROVAL_TEMPLATE_VARIABLES.filter((v) => v.group === group).map(
+                            (v) => {
+                              const example = dynamicExample(v.key, v.example);
+                              return (
+                                <button
+                                  key={v.key}
+                                  type="button"
+                                  data-testid={`template-var-${v.key}`}
+                                  title={`${v.label} — e.g. ${example}`}
+                                  onClick={() =>
+                                    updateActiveTemplate({
+                                      body: `${activeTemplate.body}${activeTemplate.body && !activeTemplate.body.endsWith(' ') && !activeTemplate.body.endsWith('\n') ? ' ' : ''}${v.token}`,
+                                    })
+                                  }
+                                  className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#161D24] px-1.5 py-0.5 text-[10px] text-[#38BDF8] transition-colors hover:border-[#38BDF8] hover:bg-[#1E2730]"
+                                >
+                                  <span className="font-mono">+{v.token}</span>
+                                  <span className="text-[#8B949E]">({example})</span>
+                                </button>
+                              );
+                            }
+                          )}
+                        </div>
+                      ));
+                    })()}
+                    <p className="pt-0.5 text-[10px] text-[#8B949E]">
+                      <span className="font-medium text-[#C9D1D9]">Cutoff</span> variables use your
+                      active Public Order Cutoff Rules from{' '}
+                      <span className="text-[#C9D1D9]">Availability Snippet</span> for the
+                      order&apos;s pickup date.
+                    </p>
                   </div>
                   <textarea
                     id="tmpl-text"
@@ -1641,7 +1680,13 @@ export function SettingsView({
                     testId="settings-template-preview"
                     text={renderPreApprovalSamplePreview(
                       activeTemplate.body,
-                      channels[0]?.name ?? 'Farm Store'
+                      channels[0]?.name ?? 'Farm Store',
+                      {
+                        holdThresholdHours: draftSettings.holdThresholdHours,
+                        timezone: draftSettings.timezone,
+                        publicSnippetCutoffRules: draftSettings.publicSnippetCutoffRules,
+                        publicSnippetShowSameDay: draftSettings.publicSnippetShowSameDay,
+                      }
                     )}
                   />
                 </div>
@@ -1652,11 +1697,16 @@ export function SettingsView({
           {/* Thresholds & Save Bar */}
           <section className="rounded-lg border border-[#283340] bg-[#161D24] p-5">
             <h2 className="font-['Plus_Jakarta_Sans'] text-base font-bold text-[#F0F6FC]">
-              Hold Timer Threshold
+              Hold Cutoff Threshold
             </h2>
             <p className="mt-1 text-xs text-[#8B949E]">
-              Public calendar weeks ahead, ordering cutoffs, paused messages, and live GitHub
-              publishing are configured on the <span className="text-[#C9D1D9]">Availability Snippet</span> tab.
+              Controls when unconfirmed Pre-Approved orders trigger the top{' '}
+              <span className="text-[#C9D1D9]">Needs Attention</span> banner (to confirm, bump
+              forward, or release) and populates{' '}
+              <code className="font-mono text-[#38BDF8]">{'{{hold_cutoff}}'}</code>,{' '}
+              <code className="font-mono text-[#38BDF8]">{'{{hold_cutoff_by}}'}</code>, and{' '}
+              <code className="font-mono text-[#38BDF8]">{'{{hold_cutoff_date}}'}</code> in your
+              templates.
             </p>
             <div className="mt-4 max-w-sm">
               <label htmlFor="hold-hours" className="mb-1 block text-xs font-medium text-[#C9D1D9]">
@@ -1668,13 +1718,28 @@ export function SettingsView({
                 type="number"
                 min="1"
                 max="336"
-                value={draftSettings.holdThresholdHours}
-                onChange={(e) =>
+                value={holdHoursInput}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setHoldHoursInput(raw);
+                  const parsed = Number.parseInt(raw, 10);
+                  if (Number.isFinite(parsed) && parsed >= 1) {
+                    setDraftSettings({
+                      ...draftSettings,
+                      holdThresholdHours: Math.min(336, parsed),
+                    });
+                  }
+                }}
+                onBlur={() => {
+                  const parsed = Number.parseInt(holdHoursInput, 10);
+                  const clamped =
+                    Number.isFinite(parsed) && parsed >= 1 ? Math.min(336, parsed) : 48;
+                  setHoldHoursInput(String(clamped));
                   setDraftSettings({
                     ...draftSettings,
-                    holdThresholdHours: Math.max(1, Number(e.target.value) || 48),
-                  })
-                }
+                    holdThresholdHours: clamped,
+                  });
+                }}
                 className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 font-mono text-sm tabular-nums text-[#F0F6FC]"
               />
             </div>

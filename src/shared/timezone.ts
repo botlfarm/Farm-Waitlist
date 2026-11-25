@@ -53,6 +53,29 @@ export function formatLocalDateTime(date: Date, timezone: string = DEFAULT_TIMEZ
   }).format(date);
 }
 
+/** e.g. "Fri, Nov 27" in target timezone */
+export function formatLocalDateNoYear(date: Date, timezone: string = DEFAULT_TIMEZONE): string {
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  }).format(date);
+}
+
+/** e.g. "Fri, Nov 27 at 2:00 PM" in target timezone */
+export function formatLocalDateTimeNoYear(date: Date, timezone: string = DEFAULT_TIMEZONE): string {
+  if (Number.isNaN(date.getTime())) return '';
+  const datePart = formatLocalDateNoYear(date, timezone);
+  const timePart = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(date);
+  return `${datePart} at ${timePart}`;
+}
+
 /**
  * Formats a Date into ISO-like local string "YYYY-MM-DD HH:mm:ss" in the target timezone.
  */

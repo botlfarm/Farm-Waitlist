@@ -856,3 +856,37 @@ export function evaluateCandidateSlotDates(params: {
 
   return results;
 }
+
+/**
+ * Computes the next sensible pickup date when bumping an overdue or expired-hold order:
+ * - If the order's current slot is in the past (< today), starts searching from `today`.
+ * - If the order's current slot is today or in the future, starts searching from the day after its current slot.
+ * Respects the order's active PickupChannel schedule (weekly weekdays / specific event dates) when set.
+ */
+export function computeNextBumpDate(
+  order: Pick<OrderRecord, 'slottedDate' | 'pickupChannelId'>,
+  channels: PickupChannel[],
+  today: string
+): string {
+  const minDate =
+    order.slottedDate && order.slottedDate >= today
+      ? addDays(order.slottedDate, 1)
+      : today;
+
+  const channel = order.pickupChannelId
+    ? channels.find((c) => c.id === order.pickupChannelId && c.isActive) ?? null
+    : null;
+
+  if (!channel) {
+    return minDate;
+  }
+
+  for (let offset = 0; offset < 90; offset++) {
+    const candidate = addDays(minDate, offset);
+    if (isChannelActiveOnDate(channel, candidate, getIsoWeekday(candidate))) {
+      return candidate;
+    }
+  }
+
+  return minDate;
+}

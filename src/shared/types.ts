@@ -336,6 +336,7 @@ export interface WorkspacePayload {
   days: CalendarDayProjection[];
   orders: OrderRecord[];
   overdueOrders: OrderRecord[];
+  expiredHoldOrders?: OrderRecord[];
   reconciliationOrders: OrderRecord[];
   ignoredOrders: OrderRecord[];
   standingOrders: StandingOrder[];

@@ -2016,4 +2016,322 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
       restarted.close();
     }
   });
+
+  it('surfaces expired hold cutoff orders alongside overdue orders, bumps forward with hold timer reset, and renders hold_cutoff template variables', async () => {
+    const { createExpressApp } = await import('../../src/server/app');
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const now = new Date('2026-11-25T19:00:00Z'); // Wed, Nov 25 at 2:00 PM EST
+    const nowIso = now.toISOString();
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 10, 2, 1, 0, ?, ?)`
+        )
+        .run(nowIso, nowIso).lastInsertRowid
+    );
+    // Saturday-only channel to verify bump respects channel pickup days
+    const satChannelId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO pickup_channels (name, allowed_weekdays_json, color_token, is_active, sort_order)
+           VALUES ('Saturday Market', '[6]', 'amber', 1, 0)`
+        )
+        .run().lastInsertRowid
+    );
+    // Daily channel (Mon-Sun)
+    const dailyChannelId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO pickup_channels (name, allowed_weekdays_json, color_token, is_active, sort_order)
+           VALUES ('Farm Store', '[1,2,3,4,5,6,7]', 'sky', 1, 1)`
+        )
+        .run().lastInsertRowid
+    );
+
+    mgr.updateSettings({
+      holdThresholdHours: 48,
+      preApprovalTemplate:
+        'Hi {{first_name}}, held for {{hold_cutoff}} — please order by {{hold_cutoff_by}} ({{hold_cutoff_date}}) for {{date_short}}.',
+      preApprovalTemplates: [
+        {
+          id: 'default',
+          name: 'Default',
+          format: 'plain',
+          body: 'Hi {{first_name}}, held for {{hold_cutoff}} — please order by {{hold_cutoff_by}} ({{hold_cutoff_date}}) for {{date_short}}.',
+          channelIds: [],
+          itemIds: [],
+          isDefault: true,
+        },
+      ],
+    });
+
+    // Order 1: Past-date pre_approved on daily channel (Tue Nov 24, today is Wed Nov 25)
+    const pastOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, slotted_date, customer_name, pickup_channel_id, pre_approved_at, created_at, updated_at)
+           VALUES ('manual', 'pre_approved', 'specific_date', '2026-11-24', 'Past Paula', ?, '2026-11-24T12:00:00Z', ?, ?)`
+        )
+        .run(dailyChannelId, nowIso, nowIso).lastInsertRowid
+    );
+    mgr.db
+      .prepare('INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 2)')
+      .run(pastOrderId, itemId);
+
+    // Order 2: Future pre_approved on Saturday Market (Sat Nov 28) whose hold expired (50h ago > 48h)
+    const expiredHoldOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, slotted_date, customer_name, pickup_channel_id, pre_approved_at, created_at, updated_at)
+           VALUES ('manual', 'pre_approved', 'specific_date', '2026-11-28', 'Expired Eddie', ?, '2026-11-23T17:00:00Z', ?, ?)`
+        )
+        .run(satChannelId, nowIso, nowIso).lastInsertRowid
+    );
+    mgr.db
+      .prepare('INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 3)')
+      .run(expiredHoldOrderId, itemId);
+
+    // Order 3: Fresh slotted order to test pre-approve template rendering with hold cutoff variables
+    const freshOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, slotted_date, customer_name, pickup_channel_id, created_at, updated_at)
+           VALUES ('manual', 'slotted', 'specific_date', '2026-11-28', 'Fresh Fiona', ?, ?, ?)`
+        )
+        .run(dailyChannelId, nowIso, nowIso).lastInsertRowid
+    );
+    mgr.db
+      .prepare('INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 1)')
+      .run(freshOrderId, itemId);
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+      },
+      getNow: () => now,
+    });
+    const server = app.listen(0);
+    const addr = server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+    try {
+      // 1. Workspace exposes both overdueOrders and expiredHoldOrders
+      const wsRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
+      const ws = (await wsRes.json()) as {
+        overdueOrders: Array<{ id: number }>;
+        expiredHoldOrders: Array<{ id: number }>;
+      };
+      expect(ws.overdueOrders.map((o) => o.id)).toEqual([pastOrderId]);
+      expect(ws.expiredHoldOrders.map((o) => o.id)).toEqual([expiredHoldOrderId]);
+
+      // 2. Pre-approving Fresh Fiona renders {{hold_cutoff}}, {{hold_cutoff_by}}, and {{hold_cutoff_date}}
+      const preRes = await fetch(`http://127.0.0.1:${port}/api/orders/${freshOrderId}/pre-approve`, {
+        method: 'POST',
+      });
+      expect(preRes.status).toBe(200);
+      const preBody = (await preRes.json()) as { message: string };
+      expect(preBody.message).toBe(
+        'Hi Fresh, held for 48 hours — please order by Fri, Nov 27 at 2:00 PM (Fri, Nov 27) for Sat, Nov 28.'
+      );
+
+      // 3. Bumping Past Paula moves her from past Tue Nov 24 -> today Wed Nov 25 and resets hold timer
+      const bumpPastRes = await fetch(`http://127.0.0.1:${port}/api/orders/${pastOrderId}/bump`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      expect(bumpPastRes.status).toBe(200);
+      const bumpPastBody = (await bumpPastRes.json()) as {
+        previousDate: string;
+        bumpedToDate: string;
+        order: { slottedDate: string; preApprovedAt: string; status: string };
+      };
+      expect(bumpPastBody.previousDate).toBe('2026-11-24');
+      expect(bumpPastBody.bumpedToDate).toBe('2026-11-25');
+      expect(bumpPastBody.order.preApprovedAt).toBe(nowIso);
+      expect(bumpPastBody.order.status).toBe('pre_approved');
+
+      // 4. Bumping Expired Eddie (Saturday Market, Sat Nov 28) advances to next Saturday Dec 5 & resets hold timer
+      const bumpExpiredRes = await fetch(
+        `http://127.0.0.1:${port}/api/orders/${expiredHoldOrderId}/bump`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }
+      );
+      expect(bumpExpiredRes.status).toBe(200);
+      const bumpExpiredBody = (await bumpExpiredRes.json()) as {
+        bumpedToDate: string;
+        order: { slottedDate: string; preApprovedAt: string };
+      };
+      expect(bumpExpiredBody.bumpedToDate).toBe('2026-12-05');
+      expect(bumpExpiredBody.order.preApprovedAt).toBe(nowIso);
+
+      // 5. After bumping both, both overdueOrders and expiredHoldOrders are now empty!
+      const wsAfterRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
+      const wsAfter = (await wsAfterRes.json()) as {
+        overdueOrders: Array<{ id: number }>;
+        expiredHoldOrders: Array<{ id: number }>;
+      };
+      expect(wsAfter.overdueOrders).toHaveLength(0);
+      expect(wsAfter.expiredHoldOrders).toHaveLength(0);
+
+      // 6. Undo cleanly restores Expired Eddie back to Sat Nov 28
+      const undoRes = await fetch(`http://127.0.0.1:${port}/api/checkpoints/undo`, {
+        method: 'POST',
+      });
+      expect(undoRes.status).toBe(200);
+      const wsUndoRes = await fetch(`http://127.0.0.1:${port}/api/workspace`);
+      const wsUndo = (await wsUndoRes.json()) as {
+        expiredHoldOrders: Array<{ id: number; slottedDate: string }>;
+      };
+      expect(wsUndo.expiredHoldOrders.map((o) => o.id)).toEqual([expiredHoldOrderId]);
+      expect(wsUndo.expiredHoldOrders[0].slottedDate).toBe('2026-11-28');
+    } finally {
+      server.close();
+      mgr.close();
+    }
+  });
+
+  it('resolves {{order_cutoff}}, {{order_cutoff_date}}, and {{order_cutoff_time}} from Public Order Cutoff Rules on pre-approval', async () => {
+    const { createExpressApp } = await import('../../src/server/app');
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const fixedNow = new Date('2026-11-25T19:00:00Z'); // Wed, Nov 25, 2026 2:00 PM EST
+    const nowIso = fixedNow.toISOString();
+
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 12, 0, 1, 1, ?, ?)`
+        )
+        .run(nowIso, nowIso).lastInsertRowid
+    );
+    const channelId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO pickup_channels (name, allowed_weekdays_json, color_token, is_active, sort_order)
+           VALUES ('Farm Store', '[1,2,3,4,5,6,7]', 'sky', 1, 1)`
+        )
+        .run().lastInsertRowid
+    );
+
+    const templateBody =
+      'Hi {{first_name}}, please order by {{order_cutoff}} ({{order_cutoff_date}} at {{order_cutoff_time}}) for {{date_short}}.';
+    mgr.updateSettings({
+      preApprovalTemplate: templateBody,
+      preApprovalTemplates: [
+        {
+          id: 'default',
+          name: 'Default',
+          format: 'plain',
+          body: templateBody,
+          channelIds: [],
+          itemIds: [],
+          isDefault: true,
+        },
+      ],
+      publicSnippetShowSameDay: true,
+      publicSnippetCutoffRules: [
+        // Rule 1: 1 day before at 4:00 PM for all pickup days
+        {
+          id: 'r-1day',
+          enabled: true,
+          mode: 'days_before',
+          daysBefore: 1,
+          cutoffWeekday: 5,
+          cutoffTime: '16:00',
+          pickupWeekdays: [],
+        },
+        // Rule 2: Weekly Thursday at 6:00 PM specifically for Saturday pickups (earlier than Fri 4pm!)
+        {
+          id: 'r-sat-thu',
+          enabled: true,
+          mode: 'weekly_day',
+          daysBefore: 1,
+          cutoffWeekday: 4,
+          cutoffTime: '18:00',
+          pickupWeekdays: [6],
+        },
+      ],
+    });
+
+    const satOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, slotted_date, customer_name, pickup_channel_id, created_at, updated_at)
+           VALUES ('manual', 'slotted', 'specific_date', '2026-11-28', 'Sam Saturday', ?, ?, ?)`
+        )
+        .run(channelId, nowIso, nowIso).lastInsertRowid
+    );
+    const monOrderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, slotted_date, customer_name, pickup_channel_id, created_at, updated_at)
+           VALUES ('manual', 'slotted', 'specific_date', '2026-11-30', 'Mona Monday', ?, ?, ?)`
+        )
+        .run(channelId, nowIso, nowIso).lastInsertRowid
+    );
+    mgr.db
+      .prepare(`INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 2)`)
+      .run(satOrderId, itemId);
+    mgr.db
+      .prepare(`INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 2)`)
+      .run(monOrderId, itemId);
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+      },
+      getNow: () => fixedNow,
+    });
+    const server = app.listen(0);
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+
+    try {
+      // Saturday Nov 28 matches both rules; earliest is Thu, Nov 26 at 6:00 PM
+      const satRes = await fetch(`http://127.0.0.1:${port}/api/orders/${satOrderId}/pre-approve`, {
+        method: 'POST',
+      });
+      expect(satRes.status).toBe(200);
+      const satBody = (await satRes.json()) as { message: string };
+      expect(satBody.message).toBe(
+        'Hi Sam, please order by Thu, Nov 26 at 6:00 PM (Thu, Nov 26 at 6:00 PM) for Sat, Nov 28.'
+      );
+
+      // Monday Nov 30 matches only the 1-day-before rule -> Sun, Nov 29 at 4:00 PM
+      const monRes = await fetch(`http://127.0.0.1:${port}/api/orders/${monOrderId}/pre-approve`, {
+        method: 'POST',
+      });
+      expect(monRes.status).toBe(200);
+      const monBody = (await monRes.json()) as { message: string };
+      expect(monBody.message).toBe(
+        'Hi Mona, please order by Sun, Nov 29 at 4:00 PM (Sun, Nov 29 at 4:00 PM) for Mon, Nov 30.'
+      );
+    } finally {
+      server.close();
+      mgr.close();
+    }
+  });
 });

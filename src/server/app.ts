@@ -9,6 +9,7 @@ import {
 } from '../shared/generators';
 import { selectPrimaryOdooSide } from '../shared/orderMatching';
 import {
+  computeNextBumpDate,
   findEarliestValidSlotDate,
   isWeekdayAllowedForChannel,
   projectDailySupply,
@@ -17,6 +18,7 @@ import {
   DEFAULT_TIMEZONE,
   addDays,
   compareWaitlistOrders,
+  getAgingHoldHours,
   getMondayOfWeek,
   getTodayDateKey,
 } from '../shared/timezone';
@@ -109,7 +111,7 @@ const AVAILABILITY_MUTATION_ROUTES: Array<{ method: string; pattern: RegExp }> =
   { method: 'DELETE', pattern: /^\/orders\/\d+$/ },
   {
     method: 'POST',
-    pattern: /^\/orders\/\d+\/(slot|pre-approve|release-hold|ignore|restore-ignored|reconcile|merge)$/,
+    pattern: /^\/orders\/\d+\/(slot|pre-approve|release-hold|bump|ignore|restore-ignored|reconcile|merge)$/,
   },
   { method: 'POST', pattern: /^\/orders\/auto-slot$/ },
   { method: 'POST', pattern: /^\/standing-orders$/ },
@@ -232,12 +234,23 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       today,
     });
 
+    const now = getNow();
+    const holdCutoffHours = Math.max(1, settings.holdThresholdHours || 48);
+
     const overdueOrders = activeOrders.filter(
       (o) =>
         o.slottedDate !== null &&
         o.slottedDate < today &&
         (o.status === 'slotted' || o.status === 'pre_approved')
     );
+
+    const expiredHoldOrders = activeOrders.filter((o) => {
+      if (o.status !== 'pre_approved' || !o.slottedDate || o.slottedDate < today) {
+        return false;
+      }
+      const aging = getAgingHoldHours(o.preApprovedAt, now);
+      return aging !== null && aging >= holdCutoffHours;
+    });
 
     const reconciliationOrders = activeOrders.filter(
       (o) => o.source === 'odoo' && o.odooMissingFlagged && o.status !== 'confirmed'
@@ -258,6 +271,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       days,
       orders: activeOrders,
       overdueOrders,
+      expiredHoldOrders,
       reconciliationOrders,
       ignoredOrders,
       standingOrders: listStandingOrders(db),
@@ -1038,7 +1052,8 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
 
     captureCheckpoint(db, `Pre-approve ${existing.customerName}`);
 
-    const nowIso = new Date().toISOString();
+    const nowDate = getNow();
+    const nowIso = nowDate.toISOString();
     db.prepare(
       `UPDATE orders SET status = 'pre_approved', pre_approved_at = COALESCE(pre_approved_at, ?), updated_at = ? WHERE id = ?`
     ).run(nowIso, nowIso, id);
@@ -1052,12 +1067,71 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       order: updated,
       items: listTrackedItems(db),
       channels: listPickupChannels(db),
+      holdThresholdHours: settings.holdThresholdHours,
+      timezone: settings.timezone || config.timezone || DEFAULT_TIMEZONE,
+      now: nowDate,
+      publicSnippetCutoffRules: settings.publicSnippetCutoffRules,
+      publicSnippetShowSameDay: settings.publicSnippetShowSameDay,
     });
 
     res.json({
       order: updated,
       message,
       selectedTemplateId: matchedTemplate?.id ?? null,
+    });
+  });
+
+  // Bump an overdue or expired-hold order forward to the next valid pickup day & reset pre-approved hold timer
+  router.post('/orders/:id/bump', (req: Request, res: Response) => {
+    const id = parsePositiveId(String(req.params.id));
+    if (!id) {
+      res.status(400).json({ error: 'Invalid order ID' });
+      return;
+    }
+    const db = dbManager.db;
+    const existing = getOrderById(db, id);
+    if (!existing) {
+      res.status(404).json({ error: 'Order not found' });
+      return;
+    }
+
+    const { today } = getHorizon();
+    const channels = listPickupChannels(db);
+    const requestedTarget = typeof req.body?.date === 'string' ? req.body.date.trim() : '';
+    if (requestedTarget && !VALID_DATE_RE.test(requestedTarget)) {
+      res.status(400).json({ error: 'Invalid target date format (YYYY-MM-DD)' });
+      return;
+    }
+
+    const targetDate = requestedTarget || computeNextBumpDate(existing, channels, today);
+    const previousDate = existing.slottedDate;
+    const nowIso = getNow().toISOString();
+
+    captureCheckpoint(db, `Bump ${existing.customerName} -> ${targetDate}`);
+
+    const nextStatus: OrderStatus =
+      existing.status === 'waitlist' ? 'slotted' : existing.status;
+    const nextPreApprovedAt =
+      nextStatus === 'pre_approved' ? nowIso : existing.preApprovedAt;
+
+    db.prepare(
+      `UPDATE orders
+       SET slotted_date = ?, status = ?, pre_approved_at = ?, updated_at = ?
+       WHERE id = ?`
+    ).run(targetDate, nextStatus, nextPreApprovedAt, nowIso, id);
+
+    if (existing.source === 'standing' && existing.standingOrderId && existing.standingOccurrenceDate) {
+      db.prepare(
+        `INSERT INTO standing_order_exceptions (standing_order_id, occurrence_date, action, override_order_id)
+         VALUES (?, ?, 'modified', ?)
+         ON CONFLICT(standing_order_id, occurrence_date) DO UPDATE SET action = 'modified', override_order_id = excluded.override_order_id`
+      ).run(existing.standingOrderId, existing.standingOccurrenceDate, id);
+    }
+
+    res.json({
+      order: getOrderById(db, id)!,
+      previousDate,
+      bumpedToDate: targetDate,
     });
   });
 

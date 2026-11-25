@@ -532,6 +532,16 @@ export default function App() {
                   );
                 }
               }}
+              onConfirmOrder={async (orderId) => {
+                await api.updateOrder(orderId, { status: 'confirmed' });
+                await refreshWorkspace();
+                showToast('Order marked confirmed (Undo available)');
+              }}
+              onBumpOrder={async (orderId, targetDate) => {
+                const res = await api.bumpOrder(orderId, targetDate);
+                await refreshWorkspace();
+                showToast(`Bumped order to ${res.bumpedToDate} (Undo available)`);
+              }}
               onReleaseHold={async (orderId) => {
                 await api.releaseHold(orderId);
                 await refreshWorkspace();
@@ -713,6 +723,18 @@ export default function App() {
             }}
             onExtendWeeks={() => setWeeks((w) => Math.min(26, w + 2))}
             onPreApprove={handlePreApprove}
+            onConfirmOrder={async (orderId) => {
+              await api.updateOrder(orderId, { status: 'confirmed' });
+              await refreshWorkspace();
+              showToast('Order marked confirmed (Undo available)');
+              setSelectedOrderId(null);
+            }}
+            onBumpOrder={async (orderId, targetDate) => {
+              const res = await api.bumpOrder(orderId, targetDate);
+              await refreshWorkspace();
+              showToast(`Bumped order to ${res.bumpedToDate} (Undo available)`);
+              setSelectedOrderId(null);
+            }}
             onReleaseHold={async (orderId) => {
               await api.releaseHold(orderId);
               await refreshWorkspace();
@@ -819,6 +841,10 @@ export default function App() {
             templates={workspace.settings.preApprovalTemplates ?? []}
             items={workspace.items}
             channels={workspace.channels}
+            holdThresholdHours={workspace.settings.holdThresholdHours}
+            timezone={workspace.settings.timezone}
+            publicSnippetCutoffRules={workspace.settings.publicSnippetCutoffRules}
+            publicSnippetShowSameDay={workspace.settings.publicSnippetShowSameDay}
             onClose={() =>
               setPreApprovalState({
                 open: false,

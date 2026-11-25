@@ -6,7 +6,9 @@ import {
   formatDateNoYear,
   formatDateNumeric,
   formatFullDisplayDate,
+  formatLocalDateNoYear,
   formatLocalDateTime,
+  formatLocalDateTimeNoYear,
   formatLocalTimeHHMM,
   formatShortCalendarDate,
   formatWeekdayLong,
@@ -84,7 +86,7 @@ export interface TemplateVariableMeta {
   token: string;
   label: string;
   example: string;
-  group: 'name' | 'date' | 'order';
+  group: 'name' | 'date' | 'order' | 'hold' | 'cutoff';
 }
 
 export const PRE_APPROVAL_TEMPLATE_VARIABLES: TemplateVariableMeta[] = [
@@ -100,7 +102,137 @@ export const PRE_APPROVAL_TEMPLATE_VARIABLES: TemplateVariableMeta[] = [
   { key: 'items_summary', token: '{{items_summary}}', label: 'Items summary', example: '2 dozens Standard Eggs', group: 'order' },
   { key: 'channel', token: '{{channel}}', label: 'Pickup channel', example: 'Farm Store', group: 'order' },
   { key: 'order_ref', token: '{{order_ref}}', label: 'Order reference', example: 'S00105', group: 'order' },
+  { key: 'hold_cutoff', token: '{{hold_cutoff}}', label: 'Hold cutoff window', example: '48 hours', group: 'hold' },
+  { key: 'hold_cutoff_by', token: '{{hold_cutoff_by}}', label: 'Hold deadline date & time', example: 'Fri, Nov 27 at 2:00 PM', group: 'hold' },
+  { key: 'hold_cutoff_date', token: '{{hold_cutoff_date}}', label: 'Hold deadline date (no year)', example: 'Fri, Nov 27', group: 'hold' },
+  { key: 'order_cutoff', token: '{{order_cutoff}}', label: 'Public order cutoff (date & time)', example: 'Fri, Nov 27 at 4:00 PM', group: 'cutoff' },
+  { key: 'order_cutoff_date', token: '{{order_cutoff_date}}', label: 'Public order cutoff date (no year)', example: 'Fri, Nov 27', group: 'cutoff' },
+  { key: 'order_cutoff_time', token: '{{order_cutoff_time}}', label: 'Public order cutoff time', example: '4:00 PM', group: 'cutoff' },
 ];
+
+export function format24HourTimeTo12Hour(hhmm: string): string {
+  const parts = hhmm.trim().split(':');
+  if (parts.length !== 2) return hhmm;
+  const h = Number(parts[0]);
+  const m = parts[1];
+  if (!Number.isFinite(h)) return hhmm;
+  const suffix = h >= 12 ? 'PM' : 'AM';
+  const hr12 = h % 12 === 0 ? 12 : h % 12;
+  return `${hr12}:${m} ${suffix}`;
+}
+
+export function formatHoldCutoffDuration(hours: number): string {
+  const safeHours = Number.isFinite(hours) && hours > 0 ? Math.round(hours) : 48;
+  return safeHours === 1 ? '1 hour' : `${safeHours} hours`;
+}
+
+export function resolveHoldCutoffValues(params: {
+  holdThresholdHours?: number;
+  baseIso?: string | null;
+  timezone?: string;
+  now?: Date;
+}): {
+  holdCutoff: string;
+  holdCutoffBy: string;
+  holdCutoffDate: string;
+} {
+  const safeHours =
+    typeof params.holdThresholdHours === 'number' &&
+    Number.isFinite(params.holdThresholdHours) &&
+    params.holdThresholdHours > 0
+      ? Math.round(params.holdThresholdHours)
+      : 48;
+  const tz = params.timezone || DEFAULT_TIMEZONE;
+  const baseDate = params.baseIso ? new Date(params.baseIso) : params.now ?? new Date();
+  const validBase = Number.isNaN(baseDate.getTime()) ? params.now ?? new Date() : baseDate;
+  const deadline = new Date(validBase.getTime() + safeHours * 3_600_000);
+
+  return {
+    holdCutoff: formatHoldCutoffDuration(safeHours),
+    holdCutoffBy: formatLocalDateTimeNoYear(deadline, tz),
+    holdCutoffDate: formatLocalDateNoYear(deadline, tz),
+  };
+}
+
+/**
+ * Resolves the earliest active Public Order Cutoff deadline (from Availability Snippet rules)
+ * for a given pickup date, formatted for pre-approval message templates.
+ */
+export function resolvePublicOrderCutoffValues(params: {
+  pickupDate?: string | null;
+  cutoffRules?: SnippetCutoffRule[];
+  showSameDay?: boolean;
+}): {
+  orderCutoff: string;
+  orderCutoffDate: string;
+  orderCutoffTime: string;
+  hasRule: boolean;
+} {
+  const pickupDate = (params.pickupDate ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(pickupDate)) {
+    return {
+      orderCutoff: 'the order cutoff',
+      orderCutoffDate: 'the order cutoff date',
+      orderCutoffTime: 'the cutoff time',
+      hasRule: false,
+    };
+  }
+
+  const normalizedRules = normalizeCutoffRules(params.cutoffRules ?? []);
+  const pickupIso = getIsoWeekday(pickupDate);
+
+  let earliest: { cutoffDate: string; cutoffTime: string; sortKey: string } | null = null;
+
+  for (const rule of normalizedRules) {
+    if (!rule.enabled) continue;
+    if (rule.pickupWeekdays.length > 0 && !rule.pickupWeekdays.includes(pickupIso)) {
+      continue;
+    }
+
+    let cutoffDate: string;
+    if (rule.mode === 'weekly_day') {
+      const delta = (pickupIso - rule.cutoffWeekday + 7) % 7;
+      cutoffDate = addDays(pickupDate, -delta);
+    } else {
+      const daysBefore = Math.max(0, Math.min(14, Math.floor(rule.daysBefore || 0)));
+      cutoffDate = addDays(pickupDate, -daysBefore);
+    }
+
+    const sortKey = `${cutoffDate}T${rule.cutoffTime}`;
+    if (!earliest || sortKey < earliest.sortKey) {
+      earliest = { cutoffDate, cutoffTime: rule.cutoffTime, sortKey };
+    }
+  }
+
+  if (earliest) {
+    const dateLabel = formatDateNoYear(earliest.cutoffDate);
+    const timeLabel = format24HourTimeTo12Hour(earliest.cutoffTime);
+    return {
+      orderCutoff: `${dateLabel} at ${timeLabel}`,
+      orderCutoffDate: dateLabel,
+      orderCutoffTime: timeLabel,
+      hasRule: true,
+    };
+  }
+
+  if (params.showSameDay === false) {
+    const prevDateLabel = formatDateNoYear(addDays(pickupDate, -1));
+    return {
+      orderCutoff: `${prevDateLabel} at 11:59 PM`,
+      orderCutoffDate: prevDateLabel,
+      orderCutoffTime: '11:59 PM',
+      hasRule: true,
+    };
+  }
+
+  const pickupLabel = formatDateNoYear(pickupDate);
+  return {
+    orderCutoff: pickupLabel,
+    orderCutoffDate: pickupLabel,
+    orderCutoffTime: 'pickup time',
+    hasRule: false,
+  };
+}
 
 interface ResolvedTemplateValues {
   name: string;
@@ -115,6 +247,12 @@ interface ResolvedTemplateValues {
   itemsSummary: string;
   channel: string;
   orderRef: string;
+  holdCutoff: string;
+  holdCutoffBy: string;
+  holdCutoffDate: string;
+  orderCutoff: string;
+  orderCutoffDate: string;
+  orderCutoffTime: string;
 }
 
 function applyPreApprovalTemplateValues(template: string, values: ResolvedTemplateValues): string {
@@ -130,7 +268,13 @@ function applyPreApprovalTemplateValues(template: string, values: ResolvedTempla
     .replace(/\{\{\s*date\s*\}\}/gi, values.date)
     .replace(/\{\{\s*items_summary\s*\}\}/gi, values.itemsSummary)
     .replace(/\{\{\s*channel\s*\}\}/gi, values.channel)
-    .replace(/\{\{\s*order_ref\s*\}\}/gi, values.orderRef);
+    .replace(/\{\{\s*order_ref\s*\}\}/gi, values.orderRef)
+    .replace(/\{\{\s*hold_cutoff_by\s*\}\}/gi, values.holdCutoffBy)
+    .replace(/\{\{\s*hold_cutoff_date\s*\}\}/gi, values.holdCutoffDate)
+    .replace(/\{\{\s*hold_cutoff\s*\}\}/gi, values.holdCutoff)
+    .replace(/\{\{\s*order_cutoff_date\s*\}\}/gi, values.orderCutoffDate)
+    .replace(/\{\{\s*order_cutoff_time\s*\}\}/gi, values.orderCutoffTime)
+    .replace(/\{\{\s*order_cutoff\s*\}\}/gi, values.orderCutoff);
 }
 
 function resolveDateFormatValues(effectiveYmd: string | null | undefined) {
@@ -159,8 +303,23 @@ export function renderPreApprovalMessage(params: {
   order: OrderRecord;
   items: TrackedItem[];
   channels: PickupChannel[];
+  holdThresholdHours?: number;
+  timezone?: string;
+  now?: Date;
+  publicSnippetCutoffRules?: SnippetCutoffRule[];
+  publicSnippetShowSameDay?: boolean;
 }): string {
-  const { template, order, items, channels } = params;
+  const {
+    template,
+    order,
+    items,
+    channels,
+    holdThresholdHours,
+    timezone,
+    now,
+    publicSnippetCutoffRules,
+    publicSnippetShowSameDay,
+  } = params;
   const itemsById = new Map(items.map((i) => [i.id, i]));
   const channel = order.pickupChannelId
     ? channels.find((c) => c.id === order.pickupChannelId)?.name ?? order.freeTextPickup ?? 'Farm Pickup'
@@ -171,6 +330,17 @@ export function renderPreApprovalMessage(params: {
   const nameParts = splitCustomerName(order.customerName);
   const itemsSummary = formatOrderItemsSummary(order, itemsById);
   const orderRef = (order.odooQuotationName ?? '').trim();
+  const holdValues = resolveHoldCutoffValues({
+    holdThresholdHours,
+    baseIso: order.preApprovedAt,
+    timezone,
+    now,
+  });
+  const orderCutoffValues = resolvePublicOrderCutoffValues({
+    pickupDate: effectiveYmd,
+    cutoffRules: publicSnippetCutoffRules,
+    showSameDay: publicSnippetShowSameDay,
+  });
 
   return applyPreApprovalTemplateValues(template, {
     name: nameParts.fullName,
@@ -180,14 +350,36 @@ export function renderPreApprovalMessage(params: {
     itemsSummary,
     channel,
     orderRef,
+    ...holdValues,
+    orderCutoff: orderCutoffValues.orderCutoff,
+    orderCutoffDate: orderCutoffValues.orderCutoffDate,
+    orderCutoffTime: orderCutoffValues.orderCutoffTime,
   });
 }
 
+const SAMPLE_PREVIEW_ANCHOR_ISO = '2026-11-25T19:00:00Z'; // Wed, Nov 25 at 2:00 PM EST
+
 export function renderPreApprovalSamplePreview(
   template: string,
-  channelName: string = 'Farm Store'
+  channelName: string = 'Farm Store',
+  options?: {
+    holdThresholdHours?: number;
+    timezone?: string;
+    publicSnippetCutoffRules?: SnippetCutoffRule[];
+    publicSnippetShowSameDay?: boolean;
+  }
 ): string {
   const dates = resolveDateFormatValues('2026-11-28');
+  const holdValues = resolveHoldCutoffValues({
+    holdThresholdHours: options?.holdThresholdHours ?? 48,
+    baseIso: SAMPLE_PREVIEW_ANCHOR_ISO,
+    timezone: options?.timezone ?? DEFAULT_TIMEZONE,
+  });
+  const orderCutoffValues = resolvePublicOrderCutoffValues({
+    pickupDate: '2026-11-28',
+    cutoffRules: options?.publicSnippetCutoffRules,
+    showSameDay: options?.publicSnippetShowSameDay,
+  });
   return applyPreApprovalTemplateValues(template, {
     name: 'Alex Rivera',
     firstName: 'Alex',
@@ -196,6 +388,10 @@ export function renderPreApprovalSamplePreview(
     itemsSummary: '2 dozens Standard Eggs',
     channel: channelName || 'Farm Store',
     orderRef: 'S00105',
+    ...holdValues,
+    orderCutoff: orderCutoffValues.orderCutoff,
+    orderCutoffDate: orderCutoffValues.orderCutoffDate,
+    orderCutoffTime: orderCutoffValues.orderCutoffTime,
   });
 }
 
