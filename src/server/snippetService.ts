@@ -11,6 +11,7 @@ import {
   getTodayDateKey,
 } from '../shared/timezone';
 import type {
+  AppSettings,
   GithubPublishStatus,
   PublicAvailabilityJsonPayload,
   PublicAvailabilityResult,
@@ -40,8 +41,17 @@ export function buildSnippetForDatabase(params: {
   config: RuntimeConfig;
   weeksOverride?: number;
   now?: Date;
+  accurateAsOf?: Date;
+  skipMaterialize?: boolean;
 }): BuiltSnippetBundle {
-  const { dbManager, config, weeksOverride, now = new Date() } = params;
+  const {
+    dbManager,
+    config,
+    weeksOverride,
+    now = new Date(),
+    accurateAsOf,
+    skipMaterialize = false,
+  } = params;
   const db = dbManager.db;
   const settings = dbManager.getSettings();
   const timezone = settings.timezone || config.timezone || DEFAULT_TIMEZONE;
@@ -56,7 +66,9 @@ export function buildSnippetForDatabase(params: {
   const startDate = getMondayOfWeek(today);
   const endDate = addDays(startDate, horizonWeeks * 7 - 1);
 
-  materializeStandingOrders(db, today, endDate);
+  if (!skipMaterialize && !dbManager.isBackupPreviewActive()) {
+    materializeStandingOrders(db, today, endDate);
+  }
 
   const items = listTrackedItems(db);
   const channels = listPickupChannels(db);
@@ -81,6 +93,7 @@ export function buildSnippetForDatabase(params: {
     weeks,
     timezone,
     now,
+    accurateAsOf,
     enabled: settings.publicSnippetEnabled !== false,
     pausedMessage: settings.publicSnippetPausedMessage,
     showSameDay: settings.publicSnippetShowSameDay !== false,
@@ -193,7 +206,16 @@ export async function publishSnippetSnapshotToGithub(params: {
     }
   }
 
-  const { jsonPayload } = buildSnippetForDatabase({ dbManager, config, now });
+  // For background auto-publishes, display the timestamp when the user actually edited
+  // availability rather than when the background interval woke up (so a late-evening edit
+  // never shows a 12:25 AM midnight timestamp). Manual "Publish to Website" uses `now`.
+  const editedMsForDisplay =
+    !force && requireUserEdit && settings.availabilityLastEditedAt
+      ? Date.parse(settings.availabilityLastEditedAt)
+      : NaN;
+  const accurateAsOf = Number.isFinite(editedMsForDisplay) ? new Date(editedMsForDisplay) : now;
+
+  const { jsonPayload } = buildSnippetForDatabase({ dbManager, config, now, accurateAsOf });
 
   const repo =
     (overrides?.repo ?? '').trim() ||
@@ -236,11 +258,26 @@ export async function publishSnippetSnapshotToGithub(params: {
       };
     }
 
-    // Skipped (no semantic changes) — clear stale error while preserving lastPublishedAt/Hash
+    // Skipped (no semantic changes) — acknowledge any stale pending edit timestamp so it never
+    // lingers until midnight when yesterday rolls into isPast, and clear stale errors.
+    const ackPatch: Partial<AppSettings> = {};
+    if (settings.githubLastPublishStatus === 'error') {
+      ackPatch.githubLastPublishError = null;
+    }
+    const lastEditedMsNow = settings.availabilityLastEditedAt
+      ? Date.parse(settings.availabilityLastEditedAt)
+      : NaN;
+    const lastPublishedMsNow = settings.githubLastPublishedAt
+      ? Date.parse(settings.githubLastPublishedAt)
+      : NaN;
+    if (
+      Number.isFinite(lastEditedMsNow) &&
+      (!Number.isFinite(lastPublishedMsNow) || lastEditedMsNow > lastPublishedMsNow)
+    ) {
+      ackPatch.availabilityLastEditedAt = settings.githubLastPublishedAt ?? null;
+    }
     const currentStatus =
-      settings.githubLastPublishStatus === 'error'
-        ? dbManager.updateSettings({ githubLastPublishError: null })
-        : settings;
+      Object.keys(ackPatch).length > 0 ? dbManager.updateSettings(ackPatch) : settings;
     return {
       ...result,
       githubPublishStatus: getRedactedGithubPublishStatus(config, currentStatus),

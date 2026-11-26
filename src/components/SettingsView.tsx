@@ -61,6 +61,7 @@ interface SettingsViewProps {
   backupPreviewBusy?: boolean;
   onEnterBackupPreview?: (filename: string) => Promise<void>;
   onExitBackupPreview?: () => Promise<void>;
+  onNavigateToCalendar?: () => void;
   onWorkspaceChanged: () => Promise<void>;
   onToast: (message: string, kind?: 'info' | 'error') => void;
 }
@@ -69,6 +70,21 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function formatBackupTriggerLabel(trigger: BackupInfo['trigger']): string {
+  switch (trigger) {
+    case 'pre-restore':
+      return 'Previous DB (before restore)';
+    case 'pre-sandbox':
+      return 'Previous DB (before sandbox)';
+    case 'pre-migrate':
+      return 'Previous DB (before update)';
+    case 'scheduled':
+      return 'Scheduled daily';
+    default:
+      return 'Manual snapshot';
+  }
 }
 
 export function SettingsView({
@@ -85,6 +101,7 @@ export function SettingsView({
   backupPreviewBusy = false,
   onEnterBackupPreview,
   onExitBackupPreview,
+  onNavigateToCalendar,
   onWorkspaceChanged,
   onToast,
 }: SettingsViewProps) {
@@ -132,6 +149,14 @@ export function SettingsView({
   const [backups, setBackups] = useState<BackupInfo[]>([]);
   const [loadingBackups, setLoadingBackups] = useState(false);
   const [confirmRestoreFile, setConfirmRestoreFile] = useState<string | null>(null);
+  const [restoringFile, setRestoringFile] = useState<string | null>(null);
+  const [uploadingBackup, setUploadingBackup] = useState(false);
+  const [lastRestoreNotice, setLastRestoreNotice] = useState<{
+    restoredLabel: string;
+    safetySnapshotFilename: string;
+    itemsCount?: number;
+    ordersCount?: number;
+  } | null>(null);
 
   useEffect(() => {
     setDraftSettings(settings);
@@ -245,7 +270,7 @@ export function SettingsView({
     if (section === 'backups') {
       void loadBackups();
     }
-  }, [section, sandboxStatus?.active]);
+  }, [section, sandboxStatus?.active, backupPreviewStatus?.active]);
 
   const handleAddItem = async () => {
     if (!itemName.trim()) {
@@ -465,28 +490,60 @@ export function SettingsView({
   };
 
   const handleRestoreBackup = async (filename: string) => {
+    if (restoringFile) return;
+    setRestoringFile(filename);
     try {
       const res = await api.restoreBackup(filename);
       setConfirmRestoreFile(null);
       await loadBackups();
       await onWorkspaceChanged();
-      onToast(`Restored ${filename} (safety snapshot: ${res.safetySnapshot.filename})`);
+      setLastRestoreNotice({
+        restoredLabel: filename,
+        safetySnapshotFilename: res.safetySnapshot.filename,
+        itemsCount: res.itemsCount,
+        ordersCount: res.ordersCount,
+      });
+      const countText =
+        typeof res.ordersCount === 'number' && typeof res.itemsCount === 'number'
+          ? ` (${res.itemsCount} item${res.itemsCount === 1 ? '' : 's'}, ${res.ordersCount} order${res.ordersCount === 1 ? '' : 's'})`
+          : '';
+      onToast(
+        `Restored ${filename}${countText}. Previous DB saved as ${res.safetySnapshot.filename}.`
+      );
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Restore failed', 'error');
+    } finally {
+      setRestoringFile(null);
     }
   };
 
   const handleUploadBackup = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = '';
-    if (!file) return;
+    if (!file || uploadingBackup) return;
+    setUploadingBackup(true);
     try {
       const res = await api.uploadBackup(file);
+      setConfirmRestoreFile(null);
       await loadBackups();
       await onWorkspaceChanged();
-      onToast(`Uploaded & restored ${file.name} (safety snapshot: ${res.safetySnapshot.filename})`);
+      setLastRestoreNotice({
+        restoredLabel: file.name,
+        safetySnapshotFilename: res.safetySnapshot.filename,
+        itemsCount: res.itemsCount,
+        ordersCount: res.ordersCount,
+      });
+      const countText =
+        typeof res.ordersCount === 'number' && typeof res.itemsCount === 'number'
+          ? ` (${res.itemsCount} item${res.itemsCount === 1 ? '' : 's'}, ${res.ordersCount} order${res.ordersCount === 1 ? '' : 's'})`
+          : '';
+      onToast(
+        `Restored uploaded database ${file.name}${countText}. Previous DB saved as ${res.safetySnapshot.filename}.`
+      );
     } catch (err) {
       onToast(err instanceof Error ? err.message : 'Invalid SQLite upload', 'error');
+    } finally {
+      setUploadingBackup(false);
     }
   };
 
@@ -1864,18 +1921,23 @@ export function SettingsView({
               <div className="flex flex-wrap items-center gap-2">
                 <label
                   className={`inline-flex min-h-[40px] items-center gap-2 rounded-md border border-[#283340] bg-[#0F1419] px-4 py-2 text-xs font-semibold text-[#E6EDF3] ${
-                    sandboxStatus?.active || isBackupPreviewActive
+                    sandboxStatus?.active || isBackupPreviewActive || uploadingBackup || Boolean(restoringFile)
                       ? 'cursor-not-allowed opacity-45'
                       : 'cursor-pointer hover:border-[#38BDF8]'
                   }`}
                 >
                   <Upload className="h-4 w-4" />
-                  Upload .db to Restore
+                  {uploadingBackup ? 'Restoring Upload...' : 'Upload .db to Restore'}
                   <input
                     type="file"
                     accept=".db,.sqlite,.sqlite3"
                     data-testid="backup-upload-input"
-                    disabled={Boolean(sandboxStatus?.active) || isBackupPreviewActive}
+                    disabled={
+                      Boolean(sandboxStatus?.active) ||
+                      isBackupPreviewActive ||
+                      uploadingBackup ||
+                      Boolean(restoringFile)
+                    }
                     onChange={(e) => void handleUploadBackup(e)}
                     className="hidden"
                   />
@@ -1931,6 +1993,51 @@ export function SettingsView({
             </div>
           </section>
 
+          {lastRestoreNotice && (
+            <div
+              data-testid="backup-restore-success-banner"
+              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#16A34A]/60 bg-[#16A34A]/12 px-4 py-3 text-xs text-[#DCFCE7]"
+            >
+              <div className="space-y-0.5">
+                <p className="font-semibold text-[#86EFAC]">
+                  Database Restored from {lastRestoreNotice.restoredLabel}
+                  {typeof lastRestoreNotice.itemsCount === 'number' &&
+                  typeof lastRestoreNotice.ordersCount === 'number'
+                    ? ` — ${lastRestoreNotice.itemsCount} active item${lastRestoreNotice.itemsCount === 1 ? '' : 's'}, ${lastRestoreNotice.ordersCount} active order${lastRestoreNotice.ordersCount === 1 ? '' : 's'} now live.`
+                    : ' — live database updated.'}
+                </p>
+                <p className="text-[11px] text-[#BBF7D0]/90">
+                  Your previous live database was automatically saved as{' '}
+                  <span className="font-mono text-white">
+                    {lastRestoreNotice.safetySnapshotFilename}
+                  </span>{' '}
+                  (labeled &ldquo;Previous DB (before restore)&rdquo; below) — do not restore that
+                  row unless you want to undo this restore.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {onNavigateToCalendar && (
+                  <button
+                    type="button"
+                    data-testid="backup-restore-go-calendar-btn"
+                    onClick={onNavigateToCalendar}
+                    className="inline-flex min-h-[34px] items-center gap-1.5 rounded-md bg-[#16A34A] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#22C55E]"
+                  >
+                    View Restored Calendar
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setLastRestoreNotice(null)}
+                  className="rounded p-1 text-[#BBF7D0] hover:bg-[#16A34A]/20 hover:text-white"
+                  aria-label="Dismiss restore confirmation"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
           <section className="rounded-lg border border-[#283340] bg-[#161D24] p-5">
             <h3 className="font-['Plus_Jakarta_Sans'] text-sm font-bold text-[#F0F6FC]">
               Stored Snapshots ({backups.length})
@@ -1978,7 +2085,9 @@ export function SettingsView({
                               )}
                             </div>
                           </td>
-                          <td className="px-3 py-2.5 capitalize text-[#C9D1D9]">{b.trigger}</td>
+                          <td className="px-3 py-2.5 text-[#C9D1D9]">
+                            {formatBackupTriggerLabel(b.trigger)}
+                          </td>
                           <td className="px-3 py-2.5 font-mono tabular-nums text-[#8B949E]">
                             {formatBytes(b.sizeBytes)}
                           </td>
@@ -2024,21 +2133,37 @@ export function SettingsView({
                                 Download
                               </a>
                               {confirmRestoreFile === b.filename ? (
-                                <button
-                                  type="button"
-                                  data-testid={`backup-confirm-restore-${b.filename}`}
-                                  disabled={Boolean(sandboxStatus?.active)}
-                                  onClick={() => void handleRestoreBackup(b.filename)}
-                                  className="inline-flex items-center gap-1 rounded bg-[#D97706] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] disabled:opacity-45"
-                                >
-                                  <Check className="h-3 w-3" />
-                                  Confirm Restore
-                                </button>
+                                <div className="inline-flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    data-testid={`backup-confirm-restore-${b.filename}`}
+                                    disabled={
+                                      Boolean(sandboxStatus?.active) || Boolean(restoringFile)
+                                    }
+                                    onClick={() => void handleRestoreBackup(b.filename)}
+                                    className="inline-flex items-center gap-1 rounded bg-[#D97706] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] hover:bg-[#F59E0B] disabled:opacity-45"
+                                  >
+                                    <Check className="h-3 w-3" />
+                                    {restoringFile === b.filename
+                                      ? 'Restoring...'
+                                      : 'Confirm Restore'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={Boolean(restoringFile)}
+                                    onClick={() => setConfirmRestoreFile(null)}
+                                    className="rounded border border-[#283340] bg-[#0F1419] px-2 py-1 text-[11px] text-[#8B949E] hover:text-[#F0F6FC] disabled:opacity-45"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
                               ) : (
                                 <button
                                   type="button"
                                   data-testid={`backup-restore-${b.filename}`}
-                                  disabled={Boolean(sandboxStatus?.active)}
+                                  disabled={
+                                    Boolean(sandboxStatus?.active) || Boolean(restoringFile)
+                                  }
                                   onClick={() => setConfirmRestoreFile(b.filename)}
                                   className="inline-flex items-center gap-1 rounded border border-[#283340] bg-[#0F1419] px-2.5 py-1 text-[11px] font-medium text-[#FBBF24] hover:border-[#FBBF24] disabled:cursor-not-allowed disabled:opacity-45"
                                 >

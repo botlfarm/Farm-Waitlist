@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import {
   DEFAULT_PAUSED_SNIPPET_MESSAGE,
@@ -969,6 +970,25 @@ export class DatabaseManager {
     const filename = `${trigger}-${stamp}.db`;
     const destPath = this.resolveSafeBackupPath(filename);
     await this._db.backup(destPath);
+    // Normalize the backup file to standard rollback-journal mode so inspecting/validating
+    // or restoring it never spawns stray -wal/-shm sidecar files inside backupDir.
+    let normDb: Database.Database | null = null;
+    try {
+      normDb = new Database(destPath);
+      normDb.pragma('journal_mode = DELETE');
+    } finally {
+      if (normDb && normDb.open) normDb.close();
+      for (const suffix of ['-wal', '-shm']) {
+        const sidecar = `${destPath}${suffix}`;
+        if (fs.existsSync(sidecar)) {
+          try {
+            fs.unlinkSync(sidecar);
+          } catch {
+            // Ignore cleanup failure
+          }
+        }
+      }
+    }
     const stat = fs.statSync(destPath);
     return {
       filename,
@@ -1018,19 +1038,41 @@ export class DatabaseManager {
       throw new Error('Uploaded file is not a valid SQLite database (file too small)');
     }
     const fd = fs.openSync(candidatePath, 'r');
+    let isWalFormat = false;
     try {
-      const header = Buffer.alloc(16);
-      fs.readSync(fd, header, 0, 16, 0);
-      if (!header.equals(SQLITE_HEADER_MAGIC)) {
+      const header = Buffer.alloc(20);
+      fs.readSync(fd, header, 0, 20, 0);
+      if (!header.subarray(0, 16).equals(SQLITE_HEADER_MAGIC)) {
         throw new Error('Uploaded file does not have a valid SQLite 3 file header');
       }
+      // Header bytes 18 & 19 indicate WAL format (2) vs rollback journal (1)
+      isWalFormat = header[18] === 2 || header[19] === 2;
     } finally {
       fs.closeSync(fd);
     }
 
+    // If the candidate file uses WAL mode in its header, validate via a temp copy so we
+    // never leave stray -wal/-shm sidecar files inside backupDir or fail on read-only mounts.
+    let validatePath = candidatePath;
+    let tempValidatePath: string | null = null;
     let testDb: Database.Database | null = null;
     try {
-      testDb = new Database(candidatePath, { readonly: true, fileMustExist: true });
+      if (isWalFormat) {
+        tempValidatePath = path.join(
+          os.tmpdir(),
+          `farm-waitlist-validate-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+        );
+        fs.copyFileSync(candidatePath, tempValidatePath);
+        const prep = new Database(tempValidatePath);
+        try {
+          prep.pragma('journal_mode = DELETE');
+        } finally {
+          if (prep.open) prep.close();
+        }
+        validatePath = tempValidatePath;
+      }
+
+      testDb = new Database(validatePath, { readonly: true, fileMustExist: true });
       const rows = testDb.pragma('integrity_check') as Array<{ integrity_check: string }>;
       if (!rows.length || rows[0].integrity_check !== 'ok') {
         throw new Error('SQLite integrity check failed');
@@ -1041,13 +1083,29 @@ export class DatabaseManager {
       );
     } finally {
       if (testDb && testDb.open) testDb.close();
+      if (tempValidatePath) {
+        for (const p of [tempValidatePath, `${tempValidatePath}-wal`, `${tempValidatePath}-shm`]) {
+          if (fs.existsSync(p)) {
+            try {
+              fs.unlinkSync(p);
+            } catch {
+              // Ignore temp cleanup failure
+            }
+          }
+        }
+      }
     }
   }
 
   public async restoreFromFile(
     sourcePath: string,
     defaultTimezone: string = DEFAULT_TIMEZONE
-  ): Promise<{ safetySnapshot: BackupInfo; appliedVersions: number[] }> {
+  ): Promise<{
+    safetySnapshot: BackupInfo;
+    appliedVersions: number[];
+    itemsCount: number;
+    ordersCount: number;
+  }> {
     if (this._sandboxActive) {
       throw new Error('Exit Sandbox Mode before restoring a live database backup');
     }
@@ -1066,6 +1124,14 @@ export class DatabaseManager {
     fs.copyFileSync(sourcePath, tempRestorePath);
 
     try {
+      // Flush active WAL frames cleanly before closing the current live connection
+      if (this._db && this._db.open) {
+        try {
+          this._db.pragma('wal_checkpoint(TRUNCATE)');
+        } catch {
+          // Ignore checkpoint warning if DB is already clean
+        }
+      }
       this.close();
       for (const suffix of ['-wal', '-shm']) {
         const sidecar = `${this.dbPath}${suffix}`;
@@ -1076,7 +1142,20 @@ export class DatabaseManager {
       fs.renameSync(tempRestorePath, this.dbPath);
       this.openConnection();
       const { appliedVersions } = await this.init(defaultTimezone);
-      return { safetySnapshot, appliedVersions };
+
+      const itemsRow = this._db
+        .prepare('SELECT COUNT(*) AS count FROM tracked_items WHERE is_active = 1')
+        .get() as { count: number };
+      const ordersRow = this._db
+        .prepare("SELECT COUNT(*) AS count FROM orders WHERE status != 'ignored'")
+        .get() as { count: number };
+
+      return {
+        safetySnapshot,
+        appliedVersions,
+        itemsCount: Number(itemsRow?.count ?? 0),
+        ordersCount: Number(ordersRow?.count ?? 0),
+      };
     } catch (err) {
       if (fs.existsSync(tempRestorePath)) {
         fs.unlinkSync(tempRestorePath);

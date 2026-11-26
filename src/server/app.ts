@@ -43,7 +43,10 @@ import {
   type RuntimeConfig,
 } from './config';
 import type { DatabaseManager } from './db';
-import { testGithubPublishConnection } from './githubPublisher';
+import {
+  computeAvailabilityPayloadHash,
+  testGithubPublishConnection,
+} from './githubPublisher';
 import {
   getLatestSyncLog,
   purgeOdooOrdersInFullIgnoredRanges,
@@ -120,6 +123,7 @@ const AVAILABILITY_MUTATION_ROUTES: Array<{ method: string; pattern: RegExp }> =
   { method: 'POST', pattern: /^\/standing-orders\/\d+\/skip$/ },
   { method: 'POST', pattern: /^\/checkpoints\/undo$/ },
   { method: 'POST', pattern: /^\/checkpoints\/\d+\/restore$/ },
+  { method: 'POST', pattern: /^\/backups\/preview\/restore$/ },
   { method: 'POST', pattern: /^\/backups\/[^/]+\/restore$/ },
   { method: 'POST', pattern: /^\/backups\/upload$/ },
 ];
@@ -167,17 +171,58 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     next();
   });
 
-  // Stamp availabilityLastEditedAt synchronously before responding to real user mutations
-  // (midnight rollovers, cutoff clock ticks, and background Odoo syncs intentionally do NOT set this)
+  function computeCurrentSnippetHash(now: Date): string {
+    const { jsonPayload } = buildSnippetForDatabase({
+      dbManager,
+      config,
+      now,
+      skipMaterialize: true,
+    });
+    return computeAvailabilityPayloadHash(jsonPayload);
+  }
+
+  function reconcileAvailabilityEditedFlag(hashBefore: string | null, mutationNow: Date): void {
+    try {
+      const hashAfter = computeCurrentSnippetHash(mutationNow);
+      if (hashBefore !== null && hashAfter === hashBefore) {
+        return;
+      }
+      const currentSettings = dbManager.getSettings();
+      if (
+        currentSettings.githubLastPublishedHash &&
+        hashAfter === currentSettings.githubLastPublishedHash
+      ) {
+        // Edit (e.g. Undo or revert) brought public availability back to what is already live
+        dbManager.updateSettings({
+          availabilityLastEditedAt: currentSettings.githubLastPublishedAt ?? null,
+        });
+      } else {
+        dbManager.markAvailabilityEdited(mutationNow);
+      }
+    } catch {
+      dbManager.markAvailabilityEdited(mutationNow);
+    }
+  }
+
+  // Stamp availabilityLastEditedAt synchronously ONLY when a real user mutation actually changes
+  // the public availability payload (waitlist-only notes, unslotted orders, midnight rollovers,
+  // cutoff clock ticks, and background Odoo syncs intentionally do NOT trigger a publish).
   router.use((req, res, next) => {
     const matchesAvailabilityMutation = AVAILABILITY_MUTATION_ROUTES.some(
       (rule) => rule.method === req.method && rule.pattern.test(req.path)
     );
-    if (matchesAvailabilityMutation) {
+    if (matchesAvailabilityMutation && !dbManager.isBackupPreviewActive()) {
+      const mutationNow = getNow();
+      let hashBefore: string | null = null;
+      try {
+        hashBefore = computeCurrentSnippetHash(mutationNow);
+      } catch {
+        hashBefore = null;
+      }
       const origJson = res.json.bind(res);
       res.json = ((body: unknown) => {
         if (res.statusCode >= 200 && res.statusCode < 300 && !dbManager.isBackupPreviewActive()) {
-          dbManager.markAvailabilityEdited(getNow());
+          reconcileAvailabilityEditedFlag(hashBefore, mutationNow);
         }
         return origJson(body);
       }) as Response['json'];
@@ -1335,11 +1380,30 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
     }
 
     const nextLocked = target.isLocked || source.isLocked;
-    const nextPickupChannelId = target.pickupChannelId ?? source.pickupChannelId ?? null;
-    const nextFreeTextPickup = target.freeTextPickup ?? source.freeTextPickup ?? null;
+    const targetEffectiveDate = target.slottedDate || target.requestedDate || null;
+    const sourceEffectiveDate = source.slottedDate || source.requestedDate || null;
+    const pickedSourceDate = Boolean(
+      explicitKeepDate &&
+        sourceEffectiveDate &&
+        explicitKeepDate === sourceEffectiveDate &&
+        sourceEffectiveDate !== targetEffectiveDate
+    );
+    const preferSourceChannel =
+      pickedSourceDate ||
+      Boolean(
+        target.odooMissingFlagged &&
+          !source.odooMissingFlagged &&
+          (source.pickupChannelId !== null || Boolean(source.freeTextPickup))
+      );
+    const nextPickupChannelId = preferSourceChannel
+      ? (source.pickupChannelId ?? target.pickupChannelId ?? null)
+      : (target.pickupChannelId ?? source.pickupChannelId ?? null);
+    const nextFreeTextPickup = preferSourceChannel
+      ? (source.freeTextPickup ?? target.freeTextPickup ?? null)
+      : (target.freeTextPickup ?? source.freeTextPickup ?? null);
     const nextRequestedDate =
       explicitKeepDate !== undefined
-        ? explicitKeepDate === source.slottedDate && source.slottedDate !== target.slottedDate
+        ? pickedSourceDate
           ? (source.requestedDate ?? explicitKeepDate)
           : (explicitKeepDate ?? target.requestedDate ?? source.requestedDate ?? null)
         : (target.requestedDate ?? source.requestedDate ?? null);
@@ -1857,10 +1921,18 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       (key) =>
         patch[key] !== undefined && JSON.stringify(patch[key]) !== JSON.stringify(previous[key])
     );
-    const nextPatch: Partial<AppSettings> = snippetFieldChanged
-      ? { ...patch, availabilityLastEditedAt: getNow().toISOString() }
-      : patch;
-    let updated = dbManager.updateSettings(nextPatch);
+    const shouldCheckSnippetDiff = snippetFieldChanged || patch.odooIgnoredDateRanges !== undefined;
+    const mutationNow = getNow();
+    let hashBefore: string | null = null;
+    if (shouldCheckSnippetDiff) {
+      try {
+        hashBefore = computeCurrentSnippetHash(mutationNow);
+      } catch {
+        hashBefore = null;
+      }
+    }
+
+    let updated = dbManager.updateSettings(patch);
 
     let removedIgnoredOrdersCount = 0;
     if (patch.odooIgnoredDateRanges !== undefined) {
@@ -1870,9 +1942,11 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
         updated.timezone
       );
       removedIgnoredOrdersCount = purged.removedCount;
-      if (purged.affectedCalendar) {
-        updated = dbManager.updateSettings({ availabilityLastEditedAt: getNow().toISOString() });
-      }
+    }
+
+    if (shouldCheckSnippetDiff) {
+      reconcileAvailabilityEditedFlag(hashBefore, mutationNow);
+      updated = dbManager.getSettings();
     }
 
     onSettingsUpdated?.(updated);
@@ -2187,7 +2261,7 @@ export function createApiRouter(options: CreateAppOptions): express.Router {
       }
       const result = await dbManager.restoreFromFile(safePath, config.timezone);
       onSettingsUpdated?.(dbManager.getSettings());
-      res.json({ restored: true, ...result });
+      res.json({ restored: true, filename, restoredFrom: filename, ...result });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : 'Restore failed' });
     }

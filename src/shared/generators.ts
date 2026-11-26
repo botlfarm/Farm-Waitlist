@@ -787,6 +787,7 @@ export function generatePublicAvailability(params: {
   weeks?: number;
   timezone?: string;
   now?: Date;
+  accurateAsOf?: Date;
   enabled?: boolean;
   pausedMessage?: string;
   showSameDay?: boolean;
@@ -804,6 +805,7 @@ export function generatePublicAvailability(params: {
     weeks = 3,
     timezone = DEFAULT_TIMEZONE,
     now = new Date(),
+    accurateAsOf,
     enabled = true,
     pausedMessage,
     showSameDay = true,
@@ -827,7 +829,7 @@ export function generatePublicAvailability(params: {
   const cutoffEnd = addDays(today, weeks * 7 - 1);
   const daysByDate = new Map(days.map((d) => [d.date, d]));
 
-  const generatedAtDisplay = formatLocalDateTime(now, timezone);
+  const generatedAtDisplay = formatLocalDateTime(accurateAsOf ?? now, timezone);
 
   const buildDayItems = (dayProj: CalendarDayProjection | undefined): PublicAvailabilityDay['items'] =>
     publicItems.map((item) => {

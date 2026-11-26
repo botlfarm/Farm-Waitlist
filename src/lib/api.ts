@@ -40,10 +40,17 @@ export class ApiError extends Error {
 async function requestJson<T>(relativePath: string, init?: RequestInit): Promise<T> {
   // Always use relative ./api/... URLs for Home Assistant Ingress subpath compatibility
   const url = relativePath.startsWith('./') ? relativePath : `./${relativePath.replace(/^\/+/, '')}`;
+  const hasBody = init?.body !== undefined;
+  const isFormData = init?.body instanceof FormData;
+  const effectiveBody =
+    !hasBody && init?.method && init.method.toUpperCase() !== 'GET' && init.method.toUpperCase() !== 'HEAD'
+      ? '{}'
+      : init?.body;
   const response = await fetch(url, {
     ...init,
+    body: effectiveBody,
     headers: {
-      ...(init?.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
+      ...(isFormData ? {} : { 'Content-Type': 'application/json' }),
       ...(init?.headers ?? {}),
     },
   });
@@ -539,15 +546,22 @@ export const api = {
   createBackup: () => requestJson<BackupInfo>('./api/backups', { method: 'POST' }),
 
   restoreBackup: (filename: string) =>
-    requestJson<{ restored: boolean; safetySnapshot: BackupInfo }>(
-      `./api/backups/${encodeURIComponent(filename)}/restore`,
-      { method: 'POST' }
-    ),
+    requestJson<{
+      restored: boolean;
+      safetySnapshot: BackupInfo;
+      itemsCount?: number;
+      ordersCount?: number;
+    }>(`./api/backups/${encodeURIComponent(filename)}/restore`, { method: 'POST' }),
 
   uploadBackup: (file: File) => {
     const fd = new FormData();
     fd.append('database', file);
-    return requestJson<{ restored: boolean; safetySnapshot: BackupInfo }>('./api/backups/upload', {
+    return requestJson<{
+      restored: boolean;
+      safetySnapshot: BackupInfo;
+      itemsCount?: number;
+      ordersCount?: number;
+    }>('./api/backups/upload', {
       method: 'POST',
       body: fd,
     });
@@ -577,6 +591,8 @@ export const api = {
       restoredFrom: string;
       safetySnapshot: BackupInfo;
       backupPreviewStatus: BackupPreviewStatus;
+      itemsCount?: number;
+      ordersCount?: number;
     }>('./api/backups/preview/restore', {
       method: 'POST',
     }),

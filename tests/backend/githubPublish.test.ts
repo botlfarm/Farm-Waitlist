@@ -768,4 +768,219 @@ describe('Open-Source GitHub Pages Publisher & API Routes', () => {
       dbManager.close();
     }
   });
+
+  it('never bumps "Availability accurate as of" at midnight (e.g. 12:25 AM EST) from non-availability edits, stale pending flags, or delayed auto-publishes', async () => {
+    const { dbPath, backupDir } = createTempPaths();
+    const dbManager = new DatabaseManager(dbPath, backupDir);
+    await dbManager.init('America/New_York');
+
+    const config = loadRuntimeConfig({
+      dbPath,
+      backupDir,
+      haOptionsPath: '/nonexistent/options.json',
+      githubPublish: {
+        token: 'ghp_midnight_token',
+        defaultRepo: 'myfarm/avail',
+        source: 'env',
+      },
+    });
+
+    const pushedPayloads: Array<{ generatedAtDisplay: string; generatedAtIso: string }> = [];
+    const mockFetch = vi.fn(async (input: string, init?: RequestInit) => {
+      const method = init?.method ?? 'GET';
+      if (input.includes('/readme') && method === 'GET') {
+        return new Response(JSON.stringify({ sha: 'readme-sha' }), { status: 200 });
+      }
+      if (input.includes('/contents/availability.json') && method === 'GET') {
+        return new Response(
+          JSON.stringify(
+            pushedPayloads.length > 0
+              ? { sha: `sha-${pushedPayloads.length}` }
+              : { message: 'Not Found' }
+          ),
+          { status: pushedPayloads.length > 0 ? 200 : 404 }
+        );
+      }
+      if (input.includes('/contents/availability.json') && method === 'PUT') {
+        const parsedBody = JSON.parse(String(init?.body ?? '{}')) as { content: string };
+        const decoded = JSON.parse(
+          Buffer.from(parsedBody.content, 'base64').toString('utf-8')
+        ) as { generatedAtDisplay: string; generatedAtIso: string };
+        pushedPayloads.push(decoded);
+        return new Response(JSON.stringify({ commit: { sha: `commit-${pushedPayloads.length}` } }), {
+          status: 200,
+        });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    // Nov 25, 2026 at 2:00 PM EST (19:00 UTC)
+    let currentNow = new Date('2026-11-25T19:00:00Z');
+    const app = createExpressApp({
+      dbManager,
+      config,
+      fetchFn: mockFetch,
+      getNow: () => currentNow,
+    });
+
+    const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+      const s = app.listen(0, '127.0.0.1', () => resolve(s));
+    });
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+
+    try {
+      const itemResp = await fetch(`${baseUrl}/api/items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Standard Eggs',
+          unitLabel: 'dozens',
+          supplyMode: 'continuous',
+          defaultDailyProduction: 12,
+          globalSafetyBuffer: 4,
+          includeInPublicSnippet: true,
+        }),
+      });
+      const createdItem = (await itemResp.json()) as { id: number };
+
+      await fetch(`${baseUrl}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          githubPublishRepo: 'myfarm/avail',
+          githubPublishMode: 'auto',
+          githubPublishInterval: '30m',
+          githubPublishIdleMinutes: 15,
+        }),
+      });
+
+      // 1. Initial manual publish at 2:00 PM EST on Nov 25
+      const initialPub = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: true,
+        now: currentNow,
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(initialPub.published).toBe(true);
+      expect(pushedPayloads).toHaveLength(1);
+      expect(pushedPayloads[0].generatedAtDisplay).toContain('Nov 25, 2026');
+      expect(pushedPayloads[0].generatedAtDisplay).toContain('2:00 PM');
+
+      // 2. At 6:00 PM EST, user adds an unslotted waitlist order and edits its notes
+      //    (does NOT change public availability numbers)
+      currentNow = new Date('2026-11-25T23:00:00Z');
+      const addOrderResp = await fetch(`${baseUrl}/api/orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customerName: 'Waitlist Wendy',
+          status: 'waitlist',
+          timingType: 'asap',
+          notes: 'Call before pickup',
+          items: [{ trackedItemId: createdItem.id, quantity: 2 }],
+        }),
+      });
+      expect(addOrderResp.status).toBe(201);
+      const addedOrder = (await addOrderResp.json()) as { id: number };
+
+      await fetch(`${baseUrl}/api/orders/${addedOrder.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes: 'Updated note only' }),
+      });
+
+      // Public availability didn't change -> availabilityLastEditedAt must NOT advance!
+      expect(dbManager.getSettings().availabilityLastEditedAt).toBe('2026-11-25T19:00:00.000Z');
+
+      // 3. Midnight tick at 12:25 AM EST on Nov 26 (2026-11-26T05:25:00Z) -> MUST SKIP!
+      const midnightTick1 = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: new Date('2026-11-26T05:25:00Z'),
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(midnightTick1.published).toBe(false);
+      expect(midnightTick1.skipped).toBe(true);
+      expect(pushedPayloads).toHaveLength(1);
+
+      // 4. Simulate a pre-upgrade DB that already had a stale availabilityLastEditedAt from 8:00 PM
+      //    with NO semantic change -> the 8:25 PM check skips AND clears the stale flag so
+      //    12:25 AM EST still skips cleanly!
+      dbManager.updateSettings({ availabilityLastEditedAt: '2026-11-26T01:00:00.000Z' });
+      const sameEveningSkip = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: new Date('2026-11-26T01:25:00Z'),
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(sameEveningSkip.published).toBe(false);
+      expect(sameEveningSkip.skipped).toBe(true);
+      expect(sameEveningSkip.githubPublishStatus.hasUnpublishedEdits).toBe(false);
+
+      const midnightTick2 = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: new Date('2026-11-26T05:25:00Z'),
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(midnightTick2.published).toBe(false);
+      expect(midnightTick2.skipped).toBe(true);
+      expect(pushedPayloads).toHaveLength(1);
+
+      // 5. Real inventory edit at 11:55 PM EST on Nov 25 (2026-11-26T04:55:00Z) auto-published
+      //    after quiet delay at 12:25 AM EST on Nov 26 (2026-11-26T05:25:00Z):
+      //    MUST publish the real change, and "accurate as of" MUST show 11:55 PM (edit time), NOT 12:25 AM!
+      currentNow = new Date('2026-11-26T04:55:00Z');
+      const supplyEditResp = await fetch(`${baseUrl}/api/supply/${createdItem.id}/2026-11-27`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actualOnHand: 50, estProduced: 12 }),
+      });
+      expect(supplyEditResp.status).toBe(200);
+      expect(dbManager.getSettings().availabilityLastEditedAt).toBe('2026-11-26T04:55:00.000Z');
+
+      const afterRealEditPub = await publishSnippetSnapshotToGithub({
+        dbManager,
+        config,
+        force: false,
+        requireUserEdit: true,
+        now: new Date('2026-11-26T05:25:00Z'),
+        fetchFn: mockFetch as unknown as typeof fetch,
+      });
+      expect(afterRealEditPub.published).toBe(true);
+      expect(pushedPayloads).toHaveLength(2);
+      expect(pushedPayloads[1].generatedAtDisplay).toContain('Nov 25, 2026');
+      expect(pushedPayloads[1].generatedAtDisplay).toContain('11:55 PM');
+      expect(pushedPayloads[1].generatedAtDisplay).not.toContain('12:25 AM');
+
+      // 6. Real edit followed by reverting back to published state immediately clears pending edits
+      currentNow = new Date('2026-11-26T15:00:00Z');
+      await fetch(`${baseUrl}/api/supply/${createdItem.id}/2026-11-27`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actualOnHand: 99, estProduced: 12 }),
+      });
+      expect(dbManager.getSettings().availabilityLastEditedAt).toBe('2026-11-26T15:00:00.000Z');
+
+      currentNow = new Date('2026-11-26T15:01:00Z');
+      await fetch(`${baseUrl}/api/supply/${createdItem.id}/2026-11-27`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actualOnHand: 50, estProduced: 12 }),
+      });
+      expect(dbManager.getSettings().availabilityLastEditedAt).toBe(
+        afterRealEditPub.githubPublishStatus.lastPublishedAt
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      dbManager.close();
+    }
+  });
 });

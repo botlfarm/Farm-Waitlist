@@ -30,7 +30,7 @@ import {
   type DragEvent,
 } from 'react';
 import { formatQty } from '../shared/generators';
-import { findReplacementCandidates } from '../shared/orderMatching';
+import { findReplacementCandidates, resolveMergeDateOptions } from '../shared/orderMatching';
 import {
   channelHasScheduleRestriction,
   computeNextBumpDate,
@@ -76,11 +76,11 @@ interface CalendarWorkspaceProps {
   onExtendWeeks: () => void;
   onOpenSettings: () => void;
   onReconcile: (orderId: number, action: 'confirm' | 'keep' | 'ignore') => Promise<void>;
-  onReplaceOrder?: (
-    missingOrderId: number,
-    replacementOrderId: number,
-    keepDate?: string | null
-  ) => Promise<void>;
+  onOpenMergeReview?: (
+    targetOrderId: number,
+    sourceOrderId: number | null,
+    mode: 'replace' | 'merge'
+  ) => void;
   onConfirmOrder?: (orderId: number) => Promise<void>;
   onBumpOrder?: (orderId: number, targetDate?: string) => Promise<void>;
   onReleaseHold: (orderId: number) => Promise<void>;
@@ -163,7 +163,7 @@ export function CalendarWorkspace({
   onExtendWeeks,
   onOpenSettings,
   onReconcile,
-  onReplaceOrder,
+  onOpenMergeReview,
   onConfirmOrder,
   onBumpOrder,
   onReleaseHold,
@@ -188,7 +188,6 @@ export function CalendarWorkspace({
   const [selectedReplacementByOrderId, setSelectedReplacementByOrderId] = useState<
     Record<number, number>
   >({});
-  const [replacingOrderId, setReplacingOrderId] = useState<number | null>(null);
   const queueScrollRef = useRef<HTMLDivElement | null>(null);
   const calendarScrollRef = useRef<HTMLDivElement | null>(null);
   const queueCardRefs = useRef<Map<number, HTMLDivElement>>(new Map());
@@ -1258,7 +1257,14 @@ export function CalendarWorkspace({
                 const chosenMatch =
                   candidates.find((c) => c.order.id === chosenId) ?? candidates[0] ?? null;
                 const replacementOrder = chosenMatch?.order ?? null;
-                const isReplacing = replacingOrderId === order.id;
+                const replaceDateOpts = replacementOrder
+                  ? resolveMergeDateOptions(order, replacementOrder)
+                  : null;
+                const hasDifferentReplacementDates = Boolean(
+                  replaceDateOpts?.hasDifferentDates &&
+                    replaceDateOpts.targetDate &&
+                    replaceDateOpts.sourceDate
+                );
 
                 const formatCompactItems = (target: OrderRecord) =>
                   target.items
@@ -1304,11 +1310,21 @@ export function CalendarWorkspace({
                             {replacementOrder.status === 'waitlist'
                               ? ' (new in Waitlist'
                               : ` (${replacementOrder.status.replace('_', ' ')}`}
+                            {replaceDateOpts?.sourceDate
+                              ? ` · ${
+                                  replaceDateOpts.sourceDateKind === 'requested'
+                                    ? 'Requested'
+                                    : 'Scheduled'
+                                } ${formatShortCalendarDate(replaceDateOpts.sourceDate)}`
+                              : ''}
                             {formatCompactItems(replacementOrder)
                               ? ` · ${formatCompactItems(replacementOrder)}`
                               : ''}
                             )
                           </span>
+                          {hasDifferentReplacementDates && (
+                            <span className="font-medium text-[#FBBF24]">· Different dates</span>
+                          )}
                           {candidates.length > 1 && (
                             <select
                               aria-label={`Choose replacement quotation for ${order.customerName}`}
@@ -1322,17 +1338,20 @@ export function CalendarWorkspace({
                               }
                               className="rounded border border-[#283340] bg-[#161D24] px-1.5 py-0.5 text-[11px] text-[#E6EDF3]"
                             >
-                              {candidates.map((cand) => (
-                                <option key={cand.order.id} value={cand.order.id}>
-                                  {cand.order.odooQuotationName || `#${cand.order.id}`} (
-                                  {cand.order.status === 'waitlist'
-                                    ? 'Waitlist'
-                                    : cand.order.slottedDate
-                                      ? formatShortCalendarDate(cand.order.slottedDate)
-                                      : cand.order.status}
-                                  )
-                                </option>
-                              ))}
+                              {candidates.map((cand) => {
+                                const candDate = cand.order.slottedDate || cand.order.requestedDate;
+                                return (
+                                  <option key={cand.order.id} value={cand.order.id}>
+                                    {cand.order.odooQuotationName || `#${cand.order.id}`} (
+                                    {candDate
+                                      ? `${cand.order.slottedDate ? '' : 'Req '}${formatShortCalendarDate(candDate)}`
+                                      : cand.order.status === 'waitlist'
+                                        ? 'Waitlist'
+                                        : cand.order.status}
+                                    )
+                                  </option>
+                                );
+                              })}
                             </select>
                           )}
                         </span>
@@ -1346,32 +1365,32 @@ export function CalendarWorkspace({
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      {replacementOrder && onReplaceOrder && (
+                      {replacementOrder && onOpenMergeReview ? (
                         <button
                           type="button"
-                          disabled={readOnly || isReplacing}
+                          disabled={readOnly}
                           data-testid={`reconcile-replace-${order.id}`}
-                          onClick={async () => {
-                            setReplacingOrderId(order.id);
-                            try {
-                              await onReplaceOrder(
-                                order.id,
-                                replacementOrder.id,
-                                order.slottedDate ?? replacementOrder.slottedDate
-                              );
-                            } finally {
-                              setReplacingOrderId(null);
-                            }
-                          }}
-                          title={`Combine ${order.odooQuotationName || 'this order'} with ${replacementOrder.odooQuotationName || 'the new quotation'}, keep your scheduled date, and preserve the full order chain`}
-                          className="inline-flex items-center gap-1 rounded bg-[#0EA5E9] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
+                          onClick={() =>
+                            onOpenMergeReview(order.id, replacementOrder.id, 'replace')
+                          }
+                          title={`Compare ${order.odooQuotationName || 'cancelled pre-order'} and ${replacementOrder.odooQuotationName || 'actual order'} side by side before approving`}
+                          className="inline-flex min-h-[28px] items-center gap-1.5 whitespace-nowrap rounded bg-[#0EA5E9] px-2.5 py-1 text-[11px] font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                         >
-                          <GitMerge className="h-3 w-3" />
-                          {isReplacing
-                            ? 'Linking...'
-                            : `Replace with ${replacementOrder.odooQuotationName || 'New Order'}`}
+                          <GitMerge className="h-3 w-3" aria-hidden="true" />
+                          Review &amp; Match {replacementOrder.odooQuotationName || 'New Order'}
                         </button>
-                      )}
+                      ) : onOpenMergeReview && workspace.orders.length > 1 ? (
+                        <button
+                          type="button"
+                          disabled={readOnly}
+                          data-testid={`reconcile-manual-match-${order.id}`}
+                          onClick={() => onOpenMergeReview(order.id, null, 'replace')}
+                          className="inline-flex min-h-[28px] items-center gap-1 whitespace-nowrap rounded border border-[#38BDF8]/50 bg-[#0EA5E9]/10 px-2.5 py-1 text-[11px] font-medium text-[#7DD3FC] transition-colors hover:border-[#38BDF8] hover:bg-[#0EA5E9]/20 disabled:cursor-not-allowed disabled:opacity-45"
+                        >
+                          <GitMerge className="h-3 w-3" aria-hidden="true" />
+                          Compare &amp; Match...
+                        </button>
+                      ) : null}
                       {!replacementOrder && order.odooSuggestedConfirmed && (
                         <button
                           type="button"

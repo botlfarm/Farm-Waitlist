@@ -5,6 +5,7 @@ import { CalendarWorkspace } from './components/CalendarWorkspace';
 import { DayDetailDrawer } from './components/DayDetailDrawer';
 import { OrderDetailDrawer } from './components/OrderDetailDrawer';
 import { OrderListView } from './components/OrderListView';
+import { OrderMergeModal } from './components/OrderMergeModal';
 import { PreApprovalModal } from './components/PreApprovalModal';
 import { QuickAddOrderModal } from './components/QuickAddOrderModal';
 import { SettingsView } from './components/SettingsView';
@@ -37,6 +38,11 @@ export default function App() {
 
   const [selectedDayDate, setSelectedDayDate] = useState<string | null>(null);
   const [selectedOrderId, setSelectedOrderId] = useState<number | null>(null);
+  const [mergeModalState, setMergeModalState] = useState<{
+    targetOrderId: number;
+    initialSourceOrderId: number | null;
+    mode: 'replace' | 'merge';
+  } | null>(null);
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   const [preApprovalState, setPreApprovalState] = useState<{
     open: boolean;
@@ -69,13 +75,17 @@ export default function App() {
         const data = await api.getWorkspace(targetWeeks);
         setWorkspace(data);
         setLoadError(null);
-        // Default to first active item on initial load (Focus on one selected item with All view toggle)
-        if (!hasChosenFocus) {
-          const firstActive = data.items.find((i) => i.isActive);
-          if (firstActive) {
-            setFocusedItemId(firstActive.id);
+        // Default to first active item on initial load, and recover automatically if a restored/switched DB no longer has the previously focused item ID
+        const activeItems = data.items.filter((i) => i.isActive);
+        setFocusedItemId((prev) => {
+          if (prev !== 'all' && activeItems.some((i) => i.id === prev)) {
+            return prev;
           }
-        }
+          if (!hasChosenFocus || prev !== 'all') {
+            return activeItems[0]?.id ?? 'all';
+          }
+          return prev;
+        });
       } catch (err) {
         setLoadError(err instanceof Error ? err.message : 'Failed to load Farm Waitlist');
       } finally {
@@ -105,6 +115,11 @@ export default function App() {
       ? workspace.orders.find((o) => o.id === selectedOrderId) ??
         workspace.ignoredOrders.find((o) => o.id === selectedOrderId) ??
         null
+      : null;
+
+  const mergeModalTargetOrder: OrderRecord | null =
+    mergeModalState && workspace
+      ? workspace.orders.find((o) => o.id === mergeModalState.targetOrderId) ?? null
       : null;
 
   const handleSlotOrder = async (
@@ -272,8 +287,13 @@ export default function App() {
       setSelectedDayDate(null);
       setSelectedOrderId(null);
       await refreshWorkspace();
+      setActiveTab('calendar');
+      const countSummary =
+        typeof res.ordersCount === 'number' && typeof res.itemsCount === 'number'
+          ? ` (${res.itemsCount} item${res.itemsCount === 1 ? '' : 's'}, ${res.ordersCount} order${res.ordersCount === 1 ? '' : 's'})`
+          : '';
       showToast(
-        `Restored ${res.restoredFrom} to live database (safety snapshot: ${res.safetySnapshot.filename})`
+        `Restored ${res.restoredFrom} to live database${countSummary}. Previous DB saved as ${res.safetySnapshot.filename}.`
       );
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to restore backup', 'error');
@@ -509,29 +529,9 @@ export default function App() {
                       : 'Order kept active & missing flag cleared'
                 );
               }}
-              onReplaceOrder={async (missingOrderId, replacementOrderId, keepDate) => {
-                try {
-                  const result = await api.mergeOrders(
-                    missingOrderId,
-                    replacementOrderId,
-                    'use_source',
-                    keepDate
-                  );
-                  await refreshWorkspace();
-                  const activeRef = result.order?.odooQuotationName || 'replacement order';
-                  const keptDate = result.order?.slottedDate;
-                  showToast(
-                    keptDate
-                      ? `Linked to ${activeRef} on ${keptDate} — chain preserved (Undo available)`
-                      : `Linked to ${activeRef} — chain preserved (Undo available)`
-                  );
-                } catch (err) {
-                  showToast(
-                    err instanceof Error ? err.message : 'Failed to replace with new quotation',
-                    'error'
-                  );
-                }
-              }}
+              onOpenMergeReview={(targetOrderId, sourceOrderId, mode) =>
+                setMergeModalState({ targetOrderId, initialSourceOrderId: sourceOrderId, mode })
+              }
               onConfirmOrder={async (orderId) => {
                 await api.updateOrder(orderId, { status: 'confirmed' });
                 await refreshWorkspace();
@@ -629,6 +629,7 @@ export default function App() {
               backupPreviewBusy={backupPreviewBusy}
               onEnterBackupPreview={handleEnterBackupPreview}
               onExitBackupPreview={handleExitBackupPreview}
+              onNavigateToCalendar={() => setActiveTab('calendar')}
               onWorkspaceChanged={() => refreshWorkspace()}
               onToast={showToast}
             />
@@ -766,26 +767,9 @@ export default function App() {
                     : 'Order kept active & missing flag cleared'
               );
             }}
-            onMergeOrders={async (targetOrderId, sourceOrderId, itemStrategy, keepDate) => {
-              try {
-                const result = await api.mergeOrders(
-                  targetOrderId,
-                  sourceOrderId,
-                  itemStrategy,
-                  keepDate
-                );
-                await refreshWorkspace();
-                setSelectedOrderId(null);
-                const keptDate = result.order?.slottedDate;
-                showToast(
-                  keptDate
-                    ? `Merged into 1 order on ${keptDate} — duplicate removed (Undo available)`
-                    : 'Merged into 1 unslotted order — duplicate removed (Undo available)'
-                );
-              } catch (err) {
-                showToast(err instanceof Error ? err.message : 'Failed to merge orders', 'error');
-              }
-            }}
+            onOpenMergeReview={(targetOrderId, sourceOrderId, mode) =>
+              setMergeModalState({ targetOrderId, initialSourceOrderId: sourceOrderId, mode })
+            }
             onDismissDuplicate={async (orderId, otherOrderId) => {
               try {
                 await api.dismissDuplicateOrder(orderId, otherOrderId);
@@ -809,6 +793,57 @@ export default function App() {
               await refreshWorkspace();
               showToast(`Skipped standing occurrence on ${occDate}`);
               setSelectedOrderId(null);
+            }}
+          />
+
+          {/* Side-by-Side Order Merge & Cancelled Pre-Order Match Modal */}
+          <OrderMergeModal
+            open={Boolean(mergeModalState && mergeModalTargetOrder)}
+            targetOrder={mergeModalTargetOrder}
+            initialSourceOrderId={mergeModalState?.initialSourceOrderId ?? null}
+            mode={mergeModalState?.mode ?? 'merge'}
+            allOrders={workspace.orders}
+            items={workspace.items}
+            channels={workspace.channels}
+            readOnly={isBackupPreviewActive}
+            onClose={() => setMergeModalState(null)}
+            onSelectOrder={(orderId) => {
+              setMergeModalState(null);
+              setSelectedOrderId(orderId);
+            }}
+            onApproveMerge={async (targetOrderId, sourceOrderId, itemStrategy, keepDate) => {
+              try {
+                const result = await api.mergeOrders(
+                  targetOrderId,
+                  sourceOrderId,
+                  itemStrategy,
+                  keepDate
+                );
+                await refreshWorkspace();
+                setMergeModalState(null);
+                setSelectedOrderId(null);
+                const activeRef = result.order?.odooQuotationName || result.order?.customerName;
+                const keptDate = result.order?.slottedDate;
+                showToast(
+                  keptDate
+                    ? `Approved: ${activeRef || '1 order'} on ${keptDate} — duplicate removed (Undo available)`
+                    : `Approved: ${activeRef || '1 unslotted order'} — duplicate removed (Undo available)`
+                );
+              } catch (err) {
+                showToast(err instanceof Error ? err.message : 'Failed to merge orders', 'error');
+              }
+            }}
+            onDismissDuplicate={async (orderId, otherOrderId) => {
+              try {
+                await api.dismissDuplicateOrder(orderId, otherOrderId);
+                await refreshWorkspace();
+                showToast('Dismissed — marked as not a duplicate');
+              } catch (err) {
+                showToast(
+                  err instanceof Error ? err.message : 'Failed to dismiss duplicate notice',
+                  'error'
+                );
+              }
             }}
           />
 

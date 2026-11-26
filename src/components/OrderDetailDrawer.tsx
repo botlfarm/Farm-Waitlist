@@ -24,8 +24,8 @@ import {
   buildOrderOdooChain,
   findReplacementCandidates,
   isStandingRecurringOrder,
+  resolveMergeDateOptions,
   scoreDuplicateOrder,
-  selectPrimaryOdooSide,
 } from '../shared/orderMatching';
 import {
   channelHasScheduleRestriction,
@@ -45,7 +45,6 @@ import {
 import type {
   CalendarDayProjection,
   OrderItemLine,
-  OrderMergeItemStrategy,
   OrderRecord,
   OrderStatus,
   PickupChannel,
@@ -93,12 +92,11 @@ interface OrderDetailDrawerProps {
   onIgnore: (orderId: number) => Promise<void>;
   onRestoreIgnored: (orderId: number) => Promise<void>;
   onReconcile: (orderId: number, action: 'confirm' | 'keep' | 'ignore') => Promise<void>;
-  onMergeOrders?: (
+  onOpenMergeReview?: (
     targetOrderId: number,
-    sourceOrderId: number,
-    itemStrategy: OrderMergeItemStrategy,
-    keepDate?: string | null
-  ) => Promise<void>;
+    sourceOrderId: number | null,
+    mode: 'replace' | 'merge'
+  ) => void;
   onDismissDuplicate?: (orderId: number, otherOrderId: number) => Promise<void>;
   onDeleteOrder: (orderId: number) => Promise<void>;
   onSkipStandingOccurrence: (standingId: number, occurrenceDate: string) => Promise<void>;
@@ -317,7 +315,7 @@ export function OrderDetailDrawer({
   onIgnore,
   onRestoreIgnored,
   onReconcile,
-  onMergeOrders,
+  onOpenMergeReview,
   onDismissDuplicate,
   onDeleteOrder,
   onSkipStandingOccurrence,
@@ -341,17 +339,11 @@ export function OrderDetailDrawer({
   const [onlyOpenDates, setOnlyOpenDates] = useState(false);
   const [showOffChannel, setShowOffChannel] = useState(false);
 
-  // Merge orders & duplicate inspection state
-  const [mergePanelOpen, setMergePanelOpen] = useState(false);
-  const [mergeSourceId, setMergeSourceId] = useState<string>('');
-  const [mergeStrategy, setMergeStrategy] = useState<OrderMergeItemStrategy>('keep_target');
-  const [mergeKeepDate, setMergeKeepDate] = useState<string>('');
-  const [merging, setMerging] = useState(false);
+  // Duplicate inspection & dismissal state
   const [dismissingDuplicateId, setDismissingDuplicateId] = useState<number | null>(null);
   const [localDismissedIds, setLocalDismissedIds] = useState<number[]>([]);
   const [inspectingDuplicateId, setInspectingDuplicateId] = useState<number | null>(null);
   const [showAllDuplicates, setShowAllDuplicates] = useState(false);
-  const [showMergeSourceDetails, setShowMergeSourceDetails] = useState(true);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const rowKeyCounter = useRef(0);
 
@@ -387,16 +379,10 @@ export function OrderDetailDrawer({
     setOnlyOpenDates(false);
     setShowOffChannel(false);
     setSlottingTarget(null);
-    setMergePanelOpen(false);
-    setMergeSourceId('');
-    setMergeStrategy('keep_target');
-    setMergeKeepDate(order.slottedDate ?? '');
-    setMerging(false);
     setDismissingDuplicateId(null);
     setLocalDismissedIds([]);
     setInspectingDuplicateId(null);
     setShowAllDuplicates(false);
-    setShowMergeSourceDetails(true);
   }, [order]);
 
   const mergeCandidates = useMemo(() => {
@@ -425,27 +411,6 @@ export function OrderDetailDrawer({
     likelyScored.sort((a, b) => b.score - a.score || b.cand.id - a.cand.id);
     return { likely: likelyScored.map((entry) => entry.cand), others };
   }, [allOrders, order, localDismissedIds]);
-
-  const selectedMergeSource = useMemo(() => {
-    const id = Number(mergeSourceId);
-    if (!id) return null;
-    return allOrders.find((o) => o.id === id) ?? null;
-  }, [allOrders, mergeSourceId]);
-
-  useEffect(() => {
-    if (!order) return;
-    setMergeKeepDate(order.slottedDate || selectedMergeSource?.slottedDate || '');
-  }, [order, selectedMergeSource?.id, selectedMergeSource?.slottedDate]);
-
-  useEffect(() => {
-    if (mergePanelOpen && scrollContainerRef.current) {
-      if (typeof scrollContainerRef.current.scrollTo === 'function') {
-        scrollContainerRef.current.scrollTo({ top: 0, behavior: 'smooth' });
-      } else {
-        scrollContainerRef.current.scrollTop = 0;
-      }
-    }
-  }, [mergePanelOpen]);
 
   const parsedChannelId = pickupChannelId ? Number(pickupChannelId) : null;
   const selectedChannel = useMemo(
@@ -575,27 +540,6 @@ export function OrderDetailDrawer({
     }
   };
 
-  const resolvedMergeDate =
-    mergeKeepDate || order.slottedDate || selectedMergeSource?.slottedDate || null;
-  const hasDifferentMergeDates = Boolean(
-    selectedMergeSource &&
-      order.slottedDate &&
-      selectedMergeSource.slottedDate &&
-      order.slottedDate !== selectedMergeSource.slottedDate
-  );
-
-  const handleConfirmMerge = async () => {
-    if (readOnly || !onMergeOrders || !selectedMergeSource || merging) return;
-    setMerging(true);
-    try {
-      await onMergeOrders(order.id, selectedMergeSource.id, mergeStrategy, resolvedMergeDate);
-      setMergePanelOpen(false);
-      setMergeSourceId('');
-    } finally {
-      setMerging(false);
-    }
-  };
-
   return (
     <div
       className="fixed inset-0 z-50 flex justify-end bg-black/60"
@@ -670,6 +614,15 @@ export function OrderDetailDrawer({
           {order.odooMissingFlagged && (() => {
             const replacementCandidates = findReplacementCandidates(order, allOrders);
             const topReplacement = replacementCandidates[0]?.order ?? null;
+            const replaceDateOpts = topReplacement
+              ? resolveMergeDateOptions(order, topReplacement)
+              : null;
+            const hasDiffReplaceDates = Boolean(
+              replaceDateOpts?.hasDifferentDates &&
+                replaceDateOpts.targetDate &&
+                replaceDateOpts.sourceDate
+            );
+
             return (
               <div
                 data-testid="order-reconcile-box"
@@ -680,74 +633,63 @@ export function OrderDetailDrawer({
                 </p>
                 {topReplacement ? (
                   <p className="mt-1 text-xs text-[#E6EDF3]">
-                    Matches newer quotation{' '}
+                    Matches newer order{' '}
                     <span className="font-mono font-semibold text-[#7DD3FC]">
                       {topReplacement.odooQuotationName || `#${topReplacement.id}`}
                     </span>{' '}
                     ({topReplacement.status === 'waitlist'
                       ? 'new in Waitlist'
                       : topReplacement.status.replace('_', ' ')}
-                    ). Link them to keep this scheduled slot, combine all notes &amp; chatter, and
-                    track{' '}
-                    <span className="font-mono text-[#F0F6FC]">
-                      {order.odooQuotationName || `#${order.id}`} →{' '}
-                      {topReplacement.odooQuotationName || `#${topReplacement.id}`}
-                    </span>
-                    .
+                    {replaceDateOpts?.sourceDate
+                      ? ` · ${
+                          replaceDateOpts.sourceDateKind === 'requested'
+                            ? 'Requested'
+                            : 'Scheduled'
+                        } ${formatShortCalendarDate(replaceDateOpts.sourceDate)}`
+                      : ''}
+                    ).{' '}
+                    {hasDiffReplaceDates && replaceDateOpts?.targetDate && replaceDateOpts?.sourceDate
+                      ? `These two orders have different dates (${formatShortCalendarDate(replaceDateOpts.targetDate)} vs ${formatShortCalendarDate(replaceDateOpts.sourceDate)}). Compare them side by side to choose the date and items before approving.`
+                      : 'Compare both orders side by side to review the date, items, and notes before approving.'}
                   </p>
                 ) : (
                   <p className="mt-1 text-xs text-[#E6EDF3]">
                     {order.odooSuggestedConfirmed
                       ? `No matching waitlist quotation found locally, but Odoo Sales Order ${order.odooSuggestedConfirmed.odooOrderName} (${order.odooSuggestedConfirmed.partnerName}) exists.`
-                      : 'This quotation is no longer active in Odoo. If a replacement quotation arrived in the waitlist, link them below — otherwise keep or remove this order.'}
+                      : 'This quotation is no longer active in Odoo. Compare with another active order below, or keep/remove this order.'}
                   </p>
                 )}
                 <div className="mt-3 flex flex-wrap items-center gap-2">
-                  {topReplacement && onMergeOrders && (
+                  {topReplacement && onOpenMergeReview ? (
                     <button
                       type="button"
-                      disabled={readOnly || merging}
+                      disabled={readOnly}
                       data-testid="drawer-reconcile-replace-btn"
-                      onClick={async () => {
-                        setMerging(true);
-                        try {
-                          await onMergeOrders(
-                            order.id,
-                            topReplacement.id,
-                            'use_source',
-                            order.slottedDate ?? topReplacement.slottedDate ?? null
-                          );
-                        } finally {
-                          setMerging(false);
-                        }
-                      }}
+                      onClick={() => onOpenMergeReview(order.id, topReplacement.id, 'replace')}
                       className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md bg-[#0EA5E9] px-3 py-1.5 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                     >
-                      <GitMerge className="h-3.5 w-3.5" />
-                      {merging
-                        ? 'Linking...'
-                        : `Replace with ${topReplacement.odooQuotationName || 'New Order'}`}
+                      <GitMerge className="h-3.5 w-3.5" aria-hidden="true" />
+                      Review &amp; Match {topReplacement.odooQuotationName || 'New Order'}
                     </button>
-                  )}
-                  {onMergeOrders && (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) && (
+                  ) : onOpenMergeReview &&
+                    (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) ? (
                     <button
                       type="button"
                       disabled={readOnly}
                       data-testid="drawer-reconcile-compare-btn"
-                      onClick={() => {
-                        const pick = topReplacement ?? mergeCandidates.likely[0] ?? mergeCandidates.others[0];
-                        if (pick) {
-                          setMergeSourceId(String(pick.id));
-                          setMergeStrategy('use_source');
-                          setMergeKeepDate(order.slottedDate ?? pick.slottedDate ?? '');
-                        }
-                        setMergePanelOpen(true);
-                      }}
-                      className="min-h-[36px] rounded-md border border-[#38BDF8]/50 bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#7DD3FC] hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
+                      onClick={() =>
+                        onOpenMergeReview(
+                          order.id,
+                          mergeCandidates.likely[0]?.id ?? mergeCandidates.others[0]?.id ?? null,
+                          'replace'
+                        )
+                      }
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-md border border-[#38BDF8]/50 bg-[#0F1419] px-3 py-1.5 text-xs font-medium text-[#7DD3FC] hover:border-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
                     >
-                      Compare / Link Order
+                      <GitMerge className="h-3.5 w-3.5" aria-hidden="true" />
+                      Compare &amp; Match Order
                     </button>
-                  )}
+                  ) : null}
                   <button
                     type="button"
                     disabled={readOnly}
@@ -793,547 +735,197 @@ export function OrderDetailDrawer({
             </div>
           )}
 
-          {/* Smart Possible Duplicate Banner + Merge Panel */}
-          {onMergeOrders &&
+          {/* Smart Possible Duplicate Banner -> opens Side-by-Side Merge Comparison Modal */}
+          {onOpenMergeReview &&
             order.status !== 'ignored' &&
-            (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) && (
-              <div className="space-y-2.5">
-                {mergeCandidates.likely.length > 0 && !mergePanelOpen && (
-                  <div
-                    data-testid="possible-duplicate-banner"
-                    className="space-y-2.5 rounded-md border border-[#38BDF8]/50 bg-[#0EA5E9]/10 px-3.5 py-2.5 text-xs"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="font-semibold text-[#38BDF8]">
-                        Possible Duplicate Order Found ({mergeCandidates.likely.length})
-                      </p>
-                      <span className="text-[11px] text-[#8B949E]">
-                        Click an order to inspect full details &amp; chatter
-                      </span>
-                    </div>
+            mergeCandidates.likely.length > 0 && (
+              <div
+                data-testid="possible-duplicate-banner"
+                className="space-y-2.5 rounded-md border border-[#38BDF8]/50 bg-[#0EA5E9]/10 px-3.5 py-2.5 text-xs"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <p className="font-semibold text-[#38BDF8]">
+                    Possible Duplicate Order Found ({mergeCandidates.likely.length})
+                  </p>
+                  <span className="text-[11px] text-[#8B949E]">
+                    Compare side by side before merging
+                  </span>
+                </div>
 
-                    <div className="space-y-2">
-                      {(showAllDuplicates
-                        ? mergeCandidates.likely
-                        : mergeCandidates.likely.slice(0, 1)
-                      ).map((cand, idx) => {
-                        const isInspecting = inspectingDuplicateId === cand.id;
-                        return (
-                          <div
-                            key={cand.id}
-                            className="rounded-md border border-[#283340] bg-[#11171D] p-2.5"
+                <div className="space-y-2">
+                  {(showAllDuplicates
+                    ? mergeCandidates.likely
+                    : mergeCandidates.likely.slice(0, 1)
+                  ).map((cand, idx) => {
+                    const isInspecting = inspectingDuplicateId === cand.id;
+                    return (
+                      <div
+                        key={cand.id}
+                        className="rounded-md border border-[#283340] bg-[#11171D] p-2.5"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            data-testid={
+                              idx === 0
+                                ? 'inspect-duplicate-btn'
+                                : `inspect-duplicate-btn-${cand.id}`
+                            }
+                            data-candidate-id={cand.id}
+                            onClick={() =>
+                              setInspectingDuplicateId((prev) =>
+                                prev === cand.id ? null : cand.id
+                              )
+                            }
+                            className="group flex min-w-0 flex-1 items-center gap-2 text-left"
                           >
-                            <div className="flex flex-wrap items-center justify-between gap-2">
+                            <Eye
+                              className="h-3.5 w-3.5 shrink-0 text-[#38BDF8]"
+                              aria-hidden="true"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-semibold text-[#F0F6FC] group-hover:text-[#38BDF8] group-hover:underline">
+                                {cand.customerName}
+                                {cand.odooQuotationName ? ` · ${cand.odooQuotationName}` : ''}
+                              </div>
+                              <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-[#8B949E]">
+                                <span className="capitalize">{cand.status.replace('_', ' ')}</span>
+                                <span>·</span>
+                                <span>
+                                  {cand.slottedDate
+                                    ? formatShortCalendarDate(cand.slottedDate)
+                                    : cand.requestedDate
+                                      ? `Req ${formatShortCalendarDate(cand.requestedDate)}`
+                                      : 'Unslotted'}
+                                </span>
+                                {cand.chatter.length > 0 && (
+                                  <>
+                                    <span>·</span>
+                                    <span className="text-[#38BDF8]">
+                                      {cand.chatter.length} chatter
+                                    </span>
+                                  </>
+                                )}
+                                <span>·</span>
+                                <span className="text-[#38BDF8]">
+                                  {isInspecting ? 'Hide Details' : 'Inspect Details'}
+                                </span>
+                              </div>
+                            </div>
+                          </button>
+
+                          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                            {onDismissDuplicate && (
                               <button
                                 type="button"
                                 data-testid={
                                   idx === 0
-                                    ? 'inspect-duplicate-btn'
-                                    : `inspect-duplicate-btn-${cand.id}`
+                                    ? 'dismiss-duplicate-btn'
+                                    : `dismiss-duplicate-btn-${cand.id}`
                                 }
-                                data-candidate-id={cand.id}
-                                onClick={() =>
-                                  setInspectingDuplicateId((prev) =>
-                                    prev === cand.id ? null : cand.id
-                                  )
-                                }
-                                className="group flex min-w-0 flex-1 items-center gap-2 text-left"
+                                disabled={readOnly || dismissingDuplicateId === cand.id}
+                                onClick={async () => {
+                                  setDismissingDuplicateId(cand.id);
+                                  setLocalDismissedIds((prev) =>
+                                    prev.includes(cand.id) ? prev : [...prev, cand.id]
+                                  );
+                                  if (inspectingDuplicateId === cand.id) {
+                                    setInspectingDuplicateId(null);
+                                  }
+                                  try {
+                                    await onDismissDuplicate(order.id, cand.id);
+                                  } finally {
+                                    setDismissingDuplicateId(null);
+                                  }
+                                }}
+                                className="inline-flex min-h-[32px] shrink-0 items-center rounded-md border border-[#283340] bg-[#161D24] px-2.5 py-1 text-xs font-medium text-[#C9D1D9] hover:border-[#8B949E] hover:text-[#F0F6FC] disabled:cursor-not-allowed disabled:opacity-45"
                               >
-                                <Eye
-                                  className="h-3.5 w-3.5 shrink-0 text-[#38BDF8]"
-                                  aria-hidden="true"
-                                />
-                                <div className="min-w-0 flex-1">
-                                  <div className="truncate font-semibold text-[#F0F6FC] group-hover:text-[#38BDF8] group-hover:underline">
-                                    {cand.customerName}
-                                    {cand.odooQuotationName ? ` · ${cand.odooQuotationName}` : ''}
-                                  </div>
-                                  <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-[#8B949E]">
-                                    <span className="capitalize">{cand.status.replace('_', ' ')}</span>
-                                    <span>·</span>
-                                    <span>
-                                      {cand.slottedDate
-                                        ? formatShortCalendarDate(cand.slottedDate)
-                                        : 'Unslotted'}
-                                    </span>
-                                    {cand.chatter.length > 0 && (
-                                      <>
-                                        <span>·</span>
-                                        <span className="text-[#38BDF8]">
-                                          {cand.chatter.length} chatter
-                                        </span>
-                                      </>
-                                    )}
-                                    <span>·</span>
-                                    <span className="text-[#38BDF8]">
-                                      {isInspecting ? 'Hide Details' : 'Inspect Details'}
-                                    </span>
-                                  </div>
-                                </div>
+                                Not a Duplicate
                               </button>
+                            )}
+                            <button
+                              type="button"
+                              disabled={readOnly}
+                              data-testid={
+                                idx === 0
+                                  ? 'open-merge-duplicate-btn'
+                                  : `open-merge-duplicate-btn-${cand.id}`
+                              }
+                              onClick={() => {
+                                setInspectingDuplicateId(null);
+                                onOpenMergeReview(
+                                  order.id,
+                                  cand.id,
+                                  order.odooMissingFlagged || cand.odooMissingFlagged
+                                    ? 'replace'
+                                    : 'merge'
+                                );
+                              }}
+                              className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#0EA5E9] px-2.5 py-1 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
+                            >
+                              <GitMerge className="h-3.5 w-3.5" aria-hidden="true" />
+                              Compare &amp; Merge
+                            </button>
+                          </div>
+                        </div>
 
-                              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-                                {onDismissDuplicate && (
+                        {/* Expanded Quick Inspection Card */}
+                        {isInspecting && (
+                          <div
+                            data-testid="duplicate-comparison-card"
+                            className="mt-3 border-t border-[#283340] pt-3"
+                          >
+                            <div className="mb-2 flex items-center justify-between gap-2">
+                              <span className="text-[11px] font-semibold text-[#38BDF8]">
+                                Full Potential Duplicate Details
+                              </span>
+                              <div className="flex items-center gap-2">
+                                {onSelectOrder && (
                                   <button
                                     type="button"
-                                    data-testid={
-                                      idx === 0
-                                        ? 'dismiss-duplicate-btn'
-                                        : `dismiss-duplicate-btn-${cand.id}`
-                                    }
-                                    disabled={readOnly || dismissingDuplicateId === cand.id}
-                                    onClick={async () => {
-                                      setDismissingDuplicateId(cand.id);
-                                      setLocalDismissedIds((prev) =>
-                                        prev.includes(cand.id) ? prev : [...prev, cand.id]
-                                      );
-                                      if (inspectingDuplicateId === cand.id) {
-                                        setInspectingDuplicateId(null);
-                                      }
-                                      try {
-                                        await onDismissDuplicate(order.id, cand.id);
-                                      } finally {
-                                        setDismissingDuplicateId(null);
-                                      }
-                                    }}
-                                    className="inline-flex min-h-[32px] shrink-0 items-center rounded-md border border-[#283340] bg-[#161D24] px-2.5 py-1 text-xs font-medium text-[#C9D1D9] hover:border-[#8B949E] hover:text-[#F0F6FC] disabled:cursor-not-allowed disabled:opacity-45"
+                                    data-testid="switch-to-duplicate-btn"
+                                    onClick={() => onSelectOrder(cand.id)}
+                                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
                                   >
-                                    Not a Duplicate
+                                    <ExternalLink className="h-3 w-3" />
+                                    Open Order
                                   </button>
                                 )}
                                 <button
                                   type="button"
-                                  disabled={readOnly}
-                                  data-testid={
-                                    idx === 0
-                                      ? 'open-merge-duplicate-btn'
-                                      : `open-merge-duplicate-btn-${cand.id}`
-                                  }
-                                  onClick={() => {
-                                    setMergeSourceId(String(cand.id));
-                                    setMergeStrategy('keep_target');
-                                    setMergePanelOpen(true);
-                                    setInspectingDuplicateId(null);
-                                  }}
-                                  className="inline-flex min-h-[32px] shrink-0 items-center gap-1.5 rounded-md bg-[#0EA5E9] px-2.5 py-1 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:cursor-not-allowed disabled:opacity-45"
+                                  onClick={() => setInspectingDuplicateId(null)}
+                                  className="text-[11px] text-[#8B949E] hover:text-[#F0F6FC]"
                                 >
-                                  <GitMerge className="h-3.5 w-3.5" />
-                                  Merge Duplicate
+                                  Close
                                 </button>
                               </div>
                             </div>
-
-                            {/* Expanded Full Duplicate Comparison Panel (including Chatter) */}
-                            {isInspecting && (
-                              <div
-                                data-testid="duplicate-comparison-card"
-                                className="mt-3 border-t border-[#283340] pt-3"
-                              >
-                                <div className="mb-2 flex items-center justify-between gap-2">
-                                  <span className="text-[11px] font-bold uppercase tracking-wide text-[#38BDF8]">
-                                    Full Potential Duplicate Details
-                                  </span>
-                                  <div className="flex items-center gap-2">
-                                    {onSelectOrder && (
-                                      <button
-                                        type="button"
-                                        data-testid="switch-to-duplicate-btn"
-                                        onClick={() => onSelectOrder(cand.id)}
-                                        className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
-                                      >
-                                        <ExternalLink className="h-3 w-3" />
-                                        Open Order
-                                      </button>
-                                    )}
-                                    <button
-                                      type="button"
-                                      onClick={() => setInspectingDuplicateId(null)}
-                                      className="text-[11px] text-[#8B949E] hover:text-[#F0F6FC]"
-                                    >
-                                      Close
-                                    </button>
-                                  </div>
-                                </div>
-                                <DuplicateOrderDetailsBody
-                                  candidate={cand}
-                                  items={items}
-                                  channels={channels}
-                                  chatterTestId="duplicate-compare-chatter"
-                                />
-                              </div>
-                            )}
+                            <DuplicateOrderDetailsBody
+                              candidate={cand}
+                              items={items}
+                              channels={channels}
+                              chatterTestId="duplicate-compare-chatter"
+                            />
                           </div>
-                        );
-                      })}
-                    </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
 
-                    {mergeCandidates.likely.length > 1 && (
-                      <button
-                        type="button"
-                        data-testid="toggle-extra-duplicates-btn"
-                        onClick={() => setShowAllDuplicates((prev) => !prev)}
-                        className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
-                      >
-                        {showAllDuplicates
-                          ? 'Show top match only'
-                          : `Show ${mergeCandidates.likely.length - 1} more possible ${
-                              mergeCandidates.likely.length - 1 === 1 ? 'match' : 'matches'
-                            }`}
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {mergePanelOpen && (
-                  <section
-                    data-testid="order-merge-panel"
-                    className="rounded-lg border border-[#38BDF8]/50 bg-[#11171D] p-3.5 sm:p-4"
+                {mergeCandidates.likely.length > 1 && (
+                  <button
+                    type="button"
+                    data-testid="toggle-extra-duplicates-btn"
+                    onClick={() => setShowAllDuplicates((prev) => !prev)}
+                    className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <GitMerge className="h-4 w-4 text-[#38BDF8]" aria-hidden="true" />
-                        <h3 className="font-['Plus_Jakarta_Sans'] text-sm font-bold text-[#F0F6FC]">
-                          Merge Order / Quotation Into This One
-                        </h3>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        {onDismissDuplicate &&
-                          selectedMergeSource &&
-                          mergeCandidates.likely.some((c) => c.id === selectedMergeSource.id) && (
-                            <button
-                              type="button"
-                              data-testid="panel-dismiss-duplicate-btn"
-                              disabled={dismissingDuplicateId === selectedMergeSource.id}
-                              onClick={async () => {
-                                const candId = selectedMergeSource.id;
-                                setDismissingDuplicateId(candId);
-                                setLocalDismissedIds((prev) =>
-                                  prev.includes(candId) ? prev : [...prev, candId]
-                                );
-                                setMergePanelOpen(false);
-                                setMergeSourceId('');
-                                try {
-                                  await onDismissDuplicate(order.id, candId);
-                                } finally {
-                                  setDismissingDuplicateId(null);
-                                }
-                              }}
-                              className="text-xs font-medium text-[#C9D1D9] hover:text-[#F0F6FC] hover:underline disabled:opacity-50"
-                            >
-                              Not a Duplicate
-                            </button>
-                          )}
-                        <button
-                          type="button"
-                          onClick={() => setMergePanelOpen(false)}
-                          className="text-xs text-[#8B949E] hover:text-[#F0F6FC]"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </div>
-
-                    <p className="mt-1.5 text-xs text-[#8B949E]">
-                      Select the duplicate or add-on order to fold into{' '}
-                      <span className="font-semibold text-[#E6EDF3]">{order.customerName}</span>.
-                      Its notes, chatter, and Odoo ID will be linked here so it won&apos;t re-import.
-                    </p>
-
-                    <div className="mt-3">
-                      <label
-                        htmlFor="merge-source-select"
-                        className="mb-1 block text-xs font-medium text-[#C9D1D9]"
-                      >
-                        Order to Absorb &amp; Remove
-                      </label>
-                      <select
-                        id="merge-source-select"
-                        data-testid="merge-source-select"
-                        value={mergeSourceId}
-                        onChange={(e) => setMergeSourceId(e.target.value)}
-                        className="min-h-[40px] w-full rounded-md border border-[#283340] bg-[#0F1419] px-3 py-2 text-xs text-[#F0F6FC] focus:border-[#38BDF8] focus:outline-none"
-                      >
-                        <option value="">Choose an order to merge...</option>
-                        {mergeCandidates.likely.length > 0 && (
-                          <optgroup label="Possible Duplicates">
-                            {mergeCandidates.likely.map((cand) => {
-                              const candSummary =
-                                cand.items.length === 0
-                                  ? 'No items'
-                                  : cand.items
-                                      .map((l) => {
-                                        const meta = items.find((i) => i.id === l.trackedItemId);
-                                        return `${formatQty(l.quantity)} ${meta ? meta.name : `#${l.trackedItemId}`}`;
-                                      })
-                                      .join(', ');
-                              return (
-                                <option key={cand.id} value={cand.id}>
-                                  {cand.customerName}
-                                  {cand.odooQuotationName ? ` (${cand.odooQuotationName})` : ''} ·{' '}
-                                  {cand.status.replace('_', ' ')} ·{' '}
-                                  {cand.slottedDate
-                                    ? formatShortCalendarDate(cand.slottedDate)
-                                    : 'Unslotted'}{' '}
-                                  · {candSummary}
-                                </option>
-                              );
-                            })}
-                          </optgroup>
-                        )}
-                        {mergeCandidates.others.length > 0 && (
-                          <optgroup label="All Other Active Orders">
-                            {mergeCandidates.others.map((cand) => {
-                              const candSummary =
-                                cand.items.length === 0
-                                  ? 'No items'
-                                  : cand.items
-                                      .map((l) => {
-                                        const meta = items.find((i) => i.id === l.trackedItemId);
-                                        return `${formatQty(l.quantity)} ${meta ? meta.name : `#${l.trackedItemId}`}`;
-                                      })
-                                      .join(', ');
-                              return (
-                                <option key={cand.id} value={cand.id}>
-                                  {cand.customerName}
-                                  {cand.odooQuotationName ? ` (${cand.odooQuotationName})` : ''} ·{' '}
-                                  {cand.status.replace('_', ' ')} ·{' '}
-                                  {cand.slottedDate
-                                    ? formatShortCalendarDate(cand.slottedDate)
-                                    : 'Unslotted'}{' '}
-                                  · {candSummary}
-                                </option>
-                              );
-                            })}
-                          </optgroup>
-                        )}
-                      </select>
-                    </div>
-
-                    {selectedMergeSource && (
-                      <div className="mt-3 space-y-2.5">
-                        <div className="rounded border border-[#283340] bg-[#0F1419] p-2.5 text-[11px] text-[#C9D1D9]">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span className="font-semibold text-[#F0F6FC]">
-                              Absorbing: {selectedMergeSource.customerName}
-                              {selectedMergeSource.odooQuotationName
-                                ? ` · ${selectedMergeSource.odooQuotationName}`
-                                : ''}
-                            </span>
-                            <div className="flex items-center gap-2">
-                              {onSelectOrder && (
-                                <button
-                                  type="button"
-                                  data-testid="merge-open-source-order-btn"
-                                  onClick={() => onSelectOrder(selectedMergeSource.id)}
-                                  className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
-                                >
-                                  <ExternalLink className="h-3 w-3" />
-                                  Open
-                                </button>
-                              )}
-                              <button
-                                type="button"
-                                data-testid="toggle-merge-source-details-btn"
-                                onClick={() => setShowMergeSourceDetails((prev) => !prev)}
-                                className="inline-flex items-center gap-1 text-[11px] font-medium text-[#38BDF8] hover:underline"
-                              >
-                                {showMergeSourceDetails ? (
-                                  <>
-                                    <ChevronUp className="h-3.5 w-3.5" />
-                                    Hide Details
-                                  </>
-                                ) : (
-                                  <>
-                                    <ChevronDown className="h-3.5 w-3.5" />
-                                    Inspect Details &amp; Chatter ({selectedMergeSource.chatter.length})
-                                  </>
-                                )}
-                              </button>
-                            </div>
-                          </div>
-                          {showMergeSourceDetails ? (
-                            <div
-                              data-testid="merge-source-details"
-                              className="mt-2.5 border-t border-[#283340] pt-2.5"
-                            >
-                              <DuplicateOrderDetailsBody
-                                candidate={selectedMergeSource}
-                                items={items}
-                                channels={channels}
-                                chatterTestId="merge-source-chatter"
-                              />
-                            </div>
-                          ) : (
-                            <div className="mt-1 font-mono text-[#8B949E]">
-                              Items:{' '}
-                              {selectedMergeSource.items.length === 0
-                                ? 'None'
-                                : selectedMergeSource.items
-                                    .map((l) => {
-                                      const meta = items.find((i) => i.id === l.trackedItemId);
-                                      return `${formatQty(l.quantity)} ${meta ? `${meta.unitLabel} ${meta.name}` : `#${l.trackedItemId}`}`;
-                                    })
-                                    .join(', ')}
-                            </div>
-                          )}
-                        </div>
-
-                        {hasDifferentMergeDates &&
-                          order.slottedDate &&
-                          selectedMergeSource.slottedDate && (
-                            <div>
-                              <span className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
-                                These orders are on 2 different dates — keep which 1 date?
-                              </span>
-                              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                                <button
-                                  type="button"
-                                  data-testid="merge-date-target"
-                                  onClick={() => setMergeKeepDate(order.slottedDate!)}
-                                  className={`rounded-md border px-2.5 py-2 text-left transition-colors ${
-                                    resolvedMergeDate === order.slottedDate
-                                      ? 'border-[#38BDF8] bg-[#0EA5E9]/15 text-[#F0F6FC]'
-                                      : 'border-[#283340] bg-[#0F1419] text-[#C9D1D9] hover:border-[#38BDF8]/50'
-                                  }`}
-                                >
-                                  <div className="text-[11px] font-semibold">
-                                    Keep {formatShortCalendarDate(order.slottedDate)}
-                                  </div>
-                                  <div className="text-[10px] text-[#8B949E]">
-                                    Removes {formatShortCalendarDate(selectedMergeSource.slottedDate)}
-                                  </div>
-                                </button>
-                                <button
-                                  type="button"
-                                  data-testid="merge-date-source"
-                                  onClick={() => setMergeKeepDate(selectedMergeSource.slottedDate!)}
-                                  className={`rounded-md border px-2.5 py-2 text-left transition-colors ${
-                                    resolvedMergeDate === selectedMergeSource.slottedDate
-                                      ? 'border-[#38BDF8] bg-[#0EA5E9]/15 text-[#F0F6FC]'
-                                      : 'border-[#283340] bg-[#0F1419] text-[#C9D1D9] hover:border-[#38BDF8]/50'
-                                  }`}
-                                >
-                                  <div className="text-[11px] font-semibold">
-                                    Move to {formatShortCalendarDate(selectedMergeSource.slottedDate)}
-                                  </div>
-                                  <div className="text-[10px] text-[#8B949E]">
-                                    Removes {formatShortCalendarDate(order.slottedDate)}
-                                  </div>
-                                </button>
-                              </div>
-                            </div>
-                          )}
-
-                        <div>
-                          <span className="mb-1.5 block text-xs font-medium text-[#C9D1D9]">
-                            How should items be handled?
-                          </span>
-                          <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
-                            {(
-                              [
-                                {
-                                  id: 'keep_target',
-                                  title: 'Same Order',
-                                  desc: 'Keep this order’s items',
-                                },
-                                {
-                                  id: 'use_source',
-                                  title: 'Same Order',
-                                  desc: 'Use absorbed order’s items',
-                                },
-                                {
-                                  id: 'combine',
-                                  title: 'Add Together',
-                                  desc: 'Sum quantities of both',
-                                },
-                              ] as const
-                            ).map((opt) => (
-                              <button
-                                key={opt.id}
-                                type="button"
-                                data-testid={`merge-strategy-${opt.id}`}
-                                onClick={() => setMergeStrategy(opt.id)}
-                                className={`rounded-md border px-2.5 py-2 text-left transition-colors ${
-                                  mergeStrategy === opt.id
-                                    ? 'border-[#38BDF8] bg-[#0EA5E9]/15 text-[#F0F6FC]'
-                                    : 'border-[#283340] bg-[#0F1419] text-[#C9D1D9] hover:border-[#38BDF8]/50'
-                                }`}
-                              >
-                                <div className="text-[11px] font-semibold">{opt.title}</div>
-                                <div className="text-[10px] text-[#8B949E]">{opt.desc}</div>
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-
-                        <div
-                          data-testid="merge-result-summary"
-                          className="space-y-1 rounded border border-[#38BDF8]/30 bg-[#0EA5E9]/10 px-2.5 py-2 text-[11px] text-[#BAE6FD]"
-                        >
-                          <div>
-                            {resolvedMergeDate ? (
-                              <>
-                                Result:{' '}
-                                <span className="font-semibold text-[#F0F6FC]">
-                                  1 order on {formatShortCalendarDate(resolvedMergeDate)}
-                                </span>
-                                {hasDifferentMergeDates &&
-                                order.slottedDate &&
-                                selectedMergeSource.slottedDate
-                                  ? ` · duplicate on ${formatShortCalendarDate(
-                                      resolvedMergeDate === order.slottedDate
-                                        ? selectedMergeSource.slottedDate
-                                        : order.slottedDate
-                                    )} will be removed.`
-                                  : ' · duplicate will be removed.'}
-                              </>
-                            ) : (
-                              <>
-                                Result:{' '}
-                                <span className="font-semibold text-[#F0F6FC]">
-                                  1 unslotted order
-                                </span>{' '}
-                                · duplicate will be removed.
-                              </>
-                            )}
-                          </div>
-                          {order.odooQuotationId && selectedMergeSource.odooQuotationId && (() => {
-                            const primarySide = selectPrimaryOdooSide(order, selectedMergeSource);
-                            const primaryRef =
-                              primarySide === 'source'
-                                ? selectedMergeSource.odooQuotationName || `#${selectedMergeSource.odooQuotationId}`
-                                : order.odooQuotationName || `#${order.odooQuotationId}`;
-                            const archivedRef =
-                              primarySide === 'source'
-                                ? order.odooQuotationName || `#${order.odooQuotationId}`
-                                : selectedMergeSource.odooQuotationName || `#${selectedMergeSource.odooQuotationId}`;
-                            return (
-                              <div className="font-mono text-[10px] text-[#7DD3FC]">
-                                Odoo chain: {archivedRef} →{' '}
-                                <span className="font-semibold text-[#F0F6FC]">{primaryRef}</span>{' '}
-                                (stays synced)
-                              </div>
-                            );
-                          })()}
-                        </div>
-
-                        <button
-                          type="button"
-                          disabled={merging}
-                          data-testid="confirm-merge-orders-btn"
-                          onClick={() => void handleConfirmMerge()}
-                          className="inline-flex min-h-[40px] w-full items-center justify-center gap-1.5 rounded-md bg-[#0EA5E9] px-4 py-2 text-xs font-semibold text-[#0B1117] hover:bg-[#38BDF8] disabled:opacity-50"
-                        >
-                          <GitMerge className="h-3.5 w-3.5" />
-                          {merging
-                            ? 'Merging Orders...'
-                            : resolvedMergeDate
-                              ? `Merge Into 1 Order on ${formatShortCalendarDate(resolvedMergeDate)} (Undoable)`
-                              : 'Merge Into 1 Order (Undoable)'}
-                        </button>
-                      </div>
-                    )}
-                  </section>
+                    {showAllDuplicates
+                      ? 'Show top match only'
+                      : `Show ${mergeCandidates.likely.length - 1} more possible ${
+                          mergeCandidates.likely.length - 1 === 1 ? 'match' : 'matches'
+                        }`}
+                  </button>
                 )}
               </div>
             )}
@@ -2134,22 +1726,23 @@ export function OrderDetailDrawer({
           ) : (
             <>
               <div className="flex flex-wrap items-center gap-2">
-                {onMergeOrders &&
+                {onOpenMergeReview &&
                   order.status !== 'ignored' &&
                   (mergeCandidates.likely.length > 0 || mergeCandidates.others.length > 0) && (
                     <button
                       type="button"
                       data-testid="toggle-merge-panel-btn"
-                      onClick={() => {
-                        if (!mergePanelOpen && !mergeSourceId && mergeCandidates.likely.length > 0) {
-                          setMergeSourceId(String(mergeCandidates.likely[0].id));
-                        }
-                        setMergePanelOpen((prev) => !prev);
-                      }}
+                      onClick={() =>
+                        onOpenMergeReview(
+                          order.id,
+                          mergeCandidates.likely[0]?.id ?? null,
+                          order.odooMissingFlagged ? 'replace' : 'merge'
+                        )
+                      }
                       className="inline-flex min-h-[38px] items-center gap-1.5 whitespace-nowrap rounded-md border border-[#38BDF8]/50 bg-[#1E2730] px-3 py-1.5 text-xs font-medium text-[#38BDF8] hover:bg-[#25313D]"
                     >
                       <GitMerge className="h-3.5 w-3.5" />
-                      {mergePanelOpen ? 'Close Merge' : 'Merge...'}
+                      Compare &amp; Merge...
                     </button>
                   )}
                 {order.source === 'odoo' && order.status !== 'ignored' && (
@@ -2201,28 +1794,15 @@ export function OrderDetailDrawer({
                 )}
               </div>
 
-              {mergePanelOpen ? (
-                <button
-                  type="button"
-                  disabled={!selectedMergeSource || merging}
-                  data-testid="footer-confirm-merge-btn"
-                  onClick={() => void handleConfirmMerge()}
-                  className="inline-flex min-h-[40px] items-center gap-1.5 whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
-                >
-                  <GitMerge className="h-4 w-4" />
-                  {merging ? 'Merging...' : 'Merge Into 1 Order'}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  disabled={saving}
-                  data-testid="order-save-btn"
-                  onClick={() => void handleSave()}
-                  className="min-h-[40px] whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
-                >
-                  {saving ? 'Saving...' : 'Save Changes'}
-                </button>
-              )}
+              <button
+                type="button"
+                disabled={saving}
+                data-testid="order-save-btn"
+                onClick={() => void handleSave()}
+                className="min-h-[40px] whitespace-nowrap rounded-md bg-[#0EA5E9] px-5 py-2 text-sm font-semibold text-[#0B1117] transition-colors hover:bg-[#38BDF8] disabled:opacity-50"
+              >
+                {saving ? 'Saving...' : 'Save Changes'}
+              </button>
             </>
           )}
         </div>

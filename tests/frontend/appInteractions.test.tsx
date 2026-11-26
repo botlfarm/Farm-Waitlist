@@ -2278,7 +2278,7 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     });
   });
 
-  it('matches a cancelled Odoo waitlist quotation to a newly arrived replacement quotation in the banner, replaces with 1 click, and shows the full Odoo chain in the drawer', async () => {
+  it('matches a cancelled Odoo waitlist quotation to a newly arrived replacement quotation via side-by-side review modal and shows the full Odoo chain in the drawer', async () => {
     const user = userEvent.setup();
     const cancelledWaitlistOrder = {
       id: 51,
@@ -2373,9 +2373,23 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     expect(banner).toHaveTextContent('Matches S00105');
 
     const replaceBtn = screen.getByTestId('reconcile-replace-51');
-    expect(replaceBtn).toHaveTextContent('Replace with S00105');
+    expect(replaceBtn).toHaveTextContent('Review & Match S00105');
 
     await user.click(replaceBtn);
+
+    // Clicking Review & Match opens the side-by-side comparison modal without mutating yet
+    const modal = await screen.findByTestId('order-merge-modal');
+    expect(mergePayloads).toHaveLength(0);
+    expect(screen.getByTestId('merge-target-card')).toHaveTextContent('S00100');
+    expect(screen.getByTestId('merge-target-card')).toHaveTextContent('Cancelled Pre-Order');
+    expect(screen.getByTestId('merge-source-card')).toHaveTextContent('S00105');
+    expect(screen.getByTestId('merge-source-card')).toHaveTextContent('Actual Replacement Order');
+    expect(screen.getByTestId('merge-result-summary')).toHaveTextContent('3 dozens Standard Eggs');
+    expect(screen.getByTestId('merge-result-summary')).toHaveTextContent('S00100');
+    expect(screen.getByTestId('merge-result-summary')).toHaveTextContent('S00105');
+    expect(modal).toBeInTheDocument();
+
+    await user.click(screen.getByTestId('confirm-merge-orders-btn'));
 
     await waitFor(() => {
       expect(mergePayloads).toEqual([
@@ -2391,6 +2405,7 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     });
 
     await waitFor(() => {
+      expect(screen.queryByTestId('order-merge-modal')).not.toBeInTheDocument();
       expect(screen.queryByTestId('reconciliation-banner')).not.toBeInTheDocument();
     });
 
@@ -3165,6 +3180,302 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
     expect(screen.getByTestId('settings-template-preview')).toHaveTextContent(
       'Hi Alex! 24 hours Thu, Nov 26 at 2:00 PM Thu, Nov 26 Fri, Nov 27 at 4:00 PM Fri, Nov 27 4:00 PM'
     );
+  });
+
+  it('sends valid JSON body on Settings backup restore, clarifies Previous DB snapshots, shows restore banner, and resets stale focusedItemId', async () => {
+    const user = userEvent.setup();
+    const initialWs = makeBaseWorkspace();
+    const restoredWs = makeBaseWorkspace({
+      items: [
+        {
+          ...initialWs.items[0],
+          id: 99,
+          name: 'Restored Pasture Eggs',
+        },
+      ],
+      days: initialWs.days.map((d) => ({
+        ...d,
+        byItem: {
+          99: {
+            ...d.byItem[1],
+            trackedItemId: 99,
+          },
+        },
+      })),
+      orders: [
+        {
+          ...initialWs.orders[0],
+          id: 99,
+          customerName: 'Restored Rebecca',
+          items: [{ trackedItemId: 99, quantity: 4 }],
+        },
+      ],
+    });
+
+    const targetBackup = 'manual-2026-11-23T12-00-00-000Z.db';
+    let restored = false;
+    const backupsList = [
+      {
+        filename: targetBackup,
+        trigger: 'manual',
+        createdAt: '2026-11-23T12:00:00Z',
+        sizeBytes: 2100000,
+      },
+    ];
+    const restoreRequests: Array<{ url: string; body: unknown }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(restored ? restoredWs : initialWs), { status: 200 });
+        }
+        if (input === './api/backups' && (!init?.method || init.method === 'GET')) {
+          return new Response(JSON.stringify(backupsList), { status: 200 });
+        }
+        if (input === `./api/backups/${encodeURIComponent(targetBackup)}/restore` && init?.method === 'POST') {
+          restoreRequests.push({ url: input, body: init.body });
+          restored = true;
+          backupsList.unshift({
+            filename: 'pre-restore-2026-11-23T14-20-00-000Z.db',
+            trigger: 'pre-restore',
+            createdAt: '2026-11-23T14:20:00Z',
+            sizeBytes: 135168,
+          });
+          return new Response(
+            JSON.stringify({
+              restoredFrom: targetBackup,
+              safetySnapshot: backupsList[0],
+              appliedVersions: [],
+              itemsCount: 1,
+              ordersCount: 1,
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+    expect(await screen.findByTestId('order-chip-10')).toHaveTextContent('Clara Farmer');
+
+    await user.click(screen.getByTestId('nav-settings'));
+    await user.click(await screen.findByTestId('settings-tab-backups'));
+    await user.click(await screen.findByTestId(`backup-restore-${targetBackup}`));
+    await user.click(await screen.findByTestId(`backup-confirm-restore-${targetBackup}`));
+
+    // Restore POST must include a valid JSON body ('{}') and display unmistakable confirmation banner
+    await waitFor(() => {
+      expect(restoreRequests).toHaveLength(1);
+      expect(restoreRequests[0].body).toBe('{}');
+    });
+
+    const successBanner = await screen.findByTestId('backup-restore-success-banner');
+    expect(successBanner).toHaveTextContent(targetBackup);
+    expect(successBanner).toHaveTextContent('1 active item');
+    expect(successBanner).toHaveTextContent('1 active order');
+    expect(successBanner).toHaveTextContent('pre-restore-2026-11-23T14-20-00-000Z.db');
+
+    // Newly created pre-restore snapshot is labeled clearly as Previous DB (before restore)
+    expect(screen.getByText('Previous DB (before restore)')).toBeInTheDocument();
+
+    // Clicking View Restored Calendar switches to Calendar and auto-recovers focusedItemId to restored item #99
+    await user.click(screen.getByTestId('backup-restore-go-calendar-btn'));
+    expect(await screen.findByTestId('order-chip-99')).toHaveTextContent('Restored Rebecca');
+    expect(await screen.findByTestId('day-metrics-2026-11-23')).toBeInTheDocument();
+  });
+
+  it('presents cancelled pre-order and actual replacement order side by side, defaults to actual order date/items, and previews exact changes before approving', async () => {
+    const user = userEvent.setup();
+    const cancelledPreOrder = {
+      id: 81,
+      source: 'odoo' as const,
+      status: 'pre_approved' as const,
+      timingType: 'specific_date' as const,
+      requestedDate: '2026-11-24',
+      slottedDate: '2026-11-24',
+      isLocked: false,
+      customerName: 'Hannah Brooks',
+      customerNameOverridden: false,
+      customerEmail: 'hannah@example.com',
+      customerPhone: '555-7171',
+      pickupChannelId: 1,
+      freeTextPickup: null,
+      notes: 'Original Tuesday pre-order',
+      preApprovedAt: '2026-11-22T15:00:00Z',
+      standingOrderId: null,
+      standingOccurrenceDate: null,
+      odooQuotationId: 810,
+      odooQuotationName: 'S00810',
+      odooPartnerId: 901,
+      odooCreatedAtLocal: '2026-11-22 10:00:00',
+      odooRawNotes: 'Waitlist request for Tue',
+      odooRawLines: ['2 × Standard Eggs'],
+      odooUpdatedAfterSlot: false,
+      odooMissingFlagged: true,
+      odooSuggestedConfirmed: null,
+      mergedOdooNames: [] as string[],
+      dismissedDuplicateOrderIds: [] as number[],
+      waitlistSortOrder: null,
+      createdAt: '2026-11-22T15:00:00Z',
+      updatedAt: '2026-11-22T15:00:00Z',
+      items: [{ trackedItemId: 1, quantity: 2 }],
+      chatter: [
+        {
+          id: 1,
+          orderId: 81,
+          odooMessageId: 8101,
+          authorName: 'Farm Staff',
+          bodyText: 'Pre-approved for Tuesday Nov 24',
+          createdAtUtc: '2026-11-22T15:15:00Z',
+          createdAtLocal: '2026-11-22 10:15:00',
+          messageType: 'comment' as const,
+          subtypeName: 'Note',
+        },
+      ],
+    };
+
+    const actualReplacementOrder = {
+      ...cancelledPreOrder,
+      id: 82,
+      status: 'confirmed' as const,
+      requestedDate: '2026-11-28',
+      slottedDate: '2026-11-28',
+      pickupChannelId: 2,
+      notes: 'Customer placed actual storefront order for Saturday',
+      preApprovedAt: null,
+      odooQuotationId: 820,
+      odooQuotationName: 'S00820',
+      odooCreatedAtLocal: '2026-11-23 11:30:00',
+      odooRawNotes: 'Paid Saturday Market pickup',
+      odooRawLines: ['3 × Standard Eggs'],
+      odooMissingFlagged: false,
+      items: [{ trackedItemId: 1, quantity: 3 }],
+      chatter: [
+        {
+          id: 2,
+          orderId: 82,
+          odooMessageId: 8201,
+          authorName: 'Hannah Brooks',
+          bodyText: 'Switched to Saturday pickup with an extra dozen',
+          createdAtUtc: '2026-11-23T16:31:00Z',
+          createdAtLocal: '2026-11-23 11:31:00',
+          messageType: 'email' as const,
+          subtypeName: 'Discussions',
+        },
+      ],
+    };
+
+    const ws = makeBaseWorkspace();
+    ws.channels = [
+      ...ws.channels,
+      {
+        id: 2,
+        name: 'Saturday Farmers Market',
+        allowedWeekdays: [6],
+        colorToken: 'emerald',
+        isActive: true,
+        sortOrder: 1,
+      },
+    ];
+    ws.orders = [...ws.orders, cancelledPreOrder, actualReplacementOrder];
+    ws.reconciliationOrders = [cancelledPreOrder];
+
+    const mergePayloads: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        if (input === './api/orders/81/merge') {
+          const parsed = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+          mergePayloads.push({ url: input, body: parsed });
+          const merged = {
+            ...cancelledPreOrder,
+            status: 'confirmed' as const,
+            slottedDate: String(parsed.keepDate),
+            pickupChannelId: 2,
+            odooQuotationId: 820,
+            odooQuotationName: 'S00820',
+            mergedOdooNames: ['S00810'],
+            odooMissingFlagged: false,
+            items: [{ trackedItemId: 1, quantity: 3 }],
+          };
+          ws.orders = ws.orders.filter((o) => o.id !== 82).map((o) => (o.id === 81 ? merged : o));
+          ws.reconciliationOrders = [];
+          return new Response(JSON.stringify({ order: merged, mergedOrderId: 82 }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    const banner = await screen.findByTestId('reconciliation-banner');
+    expect(banner).toHaveTextContent('Different dates');
+    const reviewBtn = screen.getByTestId('reconcile-replace-81');
+    expect(reviewBtn).toHaveTextContent('Review & Match S00820');
+    await user.click(reviewBtn);
+
+    // Side-by-side modal renders both orders with full details & chatter
+    await screen.findByTestId('order-merge-modal');
+    const targetCard = screen.getByTestId('merge-target-card');
+    const sourceCard = screen.getByTestId('merge-source-card');
+    expect(targetCard).toHaveTextContent('Cancelled Pre-Order');
+    expect(targetCard).toHaveTextContent('S00810');
+    expect(targetCard).toHaveTextContent('Tue, Nov 24');
+    expect(targetCard).toHaveTextContent('Farm Store');
+    expect(targetCard).toHaveTextContent('2 dozens Standard Eggs');
+    expect(targetCard).toHaveTextContent('Pre-approved for Tuesday Nov 24');
+
+    expect(sourceCard).toHaveTextContent('Actual Replacement Order');
+    expect(sourceCard).toHaveTextContent('S00820');
+    expect(sourceCard).toHaveTextContent('Sat, Nov 28');
+    expect(sourceCard).toHaveTextContent('Saturday Farmers Market');
+    expect(sourceCard).toHaveTextContent('3 dozens Standard Eggs');
+    expect(sourceCard).toHaveTextContent('Switched to Saturday pickup with an extra dozen');
+
+    // Actual replacement order date (Nov 28) is recommended and selected by default
+    expect(screen.getByTestId('merge-date-source')).toHaveTextContent('Move to Nov 28');
+    expect(screen.getByTestId('merge-date-source')).toHaveTextContent('Selected · Recommended');
+    expect(screen.getByTestId('merge-date-target')).toHaveTextContent('Keep Nov 24');
+
+    const summary = screen.getByTestId('merge-result-summary');
+    expect(summary).toHaveTextContent('1 order on Nov 28');
+    expect(summary).toHaveTextContent('duplicate on Nov 24 will be removed');
+    expect(summary).toHaveTextContent('Confirmed');
+    expect(summary).toHaveTextContent('Saturday Farmers Market');
+    expect(summary).toHaveTextContent('3 dozens Standard Eggs');
+    expect(summary).toHaveTextContent('S00810');
+    expect(summary).toHaveTextContent('S00820');
+
+    // User can toggle to the cancelled pre-order date and see the preview update immediately
+    await user.click(screen.getByTestId('merge-date-target'));
+    expect(screen.getByTestId('merge-result-summary')).toHaveTextContent('1 order on Nov 24');
+    expect(screen.getByTestId('merge-result-summary')).toHaveTextContent(
+      'duplicate on Nov 28 will be removed'
+    );
+
+    // Switch back to the recommended actual order date and approve
+    await user.click(screen.getByTestId('merge-date-source'));
+    await user.click(screen.getByTestId('confirm-merge-orders-btn'));
+
+    await waitFor(() => {
+      expect(mergePayloads).toEqual([
+        {
+          url: './api/orders/81/merge',
+          body: {
+            sourceOrderId: 82,
+            itemStrategy: 'use_source',
+            keepDate: '2026-11-28',
+          },
+        },
+      ]);
+    });
   });
 });
 

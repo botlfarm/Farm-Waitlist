@@ -27,6 +27,10 @@ import {
   splitCustomerName,
 } from '../../src/shared/generators';
 import {
+  previewMergeOutcome,
+  resolveMergeDateOptions,
+} from '../../src/shared/orderMatching';
+import {
   evaluateCandidateSlotDates,
   findEarliestValidSlotDate,
   isWeekdayAllowedForChannel,
@@ -2329,6 +2333,285 @@ describe('Multi-Template Pre-Approval Engine, Safe HTML Links & Persistence', ()
       expect(monBody.message).toBe(
         'Hi Mona, please order by Sun, Nov 29 at 4:00 PM (Sun, Nov 29 at 4:00 PM) for Mon, Nov 30.'
       );
+    } finally {
+      server.close();
+      mgr.close();
+    }
+  });
+
+  it('writes clean rollback-journal backups with zero WAL/SHM sidecars and restores both direct and previewed snapshots with live item/order counts', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const { createExpressApp } = await import('../../src/server/app');
+    const { dir, dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const nowIso = '2026-11-25T15:00:00.000Z';
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, sort_order, created_at, updated_at)
+           VALUES ('Restored Duck Eggs', 'dozens', 1, 'continuous', 10, 2, 1, 0, ?, ?)`
+        )
+        .run(nowIso, nowIso).lastInsertRowid
+    );
+    const orderId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, slotted_date, customer_name, created_at, updated_at)
+           VALUES ('manual', 'confirmed', 'specific_date', '2026-11-26', 'Restored Ruth', ?, ?)`
+        )
+        .run(nowIso, nowIso).lastInsertRowid
+    );
+    mgr.db
+      .prepare(`INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 3)`)
+      .run(orderId, itemId);
+
+    // 1. Create a manual snapshot and verify it is normalized out of WAL mode with zero sidecar files
+    const snap = await mgr.createBackup('manual');
+    const backupEntriesAfterCreate = fs.readdirSync(backupDir);
+    expect(backupEntriesAfterCreate.some((f) => f.endsWith('-wal') || f.endsWith('-shm'))).toBe(false);
+    const snapHeader = fs.readFileSync(path.join(backupDir, snap.filename)).subarray(0, 20);
+    expect(snapHeader[18]).toBe(1);
+    expect(snapHeader[19]).toBe(1);
+
+    // 2. Also create a legacy WAL-mode backup file inside backupDir and validate it without creating sidecars
+    const legacyWalSnapName = 'manual-2026-11-25T14-00-00-000Z-legacy-wal.db';
+    const legacyWalPath = path.join(backupDir, legacyWalSnapName);
+    fs.copyFileSync(path.join(backupDir, snap.filename), legacyWalPath);
+    const legacyDb = new Database(legacyWalPath);
+    legacyDb.pragma('journal_mode = WAL');
+    legacyDb.close();
+    // Clean any sidecars from our test fixture creation before calling validateSqliteFile
+    for (const suffix of ['-wal', '-shm']) {
+      if (fs.existsSync(`${legacyWalPath}${suffix}`)) fs.unlinkSync(`${legacyWalPath}${suffix}`);
+    }
+    const legacyHeader = fs.readFileSync(legacyWalPath).subarray(0, 20);
+    expect(legacyHeader[18]).toBe(2); // Confirms fixture is marked WAL in header
+
+    mgr.validateSqliteFile(legacyWalPath);
+    const backupEntriesAfterValidate = fs.readdirSync(backupDir);
+    expect(backupEntriesAfterValidate.some((f) => f.endsWith('-wal') || f.endsWith('-shm'))).toBe(false);
+
+    // 3. Wipe the live DB so we can verify real HTTP restore replaces it completely
+    mgr.db.prepare('DELETE FROM order_items').run();
+    mgr.db.prepare('DELETE FROM orders').run();
+    mgr.db.prepare('DELETE FROM tracked_items').run();
+    expect(listTrackedItems(mgr.db)).toHaveLength(0);
+    expect(listAllOrders(mgr.db)).toHaveLength(0);
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+      },
+    });
+    const server = app.listen(0);
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+
+    try {
+      // 4. Direct restore via POST /api/backups/:filename/restore with JSON '{}' body
+      const restoreRes = await fetch(
+        `http://127.0.0.1:${port}/api/backups/${encodeURIComponent(legacyWalSnapName)}/restore`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        }
+      );
+      expect(restoreRes.status).toBe(200);
+      const restoreBody = (await restoreRes.json()) as {
+        restoredFrom: string;
+        safetySnapshot: { trigger: string };
+        itemsCount: number;
+        ordersCount: number;
+      };
+      expect(restoreBody.restoredFrom).toBe(legacyWalSnapName);
+      expect(restoreBody.safetySnapshot.trigger).toBe('pre-restore');
+      expect(restoreBody.itemsCount).toBe(1);
+      expect(restoreBody.ordersCount).toBe(1);
+      expect(listTrackedItems(mgr.db).map((i) => i.name)).toEqual(['Restored Duck Eggs']);
+      expect(listAllOrders(mgr.db).map((o) => o.customerName)).toEqual(['Restored Ruth']);
+
+      // 5. Wipe live DB again, enter Backup Preview, and restore from Preview banner endpoint
+      mgr.db.prepare('DELETE FROM order_items').run();
+      mgr.db.prepare('DELETE FROM orders').run();
+      mgr.db.prepare('DELETE FROM tracked_items').run();
+
+      const previewRes = await fetch(`http://127.0.0.1:${port}/api/backups/preview/enter`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: snap.filename }),
+      });
+      expect(previewRes.status).toBe(200);
+
+      const previewRestoreRes = await fetch(`http://127.0.0.1:${port}/api/backups/preview/restore`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      expect(previewRestoreRes.status).toBe(200);
+      const previewRestoreBody = (await previewRestoreRes.json()) as {
+        restoredFrom: string;
+        itemsCount: number;
+        ordersCount: number;
+      };
+      expect(previewRestoreBody.restoredFrom).toBe(snap.filename);
+      expect(previewRestoreBody.itemsCount).toBe(1);
+      expect(previewRestoreBody.ordersCount).toBe(1);
+      expect(listTrackedItems(mgr.db).map((i) => i.name)).toEqual(['Restored Duck Eggs']);
+      expect(listAllOrders(mgr.db).map((o) => o.customerName)).toEqual(['Restored Ruth']);
+
+      // Zero stray -wal / -shm files in backupDir after all operations
+      const finalBackupEntries = fs.readdirSync(backupDir);
+      expect(finalBackupEntries.some((f) => f.endsWith('-wal') || f.endsWith('-shm'))).toBe(false);
+    } finally {
+      server.close();
+      mgr.close();
+      expect(fs.existsSync(dir)).toBe(true);
+    }
+  });
+
+  it('recommends the actual replacement order date/channel/items over a cancelled pre-order and applies them cleanly via POST /api/orders/:id/merge', async () => {
+    const { createExpressApp } = await import('../../src/server/app');
+    const { dbPath, backupDir } = createTempPaths();
+    const mgr = new DatabaseManager(dbPath, backupDir);
+    await mgr.init('America/New_York');
+
+    const nowIso = '2026-11-23T15:00:00.000Z';
+    const itemId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO tracked_items (name, unit_label, is_active, supply_mode, default_daily_production, global_safety_buffer, include_in_public_snippet, sort_order, created_at, updated_at)
+           VALUES ('Standard Eggs', 'dozens', 1, 'continuous', 20, 4, 1, 0, ?, ?)`
+        )
+        .run(nowIso, nowIso).lastInsertRowid
+    );
+    const channelFarmId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO pickup_channels (name, allowed_weekdays_json, color_token, is_active, sort_order)
+           VALUES ('Farm Pickup', '[2,4]', 'sky', 1, 0)`
+        )
+        .run().lastInsertRowid
+    );
+    const channelMarketId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO pickup_channels (name, allowed_weekdays_json, color_token, is_active, sort_order)
+           VALUES ('Saturday Farmers Market', '[6]', 'emerald', 1, 1)`
+        )
+        .run().lastInsertRowid
+    );
+
+    const cancelledId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, requested_date, slotted_date, customer_name, customer_email, pickup_channel_id, odoo_quotation_id, odoo_quotation_name, odoo_missing_flagged, created_at, updated_at)
+           VALUES ('odoo', 'pre_approved', 'specific_date', '2026-11-24', '2026-11-24', 'Hannah Brooks', 'hannah@example.com', ?, 810, 'S00810', 1, ?, ?)`
+        )
+        .run(channelFarmId, nowIso, nowIso).lastInsertRowid
+    );
+    mgr.db
+      .prepare(`INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 2)`)
+      .run(cancelledId, itemId);
+    mgr.db
+      .prepare(
+        `INSERT INTO order_chatter (order_id, odoo_message_id, author_name, body_text, created_at_utc, created_at_local, message_type)
+         VALUES (?, 9001, 'Staff', 'Pre-approved for Nov 24', '2026-11-22T15:00:00Z', '2026-11-22 10:00:00', 'comment')`
+      )
+      .run(cancelledId);
+
+    const replacementId = Number(
+      mgr.db
+        .prepare(
+          `INSERT INTO orders (source, status, timing_type, requested_date, slotted_date, customer_name, customer_email, pickup_channel_id, odoo_quotation_id, odoo_quotation_name, odoo_missing_flagged, created_at, updated_at)
+           VALUES ('odoo', 'confirmed', 'specific_date', '2026-11-28', '2026-11-28', 'Hannah Brooks', 'hannah@example.com', ?, 820, 'S00820', 0, ?, ?)`
+        )
+        .run(channelMarketId, nowIso, nowIso).lastInsertRowid
+    );
+    mgr.db
+      .prepare(`INSERT INTO order_items (order_id, tracked_item_id, quantity) VALUES (?, ?, 3)`)
+      .run(replacementId, itemId);
+    mgr.db
+      .prepare(
+        `INSERT INTO order_chatter (order_id, odoo_message_id, author_name, body_text, created_at_utc, created_at_local, message_type)
+         VALUES (?, 9002, 'Hannah Brooks', 'Switched to Saturday Nov 28', '2026-11-23T16:00:00Z', '2026-11-23 11:00:00', 'email')`
+      )
+      .run(replacementId);
+
+    const allOrdersBefore = listAllOrders(mgr.db);
+    const cancelledOrder = allOrdersBefore.find((o) => o.id === cancelledId)!;
+    const replacementOrder = allOrdersBefore.find((o) => o.id === replacementId)!;
+
+    // Pure helpers recommend the actual replacement order date/items/channel in both argument orders
+    const dateOptsForward = resolveMergeDateOptions(cancelledOrder, replacementOrder);
+    expect(dateOptsForward.hasDifferentDates).toBe(true);
+    expect(dateOptsForward.recommendedSide).toBe('source');
+    expect(dateOptsForward.recommendedDate).toBe('2026-11-28');
+
+    const dateOptsReverse = resolveMergeDateOptions(replacementOrder, cancelledOrder);
+    expect(dateOptsReverse.recommendedSide).toBe('target');
+    expect(dateOptsReverse.recommendedDate).toBe('2026-11-28');
+
+    const preview = previewMergeOutcome(cancelledOrder, replacementOrder, 'use_source', '2026-11-28');
+    expect(preview.nextSlottedDate).toBe('2026-11-28');
+    expect(preview.nextStatus).toBe('confirmed');
+    expect(preview.nextPickupChannelId).toBe(channelMarketId);
+    expect(
+      preview.mergedItems.map(({ trackedItemId, quantity }) => ({ trackedItemId, quantity }))
+    ).toEqual([{ trackedItemId: itemId, quantity: 3 }]);
+    expect(preview.primaryOdooRef).toBe('S00820');
+    expect(preview.archivedOdooRef).toBe('S00810');
+    expect(preview.combinedChatterCount).toBe(2);
+
+    const app = createExpressApp({
+      dbManager: mgr,
+      config: {
+        port: 0,
+        dbPath,
+        backupDir,
+        haOptionsPath: '',
+        timezone: 'America/New_York',
+        odoo: { url: '', db: '', apiKey: '', source: 'none' },
+      },
+    });
+    const server = app.listen(0);
+    const address = server.address();
+    const port = typeof address === 'object' && address ? address.port : 0;
+
+    try {
+      const mergeRes = await fetch(`http://127.0.0.1:${port}/api/orders/${cancelledId}/merge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceOrderId: replacementId,
+          itemStrategy: 'use_source',
+          keepDate: '2026-11-28',
+        }),
+      });
+      expect(mergeRes.status).toBe(200);
+
+      const remaining = listAllOrders(mgr.db);
+      expect(remaining).toHaveLength(1);
+      const surviving = remaining[0];
+      expect(surviving.id).toBe(cancelledId);
+      expect(surviving.slottedDate).toBe('2026-11-28');
+      expect(surviving.status).toBe('confirmed');
+      expect(surviving.pickupChannelId).toBe(channelMarketId);
+      expect(surviving.odooQuotationName).toBe('S00820');
+      expect(surviving.mergedOdooNames).toEqual(['S00810']);
+      expect(surviving.odooMissingFlagged).toBe(false);
+      expect(
+        surviving.items.map(({ trackedItemId, quantity }) => ({ trackedItemId, quantity }))
+      ).toEqual([{ trackedItemId: itemId, quantity: 3 }]);
+      expect(surviving.chatter).toHaveLength(2);
     } finally {
       server.close();
       mgr.close();
