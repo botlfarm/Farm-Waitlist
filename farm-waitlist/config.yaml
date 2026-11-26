@@ -1,5 +1,5 @@
 name: Farm Waitlist
-version: "1.0.7"
+version: "1.0.8"
 slug: farm-waitlist
 description: Local-first seasonal farm pre-orders, waitlists, standing recurring orders, daily supply forecasting, and Odoo 19.3 sync.
 url: https://github.com/botlfarm/Farm-Waitlist
