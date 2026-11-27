@@ -2,6 +2,8 @@
 
 All notable changes to Farm Waitlist are documented in this file.
 
+## [1.0.9] - 2026-11-27
+
 ### Changed
 
 - **Dimmer Past Calendar Days & Mobile Collapse**: past days on the main calendar are now clearly dimmed and labeled `· Past` (brightening smoothly on hover/focus so you can still review past orders or counts), and on mobile screens past days of the current week start collapsed into a 1-tap **Show / Hide** summary bar so mobile opens straight onto Today.
