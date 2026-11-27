@@ -2,6 +2,12 @@
 
 All notable changes to Farm Waitlist are documented in this file.
 
+## [1.0.10] - 2026-11-27
+
+### Changes
+
+- Delete UNRELEASED.md
+
 ## [1.0.9] - 2026-11-27
 
 ### Changed
