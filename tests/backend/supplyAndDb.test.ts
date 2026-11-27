@@ -34,6 +34,7 @@ import {
   evaluateCandidateSlotDates,
   findEarliestValidSlotDate,
   isWeekdayAllowedForChannel,
+  previewOrderMoveProjections,
   projectDailySupply,
 } from '../../src/shared/supplyEngine';
 import type {
@@ -778,6 +779,179 @@ describe('Daily Supply Projection Math, Buffers, Cascade Forward & ASAP Auto-Slo
 
     // Only one candidate is flagged isFirstAvailable
     expect(candidates.filter((c) => c.isFirstAvailable).map((c) => c.date)).toEqual(['2026-11-25']);
+  });
+
+  it('keeps live drag-and-drop previewOrderMoveProjections 100% identical to projectDailySupply with self consumption, walk-up sales, physical resets, and extra buffers', () => {
+    const entries = [
+      {
+        id: 1,
+        trackedItemId: 1,
+        date: '2026-11-23',
+        actualOnHand: 20,
+        estProduced: null,
+        actualEndOfDay: null,
+        isCascadeAnchor: false,
+        bufferOverride: null,
+        extraBuffer: 0,
+        selfConsumption: 2.5,
+        walkUpConsumption: 3,
+        notes: null,
+      },
+      {
+        id: 2,
+        trackedItemId: 1,
+        date: '2026-11-24',
+        actualOnHand: null,
+        estProduced: 8,
+        actualEndOfDay: null,
+        isCascadeAnchor: true,
+        bufferOverride: null,
+        extraBuffer: 2,
+        selfConsumption: 1,
+        walkUpConsumption: 4.5,
+        notes: null,
+      },
+      {
+        id: 3,
+        trackedItemId: 1,
+        date: '2026-11-25',
+        actualOnHand: null,
+        estProduced: null,
+        actualEndOfDay: 18,
+        isCascadeAnchor: false,
+        bufferOverride: null,
+        extraBuffer: 0,
+        selfConsumption: 1.5,
+        walkUpConsumption: 0,
+        notes: null,
+      },
+      {
+        id: 4,
+        trackedItemId: 1,
+        date: '2026-11-26',
+        actualOnHand: null,
+        estProduced: null,
+        actualEndOfDay: null,
+        isCascadeAnchor: false,
+        bufferOverride: 5,
+        extraBuffer: 3,
+        selfConsumption: 0,
+        walkUpConsumption: 2,
+        notes: null,
+      },
+      {
+        id: 5,
+        trackedItemId: 1,
+        date: '2026-11-27',
+        actualOnHand: 22,
+        estProduced: null,
+        actualEndOfDay: null,
+        isCascadeAnchor: false,
+        bufferOverride: null,
+        extraBuffer: 0,
+        selfConsumption: 2,
+        walkUpConsumption: 1,
+        notes: null,
+      },
+    ];
+
+    const makeOrder = (
+      id: number,
+      status: OrderRecord['status'],
+      slottedDate: string | null,
+      qty: number
+    ): OrderRecord => ({
+      id,
+      source: 'manual',
+      status,
+      timingType: slottedDate ? 'specific_date' : 'asap',
+      requestedDate: slottedDate,
+      slottedDate,
+      isLocked: false,
+      customerName: `Customer ${id}`,
+      customerNameOverridden: false,
+      customerEmail: null,
+      customerPhone: null,
+      pickupChannelId: null,
+      freeTextPickup: null,
+      notes: null,
+      preApprovedAt: null,
+      standingOrderId: null,
+      standingOccurrenceDate: null,
+      odooQuotationId: null,
+      odooQuotationName: null,
+      odooPartnerId: null,
+      odooCreatedAtLocal: null,
+      odooRawNotes: null,
+      odooRawLines: [],
+      odooUpdatedAfterSlot: false,
+      odooMissingFlagged: false,
+      odooSuggestedConfirmed: null,
+      items: [{ trackedItemId: 1, quantity: qty }],
+      chatter: [],
+      createdAt: '',
+      updatedAt: '',
+    });
+
+    const movableOrder = makeOrder(10, 'pre_approved', '2026-11-24', 6);
+    const otherOrder = makeOrder(11, 'confirmed', '2026-11-26', 9);
+    const waitlistOrder = makeOrder(12, 'waitlist', null, 5);
+    const initialOrders = [movableOrder, otherOrder, waitlistOrder];
+
+    const baseDays = projectDailySupply({
+      items: [eggsItem, turkeyItem],
+      entries,
+      orders: initialOrders,
+      startDate: '2026-11-23',
+      endDate: '2026-11-29',
+      today: '2026-11-23',
+    });
+
+    // Case 1: Dragging an already-slotted order from Tue (Nov 24) to Sat (Nov 28) across EOD & Morning resets
+    const previewMoved = previewOrderMoveProjections(
+      baseDays,
+      [eggsItem, turkeyItem],
+      movableOrder,
+      '2026-11-28'
+    );
+    const afterMoved = projectDailySupply({
+      items: [eggsItem, turkeyItem],
+      entries,
+      orders: [
+        { ...movableOrder, slottedDate: '2026-11-28' },
+        otherOrder,
+        waitlistOrder,
+      ],
+      startDate: '2026-11-23',
+      endDate: '2026-11-29',
+      today: '2026-11-23',
+    });
+    expect(previewMoved).toEqual(afterMoved);
+
+    // Unaffected days separated by physical resets (e.g. Nov 26 after Nov 25 EOD count) must not spuriously drift
+    expect(previewMoved[3].byItem[1].endingBalance).toBe(baseDays[3].byItem[1].endingBalance);
+    expect(previewMoved[3].byItem[1].sellableOpen).toBe(baseDays[3].byItem[1].sellableOpen);
+
+    // Case 2: Dragging a waitlist order onto Wed (Nov 25)
+    const previewWaitlist = previewOrderMoveProjections(
+      baseDays,
+      [eggsItem, turkeyItem],
+      waitlistOrder,
+      '2026-11-25'
+    );
+    const afterWaitlist = projectDailySupply({
+      items: [eggsItem, turkeyItem],
+      entries,
+      orders: [
+        movableOrder,
+        otherOrder,
+        { ...waitlistOrder, status: 'slotted', slottedDate: '2026-11-25' },
+      ],
+      startDate: '2026-11-23',
+      endDate: '2026-11-29',
+      today: '2026-11-23',
+    });
+    expect(previewWaitlist).toEqual(afterWaitlist);
   });
 });
 

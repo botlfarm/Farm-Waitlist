@@ -3477,6 +3477,80 @@ describe('Farm Waitlist Frontend DOM & Interaction Tests', () => {
       ]);
     });
   });
+
+  it('dims past calendar days clearly and collapses past days of the week on mobile with 1-tap Show/Hide toggle', async () => {
+    const user = userEvent.setup();
+    const base = makeBaseWorkspace();
+    const sampleMetrics = base.days[0].byItem;
+    const ws = makeBaseWorkspace({
+      today: '2026-11-26',
+      days: [
+        { date: '2026-11-23', isoWeekday: 1, isToday: false, isPast: true, byItem: sampleMetrics },
+        { date: '2026-11-24', isoWeekday: 2, isToday: false, isPast: true, byItem: sampleMetrics },
+        { date: '2026-11-25', isoWeekday: 3, isToday: false, isPast: true, byItem: sampleMetrics },
+        { date: '2026-11-26', isoWeekday: 4, isToday: true, isPast: false, byItem: sampleMetrics },
+        { date: '2026-11-27', isoWeekday: 5, isToday: false, isPast: false, byItem: sampleMetrics },
+        { date: '2026-11-28', isoWeekday: 6, isToday: false, isPast: false, byItem: sampleMetrics },
+        { date: '2026-11-29', isoWeekday: 7, isToday: false, isPast: false, byItem: sampleMetrics },
+      ],
+      orders: [
+        {
+          ...base.orders[0],
+          id: 10,
+          slottedDate: '2026-11-24',
+          status: 'confirmed',
+        },
+      ],
+    });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string) => {
+        if (input.startsWith('./api/workspace')) {
+          return new Response(JSON.stringify(ws), { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      })
+    );
+
+    render(<App />);
+
+    // Past days are clearly dimmed and labeled · Past, while Today is active
+    const monPast = await screen.findByTestId('calendar-day-2026-11-23');
+    const tuePast = screen.getByTestId('calendar-day-2026-11-24');
+    const thuToday = screen.getByTestId('calendar-day-2026-11-26');
+
+    expect(monPast).toHaveAttribute('data-past', 'true');
+    expect(monPast).toHaveAttribute('data-mobile-collapsed', 'true');
+    expect(monPast.className).toContain('opacity-45');
+    expect(monPast.className).toContain('hidden md:flex');
+    expect(screen.getByTestId('day-header-2026-11-23')).toHaveTextContent('· Past');
+
+    expect(thuToday).not.toHaveAttribute('data-past');
+    expect(thuToday).not.toHaveAttribute('data-mobile-collapsed');
+    expect(thuToday.className).not.toContain('hidden md:flex');
+    expect(screen.getByTestId('day-header-2026-11-26')).toHaveTextContent('· Today');
+
+    // Mobile toggle bar summarizes the 3 collapsed past days and past order count
+    const toggleBtn = screen.getByTestId('mobile-past-days-toggle-2026-11-23');
+    expect(toggleBtn).toHaveAttribute('aria-expanded', 'false');
+    expect(toggleBtn).toHaveTextContent('3 past days (Mon–Wed)');
+    expect(toggleBtn).toHaveTextContent('· 1 order');
+    expect(toggleBtn).toHaveTextContent('Show');
+
+    // Clicking Show expands the past days on mobile; clicking Hide collapses them again
+    await user.click(toggleBtn);
+    expect(toggleBtn).toHaveAttribute('aria-expanded', 'true');
+    expect(toggleBtn).toHaveTextContent('Hide');
+    expect(monPast).not.toHaveAttribute('data-mobile-collapsed');
+    expect(tuePast).not.toHaveAttribute('data-mobile-collapsed');
+    expect(monPast.className).not.toContain('hidden md:flex');
+
+    await user.click(toggleBtn);
+    expect(toggleBtn).toHaveAttribute('aria-expanded', 'false');
+    expect(monPast).toHaveAttribute('data-mobile-collapsed', 'true');
+    expect(monPast.className).toContain('hidden md:flex');
+  });
 });
 
 

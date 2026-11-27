@@ -411,7 +411,7 @@ export function previewOrderMoveProjections(
   if (qtyByItem.size === 0) return days;
 
   // Recompute forward + backward ATP only for affected tracked items
-  const updatedByItem = new Map<number, DailyItemProjection[]>();
+  const updatedByItem = new Map<number, Map<string, DailyItemProjection>>();
 
   for (const item of items) {
     const orderQty = qtyByItem.get(item.id);
@@ -427,14 +427,15 @@ export function previewOrderMoveProjections(
         continue;
       }
 
-      const expectedStartingBalance =
-        i === 0 ? (base.expectedStartingBalance ?? base.startingBalance) : roundQty(prevNextDayStarting);
-      const startingBalance =
-        i === 0
-          ? base.startingBalance
-          : base.actualOnHand !== null
-            ? base.actualOnHand
-            : expectedStartingBalance;
+      const isFirstDay = itemDays.length === 0;
+      const expectedStartingBalance = isFirstDay
+        ? (base.expectedStartingBalance ?? base.startingBalance)
+        : roundQty(prevNextDayStarting);
+      const startingBalance = isFirstDay
+        ? base.startingBalance
+        : base.actualOnHand !== null
+          ? roundQty(base.actualOnHand)
+          : expectedStartingBalance;
 
       let deltaSlotted = 0;
       if (sourceDate && day.date === sourceDate) {
@@ -445,11 +446,21 @@ export function previewOrderMoveProjections(
       }
 
       const slottedQty = roundQty(base.slottedQty + deltaSlotted);
-      const endingBalance = roundQty(startingBalance - slottedQty);
+      const selfConsumption =
+        typeof base.selfConsumption === 'number' && base.selfConsumption > 0
+          ? roundQty(base.selfConsumption)
+          : 0;
+      const walkUpConsumption =
+        typeof base.walkUpConsumption === 'number' && base.walkUpConsumption > 0
+          ? roundQty(base.walkUpConsumption)
+          : 0;
+      const endingBalance = roundQty(
+        startingBalance - slottedQty - selfConsumption - walkUpConsumption
+      );
       const expectedNextDayStarting = roundQty(endingBalance + base.estProduced);
       const nextDayStarting =
         base.actualEndOfDay !== null && base.actualEndOfDay !== undefined
-          ? base.actualEndOfDay
+          ? roundQty(base.actualEndOfDay)
           : expectedNextDayStarting;
       const rawSellableOpen = roundQty(endingBalance - base.effectiveBuffer);
 
@@ -458,6 +469,8 @@ export function previewOrderMoveProjections(
         expectedStartingBalance,
         startingBalance,
         slottedQty,
+        selfConsumption,
+        walkUpConsumption,
         endingBalance,
         expectedNextDayStarting,
         nextDayStarting,
@@ -521,13 +534,17 @@ export function previewOrderMoveProjections(
       }
     }
 
-    updatedByItem.set(item.id, itemDays);
+    const byDate = new Map<string, DailyItemProjection>();
+    for (const proj of itemDays) {
+      byDate.set(proj.date, proj);
+    }
+    updatedByItem.set(item.id, byDate);
   }
 
-  return days.map((day, idx) => {
+  return days.map((day) => {
     const byItem: Record<number, DailyItemProjection> = { ...day.byItem };
-    for (const [itemId, projList] of updatedByItem.entries()) {
-      const updated = projList[idx];
+    for (const [itemId, byDate] of updatedByItem.entries()) {
+      const updated = byDate.get(day.date);
       if (updated) {
         byItem[itemId] = updated;
       }

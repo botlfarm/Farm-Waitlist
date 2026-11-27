@@ -7,6 +7,7 @@ import {
   Calendar,
   CalendarClock,
   Check,
+  ChevronDown,
   ChevronRight,
   CloudUpload,
   GitMerge,
@@ -177,6 +178,9 @@ export function CalendarWorkspace({
   );
   const [showIgnored, setShowIgnored] = useState(false);
   const [showCheckpoints, setShowCheckpoints] = useState(false);
+  const [expandedMobilePastWeeks, setExpandedMobilePastWeeks] = useState<Record<string, boolean>>(
+    {}
+  );
   const [dragOverDate, setDragOverDate] = useState<string | null>(null);
   const [draggingOrderId, setDraggingOrderId] = useState<number | null>(null);
   const [draggingQueueOrderId, setDraggingQueueOrderId] = useState<number | null>(null);
@@ -1464,13 +1468,70 @@ export function CalendarWorkspace({
 
             {/* Week Rows: 1-column full-width day cards on mobile, 7-column Mon-Sun grid on md+ */}
             <div className="divide-y divide-[#283340] border border-[#283340]" data-testid="calendar-grid">
-              {weekRows.map((week, wIdx) => (
-                <div key={week[0]?.date ?? wIdx}>
+              {weekRows.map((week, wIdx) => {
+                const pastWeekKey = week[0]?.date ?? String(wIdx);
+                const pastDaysInWeek = week.filter((d) => d.isPast);
+                const isMobilePastExpanded = Boolean(expandedMobilePastWeeks[pastWeekKey]);
+                const pastOrdersCount = pastDaysInWeek.reduce(
+                  (sum, d) => sum + (ordersByDate.get(d.date)?.length ?? 0),
+                  0
+                );
+                const pastDayRangeLabel =
+                  pastDaysInWeek.length === 1
+                    ? ISO_WEEKDAY_LABELS[pastDaysInWeek[0].isoWeekday]
+                    : pastDaysInWeek.length > 1
+                      ? `${ISO_WEEKDAY_LABELS[pastDaysInWeek[0].isoWeekday]}–${ISO_WEEKDAY_LABELS[pastDaysInWeek[pastDaysInWeek.length - 1].isoWeekday]}`
+                      : '';
+
+                return (
+                <div key={pastWeekKey}>
                   {/* Mobile Week Divider */}
                   {week[0] && (
                     <div className="border-b border-[#283340] bg-[#161D24] px-3 py-2 text-xs font-semibold text-[#8B949E] md:hidden">
                       Week of {formatShortCalendarDate(week[0].date)}
                     </div>
+                  )}
+                  {/* Mobile Past Days Collapse/Expand Bar */}
+                  {pastDaysInWeek.length > 0 && (
+                    <button
+                      type="button"
+                      data-testid={`mobile-past-days-toggle-${pastWeekKey}`}
+                      aria-expanded={isMobilePastExpanded}
+                      onClick={() =>
+                        setExpandedMobilePastWeeks((prev) => ({
+                          ...prev,
+                          [pastWeekKey]: !prev[pastWeekKey],
+                        }))
+                      }
+                      className="flex min-h-[44px] w-full items-center justify-between gap-2 border-b border-[#283340] bg-[#0B0F14]/90 px-3 py-2 text-left text-xs text-[#8B949E] transition-colors hover:bg-[#131A20] hover:text-[#C9D1D9] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#38BDF8] md:hidden"
+                    >
+                      <span className="inline-flex min-w-0 items-center gap-1.5">
+                        {isMobilePastExpanded ? (
+                          <ChevronDown
+                            className="h-3.5 w-3.5 shrink-0 text-[#6E7681]"
+                            aria-hidden="true"
+                          />
+                        ) : (
+                          <ChevronRight
+                            className="h-3.5 w-3.5 shrink-0 text-[#6E7681]"
+                            aria-hidden="true"
+                          />
+                        )}
+                        <span className="truncate font-medium text-[#9BA3AE]">
+                          {pastDaysInWeek.length === 1
+                            ? `1 past day (${pastDayRangeLabel})`
+                            : `${pastDaysInWeek.length} past days (${pastDayRangeLabel})`}
+                        </span>
+                        {pastOrdersCount > 0 && (
+                          <span className="shrink-0 text-[11px] text-[#6E7681]">
+                            · {pastOrdersCount} {pastOrdersCount === 1 ? 'order' : 'orders'}
+                          </span>
+                        )}
+                      </span>
+                      <span className="shrink-0 whitespace-nowrap text-[11px] font-medium text-[#38BDF8]">
+                        {isMobilePastExpanded ? 'Hide' : 'Show'}
+                      </span>
+                    </button>
                   )}
                   <div className="grid grid-cols-1 divide-y divide-[#283340] md:grid-cols-7 md:divide-x md:divide-y-0">
                     {week.map((day) => {
@@ -1533,6 +1594,10 @@ export function CalendarWorkspace({
                         <div
                           key={day.date}
                           data-testid={`calendar-day-${day.date}`}
+                          data-past={day.isPast ? 'true' : undefined}
+                          data-mobile-collapsed={
+                            day.isPast && !isMobilePastExpanded ? 'true' : undefined
+                          }
                           onDragOver={(e) => {
                             e.preventDefault();
                             e.dataTransfer.dropEffect = 'move';
@@ -1554,13 +1619,15 @@ export function CalendarWorkspace({
                             }
                           }}
                           onDrop={(e) => void handleDrop(e, day.date)}
-                          className={`flex flex-col transition-[background-color,box-shadow,opacity] duration-200 ease-out md:min-h-[172px] ${
+                          className={`${
+                            day.isPast && !isMobilePastExpanded ? 'hidden md:flex' : 'flex'
+                          } flex-col transition-[background-color,box-shadow,opacity,filter] duration-200 ease-out md:min-h-[172px] ${
                             isDragTarget
                               ? 'bg-[#0EA5E9]/15 ring-1 ring-inset ring-[#38BDF8]'
                               : day.isToday
                                 ? 'bg-[#18232E]'
                                 : day.isPast
-                                  ? 'bg-[#0F1419]/75 opacity-75'
+                                  ? 'bg-[#0B0F14]/90 opacity-45 grayscale-[35%] hover:opacity-80 focus-within:opacity-85'
                                   : 'bg-[#131A20]'
                           }`}
                         >
@@ -1575,14 +1642,18 @@ export function CalendarWorkspace({
                               <div className="min-w-0">
                                 <span
                                   className={`font-mono text-xs font-semibold tabular-nums ${
-                                    day.isToday ? 'text-[#38BDF8]' : 'text-[#E6EDF3]'
+                                    day.isToday
+                                      ? 'text-[#38BDF8]'
+                                      : day.isPast
+                                        ? 'text-[#8B949E]'
+                                        : 'text-[#E6EDF3]'
                                   }`}
                                 >
                                   <span className="md:hidden">
                                     {ISO_WEEKDAY_LABELS[day.isoWeekday]},{' '}
                                   </span>
                                   {formatShortCalendarDate(day.date)}
-                                  {day.isToday ? ' · Today' : ''}
+                                  {day.isToday ? ' · Today' : day.isPast ? ' · Past' : ''}
                                 </span>
                                 {dayChannels.length > 0 && (
                                   <span className="ml-2 text-[11px] text-[#8B949E] md:hidden">
@@ -1983,7 +2054,8 @@ export function CalendarWorkspace({
                     })}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-xs text-[#8B949E]">

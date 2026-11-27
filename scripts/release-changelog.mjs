@@ -3,30 +3,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-export const UNRELEASED_TEMPLATE = `# Unreleased Changes
-
-<!--
-Add bullet points under the sections below as features, changes, and fixes are made.
-When pushed to \`main\`, GitHub Actions automatically ensures a fresh version in
-\`farm-waitlist/config.yaml\` (auto-bumping the patch version if it was already released),
-moves these notes into \`CHANGELOG.md\` and \`farm-waitlist/CHANGELOG.md\`,
-syncs \`package.json\`, and resets this file for the next release.
--->
-
-### Added
-
-### Changed
-
-### Fixed
-`;
-
 const CHANGELOG_HEADER = `# Changelog
 
-All notable changes to Farm Waitlist are documented in this file.
-`;
+All notable changes to Farm Waitlist are documented in this file.`;
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeBulletForDedup(line) {
+  return line
+    .trim()
+    .replace(/^[-*]\s+/, '')
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
 }
 
 /**
@@ -96,12 +86,68 @@ export function gitTagExists(rootDir, version) {
 }
 
 /**
- * Parses `UNRELEASED.md` and returns only sections that contain real bullet/text content.
- * Returns empty string if no entries have been added yet.
+ * Splits `CHANGELOG.md` into:
+ * - `headerPart`: top `# Changelog` title & intro paragraph(s)
+ * - `unversionedPart`: any unversioned notes added above the first `## [x.y.z]` release heading
+ * - `historyPart`: everything from the first `## [x.y.z]` release heading onward
  */
-export function extractUnreleasedBody(unreleasedText) {
-  const withoutComments = unreleasedText.replace(/<!--[\s\S]*?-->/g, '');
+export function splitChangelogHeaderAndHistory(changelogText) {
+  const normalized = (changelogText ?? '').replace(/\r\n/g, '\n').trim();
+  if (!normalized) {
+    return {
+      headerPart: CHANGELOG_HEADER,
+      unversionedPart: '',
+      historyPart: '',
+    };
+  }
+
+  const firstReleaseIdx = normalized.search(/^#{1,2}\s+\[?v?\d+\.\d+\.\d+/m);
+  const preHistory = firstReleaseIdx >= 0 ? normalized.slice(0, firstReleaseIdx) : normalized;
+  const historyPart = firstReleaseIdx >= 0 ? normalized.slice(firstReleaseIdx).trimStart() : '';
+
+  const preLines = preHistory.split('\n');
+  let unversionedStartLine = -1;
+  for (let i = 0; i < preLines.length; i += 1) {
+    const line = preLines[i].trimEnd();
+    if (
+      /^##\s+\[?unreleased\]?\b/i.test(line) ||
+      /^#{2,3}\s+/.test(line) ||
+      /^\s*[-*]\s+/.test(line)
+    ) {
+      unversionedStartLine = i;
+      break;
+    }
+  }
+
+  if (unversionedStartLine < 0) {
+    const headerPart = preHistory.trim() || CHANGELOG_HEADER;
+    return { headerPart, unversionedPart: '', historyPart };
+  }
+
+  const headerPart = preLines.slice(0, unversionedStartLine).join('\n').trim() || CHANGELOG_HEADER;
+  const unversionedPart = preLines.slice(unversionedStartLine).join('\n').trim();
+
+  return { headerPart, unversionedPart, historyPart };
+}
+
+/**
+ * Parses unversioned notes from the top of `CHANGELOG.md`, strips HTML comments and any
+ * optional `## [Unreleased]` header, keeps only non-empty sections, and automatically skips
+ * any bullet whose normalized text already exists in `existingHistory` (preventing duplicates).
+ */
+export function extractUnreleasedBody(unversionedText, existingHistory = '') {
+  const withoutComments = (unversionedText ?? '').replace(/<!--[\s\S]*?-->/g, '');
   const lines = withoutComments.split(/\r?\n/);
+
+  const releasedBullets = new Set();
+  if (existingHistory) {
+    for (const hLine of existingHistory.split(/\r?\n/)) {
+      if (/^\s*[-*]\s+/.test(hLine)) {
+        const key = normalizeBulletForDedup(hLine);
+        if (key) releasedBullets.add(key);
+      }
+    }
+  }
 
   const sections = [];
   let currentHeading = null;
@@ -117,7 +163,7 @@ export function extractUnreleasedBody(unreleasedText) {
     const hasContent = trimmedLines.some((line) => line.trim().length > 0);
     if (hasContent) {
       sections.push({
-        heading: currentHeading,
+        heading: currentHeading ?? '### Changes',
         body: trimmedLines.join('\n').trim(),
       });
     }
@@ -129,11 +175,23 @@ export function extractUnreleasedBody(unreleasedText) {
     if (/^#\s+/.test(line) && !/^##/.test(line)) {
       continue;
     }
+    if (/^##\s+\[?unreleased\]?\b/i.test(line)) {
+      continue;
+    }
     const subheading = /^#{2,3}\s+(.+)$/.exec(line);
     if (subheading) {
       flush();
       currentHeading = `### ${subheading[1].trim()}`;
       continue;
+    }
+    if (/^\s*[-*]\s+/.test(line)) {
+      const key = normalizeBulletForDedup(line);
+      if (key && releasedBullets.has(key)) {
+        continue;
+      }
+      if (key) {
+        releasedBullets.add(key);
+      }
     }
     currentLines.push(line);
   }
@@ -144,14 +202,14 @@ export function extractUnreleasedBody(unreleasedText) {
   }
 
   return sections
-    .map((sec) => (sec.heading ? `${sec.heading}\n\n${sec.body}` : sec.body))
+    .map((sec) => `${sec.heading}\n\n${sec.body}`)
     .join('\n\n')
     .trim();
 }
 
 /**
  * Fallback: builds a `### Changes` bullet list from git commits since the last tag
- * when `UNRELEASED.md` has no manual entries on a release.
+ * when `CHANGELOG.md` has no unversioned notes at the top on a release.
  */
 export function collectGitFallbackNotes(rootDir) {
   try {
@@ -190,24 +248,17 @@ export function collectGitFallbackNotes(rootDir) {
 }
 
 /**
- * Prepends a newly formatted release section right below the top `# Changelog` title.
+ * Stamps `## [<version>] - <dateYmd>` onto the unversioned top of `CHANGELOG.md`
+ * (replacing any unversioned block above the previous release cleanly in-place).
  */
-export function prependReleaseSection(existingChangelog, version, dateYmd, sectionBody) {
+export function stampReleaseVersionInChangelog(existingChangelog, version, dateYmd, sectionBody) {
+  const { headerPart, historyPart } = splitChangelogHeaderAndHistory(existingChangelog);
   const newSection = `## [${version}] - ${dateYmd}\n\n${sectionBody.trim()}`;
-  const trimmed = existingChangelog.trim();
 
-  if (!trimmed) {
-    return `${CHANGELOG_HEADER}\n${newSection}\n`;
-  }
-
-  const firstReleaseIdx = trimmed.search(/^#{1,2}\s+\[?v?\d+\.\d+\.\d+/m);
-  if (firstReleaseIdx > 0) {
-    const headerPart = trimmed.slice(0, firstReleaseIdx).trimEnd();
-    const historyPart = trimmed.slice(firstReleaseIdx).trimStart();
+  if (historyPart) {
     return `${headerPart}\n\n${newSection}\n\n${historyPart}\n`;
   }
-
-  return `${CHANGELOG_HEADER}\n${newSection}\n\n${trimmed}\n`;
+  return `${headerPart}\n\n${newSection}\n`;
 }
 
 /**
@@ -262,12 +313,13 @@ export function resolveNextReleaseVersion(options = {}) {
 }
 
 /**
- * Promotes `UNRELEASED.md` into root `CHANGELOG.md` and `farm-waitlist/CHANGELOG.md`,
- * syncs `package.json`, and resets `UNRELEASED.md`.
+ * Stamps the resolved version heading (`## [<version>] - <YYYY-MM-DD>`) onto the unversioned
+ * notes at the top of `CHANGELOG.md`, mirrors it to `farm-waitlist/CHANGELOG.md`, and syncs
+ * `farm-waitlist/config.yaml` and `package.json`.
  *
  * When `autoBump: true` (used in CI on pushes to `main`), if the version in
  * `farm-waitlist/config.yaml` is already tagged in git OR already present in `CHANGELOG.md`,
- * the patch version is automatically incremented (e.g. `1.0.1` -> `1.0.2`) and written back
+ * the patch version is automatically incremented (e.g. `1.0.7` -> `1.0.8`) and written back
  * to `farm-waitlist/config.yaml` so Home Assistant always detects an updatable release.
  * If the author already manually bumped `config.yaml` (e.g. to `1.1.0`), that version is kept as-is.
  */
@@ -279,7 +331,6 @@ export function releaseChangelog(options = {}) {
   const configPath = path.join(rootDir, 'farm-waitlist', 'config.yaml');
   const rootChangelogPath = path.join(rootDir, 'CHANGELOG.md');
   const addonChangelogPath = path.join(rootDir, 'farm-waitlist', 'CHANGELOG.md');
-  const unreleasedPath = path.join(rootDir, 'UNRELEASED.md');
   const packageJsonPath = path.join(rootDir, 'package.json');
 
   const resolved = resolveNextReleaseVersion(options);
@@ -299,10 +350,8 @@ export function releaseChangelog(options = {}) {
     fs.writeFileSync(configPath, writeAddonVersionText(configYamlRaw, version), 'utf8');
   }
 
-  const unreleasedRaw = fs.existsSync(unreleasedPath)
-    ? fs.readFileSync(unreleasedPath, 'utf8')
-    : '';
-  let sectionBody = extractUnreleasedBody(unreleasedRaw);
+  const { unversionedPart, historyPart } = splitChangelogHeaderAndHistory(existingChangelog);
+  let sectionBody = extractUnreleasedBody(unversionedPart, historyPart);
 
   if (!sectionBody) {
     sectionBody =
@@ -311,10 +360,14 @@ export function releaseChangelog(options = {}) {
         : collectGitFallbackNotes(rootDir);
   }
 
-  const nextChangelog = prependReleaseSection(existingChangelog, version, dateYmd, sectionBody);
+  const nextChangelog = stampReleaseVersionInChangelog(
+    existingChangelog,
+    version,
+    dateYmd,
+    sectionBody
+  );
   fs.writeFileSync(rootChangelogPath, nextChangelog, 'utf8');
   fs.writeFileSync(addonChangelogPath, nextChangelog, 'utf8');
-  fs.writeFileSync(unreleasedPath, UNRELEASED_TEMPLATE, 'utf8');
 
   // Keep package.json version synchronized with farm-waitlist/config.yaml
   if (fs.existsSync(packageJsonPath)) {
@@ -362,13 +415,12 @@ if (isDirectRun) {
     const result = releaseChangelog({ notesOutPath, autoBump });
     if (result.released) {
       console.log(
-        `${result.autoBumped ? 'Auto-bumped add-on version and promoted' : 'Promoted'} UNRELEASED.md into CHANGELOG.md and farm-waitlist/CHANGELOG.md for v${result.version}`
+        `${result.autoBumped ? 'Auto-bumped add-on version and stamped' : 'Stamped'} v${result.version} at the top of CHANGELOG.md and synced farm-waitlist/CHANGELOG.md`
       );
     } else {
       console.log(
-        `v${result.version} is already in CHANGELOG.md — kept UNRELEASED.md for the next version bump.`
+        `v${result.version} is already in CHANGELOG.md — kept unversioned top notes for the next version bump.`
       );
     }
   }
 }
-
